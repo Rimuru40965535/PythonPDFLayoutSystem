@@ -1,7 +1,10 @@
 # PythonPDFLayoutSystem 技术文档
 
-> 本文档由代码实读整理，对应工作区当前状态（git `master` @ `d5552dc` 之后的未提交工作树）。
-> 所有函数签名、参数、返回值均取自实际代码，不含推测。
+> 本文档由代码实读整理，对应工作区当前状态（git `master` @ `f718518` **之后的未提交工作树**）。
+> 所有函数签名、参数、返回值均取自实际代码；标为"实测"的结论均附可复现的观测数据。
+>
+> **已完成批次**：批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）。
+> 批次 4 承载"矩形包围内容"，前置分析见 8.11。
 
 ---
 
@@ -523,6 +526,41 @@ split_column_advanced(
 - **直接改写传入对象的 `_x/_y/_width/_height` 与 `align_*`**，并直接 `container.children.append(...)`。
 - `content_w <= 0` 或 `content_h <= 0` 时抛 `ValueError`。
 - 末尾只调用 `parent.invalidate_wrap_cache()`，**不调用几何缓存失效**。
+
+#### `create_spacer(...)` —— 批次 1 新增
+
+```python
+create_spacer(
+    name: str,
+    height: float,
+    parent: Optional[LayoutObject] = None,
+    layer: int = 0,
+) -> LayoutObject
+```
+
+创建一个纯留白对象（垂直间距）。等价于一个 `width=0`、`align_x=CENTER`、
+`align_y=FLOW`、`padding=Padding.all(0)`、`color=White` 的 `LayoutObject`。
+在流式布局中只占据 `height` 指定的纵向空间，不渲染任何内容。
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `name` | `str` | 必填 | 对象名，会写入 `objectRegister` |
+| `height` | `float` | 必填 | 留白高度 (mm) |
+| `parent` | `Optional[LayoutObject]` | `None` | 非空时自动挂载（走 `add_child`，缓存失效正确触发） |
+| `layer` | `int` | `0` | 图层索引 |
+
+**返回**：新建的留白对象。
+
+**刻意不暴露的参数**（附实测依据）：
+
+| 未暴露 | 原因 |
+| --- | --- |
+| `color` | `LayoutObject.render()` 在 `is_fill=False` 时不绘制任何内容，留白的颜色对输出无影响。抽取前 `ResumeCore.py` 里 14 处留白分别用了 `White`/`Black`/`Blue`/`Green`/`Yellow` 五种颜色，属复制粘贴残留 |
+| `padding` | 留白 `_height > 0`，`get_effective_height()` 走 `min(_height, avail_h)` 分支，padding 不参与计算。实测 `Padding.all(0)` 与 `Padding.all(10)` 的有效高/有效宽/绝对 y 完全相同 |
+| `align_y` | 留白的语义就是"接在流式序列的下一个位置"，固定 `FLOW` |
+| 自动命名 | 留白同样写入 `objectRegister`，自动命名会改变上层依赖的名字 |
+
+**用途**：`ResumeCore.py` 的 `Lead_*` 系列间距对象全部改由它创建（批次 1 完成，14 处）。
 
 ### 3.5 图层与注册表
 
@@ -1182,6 +1220,91 @@ Resume(
 - **注意**：这与 7.17（重复挂载）是**两个独立缺陷**，恰好都在同一段循环里，但成因与影响量不同
   （7.17 多占一整块内容的高度约 18mm，7.18 多占 5mm 间距）。
 
+### 7.19 `wrap_height=True` 使高度塌缩为 padding（父子高度自指）— 待批次 4 修
+
+- **位置**：`LayoutEngine.py` 的 `get_parent_available_area()`（约 676-692 行）
+  与 `get_effective_height()`（约 798-846 行）的交互
+- **现象**：开启 `wrap_height` 后，**高度不是撑开到内容，而是塌缩成只剩 padding**。
+  同一结构、只改 `wrap_height` 标志的实测对比：
+
+  | 配置 | 有效高 | 组成 |
+  | --- | --- | --- |
+  | `height=0, wrap_height=False` | **49.00** | 5 + 10 + 20 + 15（恰好等于内容总高） |
+  | `height=0, wrap_height=True` | **4.00** | 只剩 `padding.all(2)` × 2 |
+
+- **根因**：父子高度的**循环依赖**。插桩追踪过程：
+
+  ```
+  >> _calculate_wrap_height(Box) 进入: _height=0
+       get_effective_height(RB) = 300        ← 拿祖父的高度
+     >> _calculate_wrap_height(Box) 进入: _is_wrapping=True   ← 重入
+     << _calculate_wrap_height(Box) 返回 0                      ← 软降级
+       get_effective_height(Box) = 0        ← ←← 关键：父高此时是 0
+       get_effective_height(C0) = 0.0       ← 子元素被 0 高度父容器裁剪成 0
+       get_effective_height(C1) = 0.0
+       get_effective_height(C2) = 0.0
+  << _calculate_wrap_height(Box) 返回 4.0   ← 只有 padding，子元素全被吃成 0
+  ```
+
+  子元素的有效高度被父可用高度裁剪（`min(base_height, avail_h)`），
+  而父可用高度又来自父的有效高度 —— 自指。`_is_wrapping` 只防住了无限递归，
+  返回 0 之后整棵子树归零。
+
+- **为何 `wrap_height=False` 反而"看起来对"**：父元素 `_height=0` →
+  `get_effective_height()` 取满父可用高 → 恰好等于内容自然高度。
+  这是**巧合**（内容正好填满），一旦内容比可用空间小或大，这个巧合就破了。
+- **影响**：这是"矩形包围内容"的核心阻断点。**在修好之前，该能力在引擎里是反向的** ——
+  开启 wrap 比不开启更糟。
+- **修法方向**：引入显式的"测量上下文"，让测量时向上找最近的**已知高度**祖先，
+  而不是直接父；或者对子元素在父高待求时不做父高裁剪。
+  两种方向都需要先明确 `wrap_content()` 的方向性（自底向上 vs 自顶向下），见 8.11。
+
+### 7.20 `invalidate_wrap_cache` 后 `_height` 不复位，wrap 结果永久卡死 — 待批次 4 修
+
+- **位置**：`invalidate_wrap_cache()`（约 572-579 行）与
+  `_calculate_wrap_height()` 开头的 `if self._height > 0: return self._height`（约 459-462 行）
+- **现象**：一旦算出过 wrap 高度，之后**即使子元素变化、缓存被正确失效，重算也拿不回新值**：
+
+  ```
+  两个子元素(10+20)后: _height=4.0
+  再加一个(15)之后:    _height=4.0   wrap_cache_valid=False
+  重新 wrap_content(): 4.0
+  force=True 重算:     4.0          ← force 也救不回来
+  ```
+
+- **根因**：`invalidate_wrap_cache()` 清的是 `_wrap_cache_valid` / `_height_set_by_wrap`，
+  但**不动 `_height`**。而 `_calculate_wrap_height()` 开头就把 `_height > 0` 当作
+  "用户显式指定的高度"直接返回。第一次写进 `_height` 的 wrap 结果因此永久生效。
+  目前只能手工把 `_height` 归零才能重新计算。
+- **影响**：直接打击"矩形包围内容"的核心用法 —— 动态增删内容时矩形必须跟着变。
+- **与 7.19 的关系**：7.19 决定"第一次算就算不对"，7.20 决定"算错之后再也算不回来"。
+  两者叠加使 `wrap_content` 实际上不可用，必须同批修复（批次 4）。
+
+### 7.21 `wrap_width` 完全不可用 — 待批次 4b 修
+
+- **位置**：`_calculate_wrap_width()`（约 499-535 行）与
+  `get_effective_width()`（约 772-796 行）的交互
+- **现象**：收窄包围盒完全不能工作，实测三条路径全部失败：
+
+  | 配置 | 有效宽 |
+  | --- | --- |
+  | `wrap_width=True`，子元素 `width=0` | **0.00** |
+  | `wrap_width=True`，再叠加一个 `width=30` 的子元素 | **0.00** |
+  | `wrap_width=True`，盒子构造宽 60 或 0 | 均无改善 |
+
+- **根因**：原理上自相矛盾 —— 收窄要求子元素宽度由自己决定，
+  但引擎里子元素 `_width == 0` 的语义是"撑满父可用宽"，而父宽正是待求值。
+  `_calculate_wrap_width()` 取 `max(child_width)`，而子元素宽度又是从父宽推出来的。
+- **额外问题**：`_cached_wrap_width` 只在 `get_effective_width()` 的
+  `self._wrap_cache_valid and self._width_set_by_wrap` 分支里被读，
+  而 `_calculate_wrap_width()` 的重入保护直接返回当前 `_width`（自指的 0），
+  所以这条路径基本不可能返回有意义的宽度。
+- **影响**：限制了包围盒的形态 —— 只用 `wrap_height` 可以接受，
+  但"紧贴内容的矩形框"离不开宽度收窄。
+- **修法方向**：需要为 `wrap_width` 定义独立的宽度传播规则
+  （例如子元素宽度为 0 时在 wrap 测量上下文里改用"内容固有宽度"而非父宽），
+  不能复用 `_width == 0 → 撑满父宽` 的既有语义。
+
 ---
 
 ## 8. 重构方向（按优先级）
@@ -1224,10 +1347,9 @@ Resume(
 - **风险**：`create_columns` 的"宽度不足时把剩余均分"语义与 `split_column_advanced` 的"严格按比例"不同，
   统一时必须显式区分（建议 `layout_band` 只做严格按比例，剩余均分作为 `create_columns` 的私有策略保留）。
 
-### 8.2 【核心】下沉"留白"/间距构件
+### 8.2 【核心】下沉"留白"/间距构件 — ✅ 批次 1 已完成
 
-- **现状**：`ResumeCore` 里出现了 **14 次**几乎逐字相同的代码块（507, 531, 560, 624, 641, 733, 821,
-  908, 933, 972, 1017, 1035, 1070, 1101 行，批次 0 前的行号）：
+- **原状**：`ResumeCore` 里出现了 **14 处**几乎逐字相同的代码块：
 
   ```python
   root.add_child(LayoutObject(
@@ -1237,16 +1359,23 @@ Resume(
   ))
   ```
 
-  纯噪声：颜色无意义（`align_y=FLOW` 时若不 `is_fill` 根本不画），`padding` 有时 `0` 有时 `10` 更是不一致。
-- **建议**：引擎层加一个工厂
+- **实施**：引擎层新增 [`create_spacer(name, height, parent=None, layer=0)`](#create_spacer--批次-1-新增)
+  （API 见 3.4 节），`ResumeCore` 的 14 处全部替换。替换后
+  `ResumeCore.py` 中 `root.add_child(LayoutObject(...))` 形式的留白字面量**归零**。
+- **同时澄清了原方案里一处存疑的推断**：原文写"那些 `Padding.all(10)` 会让 FLOW 间距实际变成
+  `10 + height` 的嫌疑，需要一并核对"。**实测证明该推断不成立** —— 留白 `_height > 0`，
+  `get_effective_height()` 走 `min(_height, avail_h)` 分支，padding 完全不参与：
 
-  ```python
-  def create_spacer(name: str, height: float, parent=None, layer: int = 0) -> LayoutObject
+  ```
+  padding=Padding.all(0)  -> 有效高=5  有效宽=80  abs_y=10
+  padding=Padding.all(10) -> 有效高=5  有效宽=80  abs_y=10
   ```
 
-  `ResumeCore` 里 12 处全部替换为 `create_spacer(...)`。
-- **收益**：`_fill_left_column` / `_fill_right_column` 各瘦身数十行，间距参数一眼可读。
-- **顺带修复**：那些 `Padding.all(10)` 会让 FLOW 间距实际变成 `10 + height` 的嫌疑，需要一并核对。
+  所以 `padding` 与 `color` 都是**无渲染影响的噪声**，`create_spacer` 直接不暴露这两个参数。
+- **收益**：14 处各 11 行的字面量变成 14 处各 4 行的调用，间距参数一眼可读。
+- **验证**：三个入口退出码 0；PDF 规范化比对**三个产物全部逐字节一致**（见 8.10 的验收基线）。
+  `LayoutEngine.py` 测试入口新增 `create_spacer` 构件契约断言（高度、对齐、
+  自动挂载、游离态，以及"padding 不影响有效高度"这一条）。
 
 ### 8.3 【核心】下沉"单块内容"构件（取代 7.8 的手工 `_height` 调参）
 
@@ -1312,11 +1441,17 @@ Resume(
 | 批次 | 内容 | 风险 | 可验证性 | 状态 |
 | --- | --- | --- | --- | --- |
 | **0** | 修 7.1 导入；修 7.15 换行；修 7.17 重复挂载；修 7.18 末尾间距 | 极低 | 三个入口都能跑通 | ✅ **已完成** |
-| **1** | 抽 `create_spacer`（8.2） | 低 | 输出 PDF 应与重构前**逐字节一致** | 待办 |
+| **1** | 抽 `create_spacer`（8.2） | 低 | 输出 PDF 应与重构前**逐字节一致** | ✅ **已完成** |
 | **2** | 抽 `layout_band`，`split_column_advanced` 变包装（8.1） | 中 | 同上，逐字节比对 | 待办 |
 | **3** | 抽 `create_text_block` / `from_style`（8.3、8.4） | 中 | 同上 | 待办 |
-| **4** | 几何属性改 property（8.5） | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
+| **4** | **矩形包围内容前置**：几何属性改 property（8.5）+ 修 7.19 父子高度自指 + 修 7.20 `_height` 卡死 + 明确 `wrap_content` 方向性 | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
+| **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | 待办（批次 4 内交付） |
+| **4b** | 修 7.21 `wrap_width` 完全不可用（阻断点 C） | 中 | 收窄包围盒断言 | 待办 |
 | **5** | 真实行数测量（8.7），去掉 `description_height` | 高 | 视觉验收 | 待办 |
+
+> **批次 4 为何同时承载"矩形包围内容"**：见 8.11 —— 两者是同一件事的两半，
+> property 化解决"何时知道要重算"，修 7.19/7.20 解决"重算能不能算对"。
+> 只做前者会得到"失效通知发出去了、结果还是旧的"这种更难排查的状态，因此必须同批。
 
 > 批次 0 原计划只修 7.1 / 7.15 / 7.5，实际执行时：
 > - 7.5（`get_true_height()` 空实现）**未修**，因为它的正确语义需要设计决策（该返回构造高还是生效高？），
@@ -1334,7 +1469,7 @@ Resume(
    用正则把 `/CreationDate (D:...)`、`/ModDate (D:...)`、
    `/ID [<...> <...>]`、`/Producer (...)` 替换为固定占位符，再算哈希。
 
-批次 0 的实测结果：
+批次 0 的实测结果（基线为批次 0 之前）：
 
 | 产物 | 规范化后 |
 | --- | --- |
@@ -1342,13 +1477,117 @@ Resume(
 | `resume_template_v2_test.pdf` | **完全一致**（61370 字节） |
 | `output/利姆露_*.pdf` | 相差 5 字节 —— 即 7.17、7.18 两处修复带来的预期变化 |
 
-**这就是批次 1~3 的验收基线**：除了被有意修复的缺陷之外，
+批次 1 的实测结果（基线为批次 1 之前）：
+
+| 产物 | 规范化后 |
+| --- | --- |
+| `test_layout_engine_cached.pdf` | **完全一致**（19316 字节） |
+| `resume_template_v2_test.pdf` | **完全一致**（61370 字节） |
+| `output/利姆露_*.pdf` | **完全一致**（68478 字节） |
+
+批次 1 是一次**纯粹的等价重构**（只抽取构件、不改变行为），所以三个产物全部逐字节一致，
+这正是它追求的结果。
+
+**这就是批次 2~3 的验收基线**：除了被有意修复的缺陷之外，
 规范化后的 PDF 必须逐字节一致。任何未预期的差异都说明重构改变了行为，需要逐条解释。
 
-> 📌 **给下一批次的提示**：批次 0 用的参考副本是临时文件，已随探查目录一并删除。
-> 批次 1 动工前，请先**以当前工作树的输出为新基线**：
+> 📌 **给下一批次的提示**：基线用的参考副本放在工作区外的临时目录
+> （`%TEMP%\batch1_baseline\`），不入库。
+> 批次 2 动工前请**以当前工作树的输出为新基线**重取一次：
 > 跑一遍三个入口，把 `test_layout_engine_cached.pdf`、`resume_template_v2_test.pdf`、
 > `output/*.pdf` 复制到工作区外的临时目录，然后才开始改代码。
+
+### 8.11 「矩形包围内容」的实现位置与前置依赖
+
+#### 结论
+
+**它不单独占一批，应与"几何属性改 property"合并为批次 4，并排在该批次最前面。**
+
+而且它实际是一项**修复**而非新增：`wrap_height` / `wrap_content()` /
+`RectangleObject._calculate_wrap_height()` 名义上都已存在，但对"包围内容"这个用途是**反向的**
+（见 7.19）。所以不能把它当作"新功能"来排期。
+
+#### 现状：开启 wrap 反而塌缩
+
+| 实验 | 结果 |
+| --- | --- |
+| `height=0, wrap_height=False` | 有效高 **49.00**（= 内容总高，巧合） |
+| `height=0, wrap_height=True` | 有效高 **4.00**（只剩 padding） |
+| 仅改盒子构造宽 60 → 0 | 均 **4.00**，无改善 |
+| `wrap_width=True`，子元素 `width=0` | 有效宽 **0.00**（见 7.21） |
+
+#### 三个阻断点及其归属
+
+| 阻断点 | 缺陷编号 | 内容 |
+| --- | --- | --- |
+| A | 7.19 | `get_parent_available_area()` 向上要高度，而那个高度正是当前正在计算的值 |
+| B | 7.20 | `invalidate_wrap_cache()` 不清 `_height`，`wrap_content(force=True)` 也无法重算 |
+| C | 7.21 | `wrap_width` 原理上自相矛盾，完全不可用 |
+
+还有两个会在实现阶段绊住的问题（不属于独立缺陷，但需一并决定）：
+
+- **渲染顺序**：`RectangleObject.render()` 无条件实心填充（7.9），
+  而 `render()` 按 `children` **插入顺序**遍历而非图层顺序。
+  包围矩形若在子元素之后渲染就会盖住内容，必须保证先建矩形。
+- **截断语义冲突**：`get_effective_height()` 在 FLOW 模式下超过父可用空间会**静默截断**
+  并置 `_flow_clipped`。包围矩形的语义应当是"撑大自己"，而不是"被父容器腰斩"。
+  这两者需要显式取舍。
+
+#### 为何必须与批次 4 同批，且排在它前面
+
+"矩形包围内容"要求一条**自底向上的尺寸传播链**：
+
+```
+子元素尺寸变化 → 矩形重算 → 矩形尺寸变化 → 兄弟元素（FLOW）下移 → 更上层重算
+```
+
+而目前：
+
+- 尺寸变化**不会自动触发失效** —— `ResumeCore.py` 直接写 `content_obj._height = ...`，
+  `ResumeTemplate.py` 直接改 `_x/_width/align_*`，都没有钩子（见 8.5）。
+- 即便手动调了失效，**阻断点 B（7.20）** 会让重算卡在旧值上。
+
+所以两者是同一件事的两半：**property 化解决"何时知道要重算"，
+修 7.19/7.20 解决"重算能不能算对"。** 先做 property 而不修 B，
+会得到"失效通知发出去了、结果还是旧的"这种更难排查的状态。
+
+`wrap_content()` 的**方向性**也必须在这里一次定清楚，否则后患无穷：
+
+- **自底向上**（包围内容）要求打破对父高的依赖；
+- **自顶向下**（被父容器约束、超出即截断）是现在的行为；
+- 两者不能都靠 `get_parent_available_area()` 实现，需要引入显式的**测量上下文**
+  （例如测量时向上找最近的**已知高度**祖先，而不是直接父）。
+
+#### 与批次 5 的依赖
+
+文本是绝大多数被包围的内容，而文本高度目前是**两套都不准**的估算公式（见 7.7）：
+
+- `calculate_text_size`：`int(text_width / effective_width) + 1`
+- `_calculate_wrap_height`：`len(self._text) // 20 + 1`
+
+这正是 `description_height` 手动调参旋钮存在的原因。
+**只要文本高度还是估算的，矩形包围文本就只能靠手填高度。**
+
+因此拆分为：
+
+| 子批次 | 内容 | 前置 |
+| --- | --- | --- |
+| **4a** | 包围**固定高度**内容（矩形 / 图片 / `_height` 已给定的文本块） | 批次 4 主体完成即可交付 |
+| **4b** | 修 `wrap_width`（阻断点 C，7.21），实现真正收窄 | 可与 4a 同批或拆出 |
+| **5** | 真实行数测量（8.7）之后，才能包围**自动换行的长文本** | 依赖批次 5 |
+
+#### 在批次 4 之前不要固化上层 API
+
+在批次 4 之前**不需要改引擎**也能做出"包围固定高度内容"的效果，只是要手工持有尺寸：
+
+```python
+content_h = sum(c._height for c in box.children) + box.padding.top + box.padding.bottom
+box._height = content_h
+```
+
+这本质上是 `description_height` 那个调参旋钮的翻版 —— 能用，
+但正是批次 4 要消灭的东西。**不建议在批次 4 之前把它固化成上层 API**，
+否则会在功能分支里留下一个将来必须拆掉的接口。
 
 ---
 

@@ -1864,6 +1864,61 @@ def create_columns_balanced(
     )
 
 
+def create_spacer(
+    name: str,
+    height: float,
+    parent: Optional[LayoutObject] = None,
+    layer: int = 0,
+) -> LayoutObject:
+    """
+    创建一个纯留白对象（垂直间距）
+
+    等价于一个 width=0、align_x=CENTER、align_y=FLOW 的 LayoutObject。
+    在流式布局中，它只占据 height 指定的纵向空间，不渲染任何内容。
+
+    设计说明：
+        - 不暴露 color 参数：LayoutObject.render() 在 is_fill=False 时不绘制任何内容，
+          留白对象的 color 对输出没有影响，暴露它只会让调用点出现无意义的取值。
+        - 不暴露 padding 参数：留白对象高度由 height 显式给定（_height > 0），
+          get_effective_height() 走 min(_height, avail_h) 分支，padding 不参与计算。
+        - 不暴露 align_y 参数：留白的语义就是"接在流式序列的下一个位置"，
+          固定为 AlignY.FLOW。
+        - name 保持必填：留白对象同样会写入 objectRegister，
+          自动命名会改变上层依赖的名字，属于不必要的风险。
+
+    Args:
+        name: 对象名称（会注册到 objectRegister）
+        height: 留白高度 (mm)
+        parent: 父容器。非空时自动挂载（调用 add_child，会正确使缓存失效）
+        layer: 图层索引
+
+    Returns:
+        LayoutObject: 新建的留白对象
+
+    Example:
+        >>> create_spacer("Lead_Above_All", 10, root)
+        >>> create_spacer(f"Lead_Between_{i}", 5, root)
+    """
+    spacer = LayoutObject(
+        name=name,
+        x=0,
+        y=0,
+        width=0,
+        height=height,
+        color=White,
+        parent=parent,
+        padding=Padding.all(0),
+        align_x=AlignX.CENTER,
+        align_y=AlignY.FLOW,
+        layer=layer,
+    )
+
+    if parent is not None:
+        parent.add_child(spacer)
+
+    return spacer
+
+
 # ============================================================================
 # 11. 测试入口
 # ============================================================================
@@ -2028,5 +2083,32 @@ if __name__ == "__main__":
     assert _kept not in _probe_parent.children, \
         "已知缺陷 7.4 现状：create_columns 会丢弃父元素既有子元素"
     print("  ✅ create_columns 清空父元素的现状已固化（技术文档 7.4）")
+    
+    # 4) create_spacer 构件契约（批次 1）
+    #    留白对象是流式布局里的纯占位元素，必须满足：
+    #      - 高度由 height 显式给定，有效高度等于该值；
+    #      - align_x/align_y 固定为 CENTER/FLOW，宽度交给父容器决定；
+    #      - padding 不参与有效高度计算（这是"不暴露 padding 参数"的依据）；
+    #      - 传入 parent 时自动挂载，走 add_child（因此缓存失效被正确触发）；
+    #      - 不传入 parent 时保持游离，父指针为 None。
+    _sp_root = LayoutObject(name="SpacerRoot", width=100, height=200,
+                            padding=Padding.all(5))
+    _sp = create_spacer("SpacerA", 7, _sp_root)
+    assert _sp._height == 7, "留白构造高度应为 7"
+    assert _sp.align_x == AlignX.CENTER, "留白的 align_x 应为 CENTER"
+    assert _sp.align_y == AlignY.FLOW, "留白的 align_y 应为 FLOW"
+    assert _sp._width == 0, "留白的构造宽度应为 0（由父容器决定有效宽度）"
+    assert _sp in _sp_root.children, "传入 parent 时留白应被自动挂载"
+    assert _sp.parent is _sp_root, "留白的父指针应指向传入的 parent"
+    assert _sp.get_effective_height() == 7, \
+        f"留白有效高度应为 7，实际 {_sp.get_effective_height()}"
+    # padding 不参与计算：即使被外部改写也不应影响有效高度（批次 1 去掉 padding 参数的依据）
+    _sp.padding = Padding.all(10)
+    assert _sp.get_effective_height() == 7, \
+        f"padding 不应影响留白有效高度，实际 {_sp.get_effective_height()}"
+    _sp_free = create_spacer("SpacerFree", 3)
+    assert _sp_free.parent is None, "不传 parent 时留白应保持游离"
+    assert _sp_free.get_effective_height() == 3, "游离留白的有效高度应等于 height"
+    print("  ✅ create_spacer 构件契约通过")
     
     print("\n✅ 回归契约断言全部通过")

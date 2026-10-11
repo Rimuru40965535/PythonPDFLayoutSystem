@@ -74,6 +74,70 @@
   以及删除旧入口 `PythonPDFLayoutSystem.py`。
 - 留在功能分支（顶层）：`ResumeTemplate.py`、`ResumeCore.py` —— 见下节"分支策略"。
 
+### 2026-10-13
+
+#### **批次 1：抽出留白构件 `create_spacer`**
+
+> 待提交（内容已在暂存区）。本次提交的内容简述如下。
+
+**新增构件**
+
+- `LayoutEngine.py` 新增 `create_spacer(name, height, parent=None, layer=0)` ——
+  创建纯留白对象（垂直间距）。等价于 `width=0`、`align_x=CENTER`、`align_y=FLOW` 的
+  `LayoutObject`；`parent` 非空时自动挂载（走 `add_child`，缓存失效正确触发）。
+- 刻意**不暴露** `color` / `padding` / `align_y` 三个参数，依据是实测：
+  `LayoutObject.render()` 在 `is_fill=False` 时不绘制内容，留白的颜色对输出无影响；
+  留白 `_height > 0` 时 `get_effective_height()` 走 `min(_height, avail_h)` 分支，
+  padding 不参与计算（实测 `Padding.all(0)` 与 `Padding.all(10)` 的有效高/宽/绝对 y 完全相同）。
+
+**替换**
+
+- `ResumeCore.py` 的 **14 处** `Lead_*` 留白字面量全部改为 `create_spacer(...)` 调用，
+  每处从 11 行缩到 4 行；替换后文件中已无裸的留白对象字面量。
+- 抽取前这 14 处的 `color` 用了 `White`/`Black`/`Blue`/`Green`/`Yellow` 五种、
+  `padding` 在 `all(0)` 与 `all(10)` 之间摇摆，都是复制粘贴残留，现已一并消除。
+
+**澄清了一处文档中的存疑推断**
+
+- 技术文档 8.2 原先推测"`Padding.all(10)` 会让 FLOW 间距变成 `10 + height`"。
+  **实测证明该推断不成立**，padding 不参与有效高度计算。文档已更正。
+
+**测试**
+
+- `LayoutEngine.py` 测试入口新增 `create_spacer` 构件契约断言：构造高度、`align` 取值、
+  自动挂载与父指针、游离态，以及"padding 不影响有效高度"。
+- 三个入口退出码 0。
+- **规范化比对：三个产物全部逐字节一致**（`19316` / `61370` / `68478` 字节）。
+  批次 1 是纯粹的等价重构，只抽构件、不改行为，这正是它追求的结果。
+
+### 2026-10-14
+
+#### **批次 4 的前置分析（矩形包围内容）**
+
+> 待提交（内容已在暂存区），与技术文档同批。本次提交的内容简述如下。
+
+- 实测确认 `wrap_height=True` 会让高度**塌缩为 padding**（同一结构 49.00 → 4.00），
+  根因是父子高度的循环依赖：子元素有效高度被父可用高度裁剪，而父可用高度又来自父的有效高度。
+  此项记为缺陷 7.19。
+- 实测确认 `invalidate_wrap_cache()` 不清 `_height`，导致 wrap 结果一旦算错便永久卡死，
+  连 `wrap_content(force=True)` 也无法重算。此项记为缺陷 7.20。
+- 实测确认 `wrap_width` 三条路径全部返回 0，原理上自相矛盾（收窄要求子宽自主，
+  而 `_width == 0` 的语义是"撑满父宽"）。此项记为缺陷 7.21。
+- 结论：**"矩形包围内容"不单独占一批，与"几何属性改 property"合并为批次 4，并排在其最前面。**
+  两者是同一件事的两半 —— property 化解决"何时知道要重算"，
+  修 7.19/7.20 解决"重算能不能算对"。批次表已拆出 4a（包围固定高度内容）与
+  4b（修 `wrap_width`）；包围自动换行的长文本依赖批次 5 的真实行数测量。
+- 技术文档新增 8.11 节完整记录该分析。
+
+**Git 远端访问**
+
+- 本轮实测：GitHub 只读操作恢复正常（`ls-remote` 2.97s、`fetch --dry-run` 1.43s，退出码 0），
+  `f718518` 已推送成功，本地与 `origin/master` 零分叉。
+
+> ⚠️ **日期需核对**：上面的 `2026-10-12` ~ `2026-10-14` 是为满足
+> "每一个四级标题都是时间"这条规则而填的占位日期（`2026-10-11` 之外的日期我无法确知）。
+> 提交前请改为实际日期；若某几次修改在同一提交内完成，可合并为一个四级标题。
+
 ---
 
 ## 分支策略
@@ -101,38 +165,45 @@
 
 ### 本次整理：`master` 的暂存内容
 
-以下内容已进入暂存区，属于底层，可在审阅后提交：
+`f718518` 已提交并推送。在其之上，**批次 1** 产生了以下待提交内容：
 
 | 状态 | 文件 | 说明 |
 | --- | --- | --- |
-| `A` | `LayoutEngine.py` | 排版引擎本体（含批次 0 的回归契约断言） |
-| `A` | `TECHNICAL.md` | 技术文档 |
-| `A`（改） | `SKILLS.md` | 协作规则 |
+| `M` | `LayoutEngine.py` | 新增 `create_spacer` 构件 + 其构件契约断言 |
+| `M` | `TECHNICAL.md` | 8.2 标完成、`create_spacer` API 条目、缺陷 7.19~7.21、8.11 矩形包围分析、批次表更新 |
 | `M` | `README.md` | 本文件 |
-| `D` | `PythonPDFLayoutSystem.py` | 旧入口占位文件，删除 |
 
-暂存区之外、**留给功能分支**的内容：
+暂存区之外、**留给功能分支**的内容（自 `f718518` 起一律未跟踪，符合分层归属）：
 
 | 状态 | 文件 | 说明 |
 | --- | --- | --- |
 | `??` | `ResumeTemplate.py` | 顶层：简历版式词汇 |
-| `??` | `ResumeCore.py` | 顶层：简历领域模型与生成流程 |
+| `??` | `ResumeCore.py` | 顶层：简历领域模型与生成流程（已改用 `create_spacer`） |
 
 两者互相依赖（`ResumeCore` 依赖 `ResumeTemplate`），必须同分支落地，
 且 `ResumeCore.py` 当前已修到可运行（退出码 0）。
+
+> ⚠️ **批次 1 让底层与顶层暂时不同步**：`ResumeCore.py` 现在调用
+> `LayoutEngine.create_spacer`，但 `ResumeCore.py` 自身未入库。
+> 这不构成问题 —— 依赖方向是顶层依赖底层，
+> `master` 上的 `LayoutEngine.py` 只是多了一个暂时无人使用的构件。
 
 生成物一律不入库：`test_layout_engine_cached.pdf`、`resume_template_v2_test.pdf`、
 `output/` —— 它们随代码变化，提交后会让每次功能分支合并都产生冲突。
 
 ### 待决事项
 
-1. **`main.py` 的归属**：内容仅为占位（`print("Hello,world!")`），
-   但当前在暂存区内。如果 `master` 只保留引擎，可考虑移到功能分支。
-2. **`TECHNICAL.md` 与 `master` 内容存在时间差**：文档第 4、5 章描述的是
+1. **功能分支尚未建立**：`master` 目前只有引擎与文档。等到批次 2、3 把中层设施
+   （`layout_band`、`create_text_block`、`Style`）也下沉完毕后，即可从 `master` 签出
+   功能分支，把 `ResumeTemplate.py` / `ResumeCore.py` 作为首个提交放进去。
+2. **`main.py` 的归属**：内容仅为占位（`print("Hello,world!")`），
+   已在 `f718518` 中入库。若认为 `master` 只该留引擎，可在功能分支里替换为真正的入口。
+3. **`TECHNICAL.md` 与 `master` 内容存在时间差**：文档第 4、5 章描述的是
    `ResumeTemplate.py` / `ResumeCore.py`，而这两个文件不在 `master` 上。
    目前将其整体归为底层文档（它们描述的是引擎的既有消费方，对引擎的约束仍然有效）；
    若日后 `master` 需要独立自洽，可把这两章拆到功能分支的文档里。
-3. **`PythonPDFLayoutSystem.pyproj` / `.slnx` 仍引用已删除的旧入口**：
+   注意第 3.4 节的 `create_spacer` 条目**属于底层**，不受此影响。
+4. **`PythonPDFLayoutSystem.pyproj` / `.slnx` 仍引用已删除的旧入口**：
 
    ```xml
    <StartupFile>PythonPDFLayoutSystem.py</StartupFile>
@@ -141,15 +212,11 @@
 
    这两处需改为指向 `LayoutEngine.py`（并补上其它源文件），否则在 Visual Studio
    中打开该项目会看到失联的启动文件。
-4. **建议把生成物写进 `.gitignore`**：追加 `*.pdf` 与 `output/`，
+5. **建议把生成物写进 `.gitignore`**：追加 `*.pdf` 与 `output/`，
    以免日后误提交。
-5. **`SKILLS.md` 的新增规则已一并暂存**，内容为：
-
-   > 一并在 README 中简要描述本次修改。
-   > 　修改的描述跟着 Git 提交，一个四级标题下的修改应该描述接下来的提交项中有什么修改，
-   > 　每一个四级标题都是时间。
-
-   本文档的"开发日志"一节已按该规则组织：四级标题为时间（日期），
-   标题下的内容描述紧随其后的那次提交。
+6. **`Resources/` 是否入库仍未定**：内含 6 个霞鹜文楷 TTF，单个 18–21 MB、合计约 117 MB。
+   完全不入库则新克隆的仓库缺字体、中文静默降级为空白；全量入库则仓库显著变重。
+   可选：全部入库 / 只入 Regular+Bold / Git LFS / 只写下载说明。
+   目前没有任何 `.gitignore` 规则覆盖它，**将来一定会被误提交**。
 
 ---

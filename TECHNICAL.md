@@ -7,8 +7,10 @@
 > 批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）、
 > 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）、
 > 批次 3（`Style` 下沉 + `from_style` + `create_text_block`，8.3 / 8.4）、
-> **批次 4.1（四轴：新增 `SizeX` / `SizeY` / `LayoutCycleError`，无损）**。
-> 批次 4 其余步骤进行中；批次 6（分页）暂缓。
+> **批次 4.1（四轴：`SizeX` / `SizeY` / `LayoutCycleError`）、
+> 批次 4.2（两趟遍历，修 7.19 / 7.20）、批次 4.3（几何属性 property 化，8.5）**。
+> 批次 4.4（删 `wrap_*` 兼容属性）、4.5（包围盒兑现）、4b（修 7.21）、
+> 批次 5（真实行数测量）、批次 6（分页）待办。
 >
 > ⚠️ **中层与顶层文件不在 `master` 上**（`ResumeTemplate.py` / `ResumeCore.py` 属功能分支）。
 > 因此有一部分改动**无法在 `master` 完成**，集中记录在 `SKILLS.md` 的
@@ -1793,16 +1795,46 @@ Resume(
   （本批只新增 API、未修改任何既有函数体）。测试入口新增 `Style` / `from_style` /
   `create_text_block` 断言共 13 项。
 
-### 8.5 统一缓存失效入口
+### 8.5 统一缓存失效入口 — ✅ 批次 4.3 已完成
 
-- **现状**：`_x/_y/_width/_height/_layer/padding/align_x/align_y` 全是裸属性或私有属性，
-  外部可以直接写（`ResumeCore.py:1256` `content_obj._height = ...`、
-  `ResumeTemplate.py:308-323` 直接改 `_x/_width/align_*`），**没有任何钩子触发失效**。
-- **建议**：把几何属性改为 `@property` + setter，setter 内自动
-  `invalidate_geom_cache()` + `invalidate_wrap_cache()`。
-- **收益**：从机制上消灭 7.3 / 7.4 这类"忘了失效"的 bug，外部也不必再碰 `_height`。
-- **风险**：需要先确认没有代码依赖"直接写得快"的行为（例如先设 `_height` 再立刻读数）。
-  建议先加 `set_size(width, height)` / `set_position(x, y)` 显式接口作为过渡。
+- **原状**：`_x/_y/_width/_height/padding/align_x/align_y` 全是裸属性或私有属性，
+  外部可以直接写（`ResumeCore.py` 的 `content_obj._height = ...`、
+  `ResumeTemplate.py` 直接改 `_x/_width/align_*`），**没有任何钩子触发失效**。
+- **实施**：全部改为 `@property` + setter，setter 内触发 `invalidate_geom_cache()`：
+
+  | 属性 | setter 行为 |
+  | --- | --- |
+  | `padding` | 触发失效（影响内容区，进而影响 `CONTENT` 尺寸与子元素位置） |
+  | `align_x` / `align_y` | 触发失效 |
+  | `x` / `y` | 触发失效 |
+  | `width` / `height` | 触发失效，并**同步尺寸方式**：`> 0` → `FIXED`，`== 0` → `FILL` |
+  | `size_x` / `size_y` | 触发失效 |
+
+  `width` / `height` 的"同步尺寸方式"是关键：它让"先构造、后声明尺寸"的旧写法
+  （`obj.height = N`）能正确生效。**直接写 `_width` / `_height` 会绕过这一步**，
+  构造时若为 0 则尺寸方式已是 `FILL`，之后写私有字段不会改回 `FIXED`，`FILL` 会覆盖它。
+  测试入口 10.4 把这条不变量固化成了断言。
+
+- **新增四个显式接口**（都返回 `self`，支持链式）：
+
+  ```python
+  set_size(width=None, height=None)
+  set_position(x=None, y=None)
+  set_align(align_x=None, align_y=None)
+  set_padding(padding=None)          # float 会转成 Padding.all
+  ```
+
+  `None` 一律表示"不修改该轴"，因此可以只设一个方向。
+
+- **构造期不走 property**：`__init__` 直接写 `_padding` / `_align_x` / `_align_y` 等私有字段，
+  否则每构造一个对象都要向上无效化整条祖先链。`create_band` 里同理，
+  逐项写私有字段后统一调一次 `invalidate_geom_cache()`。
+
+- **收益**：从机制上消灭"忘了失效"这类 bug；调用方不必再碰私有字段。
+- **验收**：三个入口退出码 0；**三个产物逐字节一致**（本次是等价重构）。
+  新增断言：`padding` 改动对 `CONTENT` 尺寸生效（40 → 54）、
+  `align` 改动对位置生效（LEFT→RIGHT、TOP→BOTTOM）、四个显式接口触发失效并返回 self、
+  显式 `CONTENT` 不被 `height` 赋值覆盖、直接写私有字段会绕过尺寸方式。
 
 ### 8.6 修掉 wrap 宽度路径
 
@@ -1865,16 +1897,21 @@ Resume(
 >   暂以测试入口断言固化"当前返回 `None`"的现状；
 > - **新增修复**了 7.17、7.18 两个在做前置探查时新发现的缺陷。
 
-#### 验证方法（批次 1~3 必须沿用）
+#### 验证方法（批次 1~3 沿用；批次 4 起用法有变）
 
 生成的 PDF 内含 `CreationDate` / `ModDate` / `ID` / `Producer` 等易变字段，
-**直接做字节比对会永远失败**。批次 0 采用的比对流程：
+**直接做字节比对会永远失败**。规范化流程：
 
 1. 重构前先跑一遍，把生成的 PDF 另存为参考副本；
 2. 重构后再跑一遍；
 3. 对两份文件做**规范化**后比对——按字节以 Latin-1 读入，
    用正则把 `/CreationDate (D:...)`、`/ModDate (D:...)`、
    `/ID [<...> <...>]`、`/Producer (...)` 替换为固定占位符，再算哈希。
+
+> ✅ **已固化为工具**：`verify_pdfs.py`（批次 4.2 新增）。
+> 用法 `py verify_pdfs.py --baseline <目录>`，只读文件、不改动任何内容。
+> 之所以要做成工具 —— 标准工具链里没有 pypdf / PyMuPDF，
+> 而每次手工算哈希既啰嗦又容易写错。
 
 批次 0 的实测结果（基线为批次 0 之前）：
 
@@ -1922,6 +1959,23 @@ Resume(
 
 批次 1、2、3 都是**纯粹的等价重构或纯新增**（只抽构件 / 只加 API，不改变既有行为），
 所以三个产物全部逐字节一致，这正是它们追求的结果。
+
+批次 4.1 / 4.2 / 4.3 的实测结果（基线为批次 4 之前）：
+
+| 产物 | 4.1（四轴枚举） | 4.2（两趟遍历） | 4.3（property 化） |
+| --- | --- | --- | --- |
+| `test_layout_engine_cached.pdf` | **完全一致** | **完全一致** | **完全一致** |
+| `resume_template_v2_test.pdf` | **完全一致** | **完全一致** | **完全一致** |
+| `output/利姆露_*.pdf` | **完全一致** | **完全一致** | **完全一致** |
+
+> ✅ **批次 4.2 的逐字节一致是一个很强的结果**：引擎的整棵测试树走的是**全新的两趟遍历**，
+> 输出却与旧的惰性递归实现完全相同。这既证明重构是行为等价的，
+> 也说明旧实现在**没有 `CONTENT` 节点**时本来就给出了正确的几何 ——
+> 7.19 只在 `wrap_height` 参与时才发作。
+>
+> 同时它也是这一批最有价值的排错手段：4.2 期间修掉的 **4 个实现 bug**
+> （padding 减两次、`_place` 原点语义、无限递归、带容器格子尺寸方式）
+> **全部是被逐字节比对暴露的**，只跑"退出码 0"一个都发现不了。
 
 > ✅ **「只增不改」是一种可验证的强约束**：批次 3 新增了 `Style` 类、两个 `from_style`
 > 工厂与 `create_text_block`，**没有修改任何既有函数体**。因此逐字节基线是这个批次

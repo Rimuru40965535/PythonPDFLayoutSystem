@@ -413,6 +413,43 @@ social_media.png  contact_address.png  website.png
   **包围高与父高无关（父高 100/300/800 下均为 55）**、CONTENT 夹紧与溢出标记、
   尺寸循环报错、结构循环报错、失效传导（加子/改子元素后重算拿到新值）、FLOW 溢出裁剪。
 
+#### **批次 4.3：几何属性 property 化**
+
+> 待提交。本次提交的内容简述如下。
+
+`_x` / `_y` / `_width` / `_height` / `padding` / `align_x` / `align_y` 全部改为
+`@property` + setter，setter 内触发 `invalidate_geom_cache()` —— 从机制上消灭
+"忘了失效"这一类 bug（7.3 / 7.4 的根因）。
+
+**`width` / `height` 的 setter 会同步尺寸方式**：`> 0` → `FIXED`，`== 0` → `FILL`。
+这让"先构造、后声明尺寸"的旧写法（`obj.height = N`）能正确生效 ——
+构造时若为 0，尺寸方式已是 `FILL`，之后写私有字段不会改回 `FIXED`，`FILL` 会覆盖它。
+
+**新增四个显式接口**（都返回 `self`，`None` 表示不修改该轴）：
+
+```python
+set_size(width=None, height=None)
+set_position(x=None, y=None)
+set_align(align_x=None, align_y=None)
+set_padding(padding=None)          # float 会转成 Padding.all
+```
+
+**构造期不走 property**：`__init__` 直接写 `_padding` / `_align_x` / `_align_y` 等私有字段，
+否则每构造一个对象都要向上无效化整条祖先链。`create_band` 里同理，逐项写私有字段后
+统一调一次失效。
+
+**测试**
+
+- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致** —— 本次是等价重构；
+- 新增 7 项断言：`padding` 改动对 `CONTENT` 尺寸生效（40 → 54）、
+  `align` 改动对位置生效（LEFT→RIGHT、TOP→BOTTOM）、四个显式接口触发失效并返回 self、
+  **显式 `CONTENT` 不被 `height` 赋值覆盖**、
+  **「直接写私有字段会绕过尺寸方式」的不变量已固化**。
+
+> 最后那两项是排查中确认的语义边界，值得单独指出：
+> `height` 赋值**不会**覆盖调用方显式声明的 `CONTENT`（那是他明确表达的意图）；
+> 而直接写 `_height` 则会绕过尺寸方式解析 —— 这正是需要公开接口的理由。
+
 ---
 
 ## 分支策略

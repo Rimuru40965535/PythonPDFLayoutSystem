@@ -514,16 +514,18 @@ class LayoutObject:
         self._flow_clipped = False
         
         # 处理内边距
+        # 构造期直接写私有字段（_padding / _align_*），不走公开 property ——
+        # 否则每构造一个对象都要向上无效化整条祖先链。
         if padding is None:
-            self.padding = Padding()
+            self._padding = Padding()
         elif isinstance(padding, (int, float)):
-            self.padding = Padding.all(float(padding))
+            self._padding = Padding.all(float(padding))
         else:
-            self.padding = padding
+            self._padding = padding
         
         # 对齐方式
-        self.align_x = align_x
-        self.align_y = align_y
+        self._align_x = align_x
+        self._align_y = align_y
         
         # 图层支持
         self._layer = layer
@@ -643,6 +645,94 @@ class LayoutObject:
     def y(self, value: float) -> None:
         self._y = value
         self.invalidate_geom_cache()
+    
+    @property
+    def padding(self) -> Padding:
+        """
+        内边距
+
+        批次 4.3 起是 property：赋值会触发失效。内边距影响内容区，
+        因此 CONTENT 元素的内容尺寸与所有子元素的位置都可能随之变化。
+        """
+        return self._padding
+    
+    @padding.setter
+    def padding(self, value: Padding) -> None:
+        if self._padding is not value:
+            self._padding = value
+            self.invalidate_geom_cache()
+    
+    @property
+    def align_x(self) -> AlignX:
+        """水平对齐方式（只决定位置，不决定尺寸）"""
+        return self._align_x
+    
+    @align_x.setter
+    def align_x(self, value: AlignX) -> None:
+        if self._align_x != value:
+            self._align_x = value
+            self.invalidate_geom_cache()
+    
+    @property
+    def align_y(self) -> AlignY:
+        """垂直对齐方式（只决定位置，不决定尺寸）"""
+        return self._align_y
+    
+    @align_y.setter
+    def align_y(self, value: AlignY) -> None:
+        if self._align_y != value:
+            self._align_y = value
+            self.invalidate_geom_cache()
+    
+    def set_size(self, width: Optional[float] = None,
+                 height: Optional[float] = None) -> 'LayoutObject':
+        """
+        显式设置尺寸（会同步尺寸方式并触发失效）
+
+        这是"先构造、后声明尺寸"的推荐写法。直接写 `_width` / `_height`
+        会**绕过尺寸方式解析** —— 构造时若 width/height 为 0，尺寸方式被推成 FILL，
+        之后直接写私有字段不会改回 FIXED，FILL 会覆盖它。
+
+        Args:
+            width: 新宽度。None 表示不改。> 0 置 SizeX.FIXED，== 0 置 SizeX.FILL
+            height: 新高度。语义同 width，作用于 SizeY
+
+        Returns:
+            LayoutObject: self（支持链式调用）
+        """
+        if width is not None:
+            self.width = width
+        if height is not None:
+            self.height = height
+        return self
+    
+    def set_position(self, x: Optional[float] = None,
+                     y: Optional[float] = None) -> 'LayoutObject':
+        """显式设置偏移（相对父内容区左上方）。None 表示不改。返回 self。"""
+        if x is not None:
+            self.x = x
+        if y is not None:
+            self.y = y
+        return self
+    
+    def set_align(self, align_x: Optional[AlignX] = None,
+                  align_y: Optional[AlignY] = None) -> 'LayoutObject':
+        """显式设置对齐方式。None 表示不改。返回 self。"""
+        if align_x is not None:
+            self.align_x = align_x
+        if align_y is not None:
+            self.align_y = align_y
+        return self
+    
+    def set_padding(self, padding: Optional[Union[Padding, float]] = None,
+                    ) -> 'LayoutObject':
+        """显式设置内边距。float 会转成 Padding.all。None 表示不改。返回 self。"""
+        if padding is not None:
+            if isinstance(padding, (int, float)):
+                self.padding = Padding.all(float(padding))
+            else:
+                self.padding = padding
+        return self
     
     @property
     def size_x(self) -> SizeX:
@@ -2268,8 +2358,9 @@ def create_band(
             if band_height > 0:
                 obj._size_y = SizeY.FIXED
 
-        obj.align_x = AlignX.NONE
-        obj.align_y = AlignY.NONE
+        # 构造期赋值直接写私有字段，末尾统一失效一次，避免逐项触发向上传播
+        obj._align_x = AlignX.NONE
+        obj._align_y = AlignY.NONE
         obj._x = cursor
         obj._y = 0
         obj.invalidate_geom_cache()
@@ -3217,5 +3308,92 @@ if __name__ == "__main__":
     assert _fz_b.get_effective_height() == 10, \
         f"应裁剪到剩余 10，实际 {_fz_b.get_effective_height()}"
     print("    ✅ FLOW 溢出裁剪通过")
+    
+    # 10) 几何属性 property 化 + 显式接口（批次 4.3）
+    print("  --- 几何属性 property 与显式接口 ---")
+    # 10.1 padding setter 触发失效，且改动对 CONTENT 尺寸生效
+    _pd_root = LayoutObject(name="PD_Root", width=200, height=300)
+    _pd = LayoutObject(name="PD_Box", width=0, height=0, size_y=SizeY.CONTENT,
+                       padding=Padding.all(5), align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _pd_root.add_child(_pd)
+    _pd.add_child(LayoutObject(name="PD_C", width=0, height=30,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _pd_root.layout()
+    assert _pd.get_effective_height() == 40, \
+        f"padding 5+5 + 内容 30 应为 40，实际 {_pd.get_effective_height()}"
+    _pd.padding = Padding.all(12)
+    assert _pd._layout_valid is False, "改 padding 应使布局失效"
+    assert _pd.get_effective_height() == 54, \
+        f"padding 12+12 + 内容 30 应为 54，实际 {_pd.get_effective_height()}"
+    print("    ✅ padding setter 失效并生效通过（40 → 54）")
+    # 10.2 align setter 触发失效，且改动对位置生效
+    _al_root = LayoutObject(name="AL_Root", width=100, height=100)
+    _al = LayoutObject(name="AL_C", width=20, height=20,
+                       align_x=AlignX.LEFT, align_y=AlignY.TOP)
+    _al_root.add_child(_al)
+    _al_root.layout()
+    assert _al.get_absolute_x() == 0.0, f"LEFT 应为 0，实际 {_al.get_absolute_x()}"
+    _al.align_x = AlignX.RIGHT
+    assert _al._layout_valid is False, "改 align_x 应使布局失效"
+    assert _al.get_absolute_x() == 80.0, \
+        f"RIGHT 应为 100-20=80，实际 {_al.get_absolute_x()}"
+    _al.align_y = AlignY.BOTTOM
+    assert _al.get_absolute_y() == 80.0, \
+        f"BOTTOM 应为 100-20=80，实际 {_al.get_absolute_y()}"
+    print("    ✅ align setter 失效并生效通过（LEFT→RIGHT、TOP→BOTTOM）")
+    # 10.3 四个显式接口触发失效、返回 self
+    _if_root = LayoutObject(name="IF_Root", width=200, height=300)
+    _if = LayoutObject(name="IF_C", width=0, height=0,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _if_root.add_child(_if)
+    _if.add_child(LayoutObject(name="IF_C0", width=0, height=20,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _if_root.layout()
+    assert _if.size_y == SizeY.FILL and _if.get_effective_height() == 300
+    # set_size：> 0 置 FIXED，== 0 退回 FILL
+    assert _if.set_size(height=50) is _if, "set_size 应返回 self"
+    assert _if._layout_valid is False and _if.size_y == SizeY.FIXED, \
+        f"set_size(height=50) 后应为 FIXED，实际 {_if.size_y.name}"
+    assert _if.get_effective_height() == 50, f"应为 50，实际 {_if.get_effective_height()}"
+    _if.set_size(height=0)
+    assert _if.size_y == SizeY.FILL, "set_size(height=0) 应退回 FILL"
+    assert _if.get_effective_height() == 300, f"FILL 应为 300，实际 {_if.get_effective_height()}"
+    # 显式的 CONTENT 模式**不应**被 height 赋值覆盖（那是调用方明确表达的意图）
+    _ct_keep = LayoutObject(name="IF_CT", width=0, height=0, size_y=SizeY.CONTENT,
+                            align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _ct_keep.height = 50
+    assert _ct_keep.size_y == SizeY.CONTENT, \
+        "显式 CONTENT 不应被 height 赋值改成 FIXED"
+    _ct_keep.size_y = SizeY.FIXED
+    _ct_keep.height = 50
+    assert _ct_keep.size_y == SizeY.FIXED
+    print("    ✅ 显式 CONTENT 不被 height 赋值覆盖通过")
+    # set_position / set_align / set_padding
+    assert _if.set_position(x=7, y=9) is _if
+    assert _if._x == 7 and _if._y == 9
+    assert _if.set_align(align_x=AlignX.CENTER) is _if
+    assert _if.align_x == AlignX.CENTER
+    assert _if.set_padding(3) is _if
+    assert _if.padding.left == 3 and _if.padding.bottom == 3, \
+        "set_padding(float) 应转成 Padding.all"
+    assert _if.set_padding(Padding.left(6)) is _if
+    assert _if.padding.left == 6 and _if.padding.top == 0
+    print("    ✅ set_size / set_position / set_align / set_padding 通过")
+    # 10.4 不变量：直接写私有字段会绕过尺寸方式解析（这是公开接口存在的理由）
+    #      注意必须在**有父容器**时验证：游离对象没有约束可填，FILL 会退回声明值。
+    _raw_root = LayoutObject(name="RAW_Root", width=100, height=300)
+    _raw = LayoutObject(name="RAW_C", width=0, height=0, size_y=SizeY.FILL,
+                        align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _raw_root.add_child(_raw)
+    _raw_root.layout()
+    assert _raw.get_effective_height() == 300, "FILL 应撑满父内容区"
+    _raw._height = 42                      # 故意绕过 property
+    assert _raw.size_y == SizeY.FILL, "直接写 _height 不应改变尺寸方式"
+    assert _raw.get_effective_height() == 300, \
+        "直接写 _height 后 FILL 仍覆盖它，有效高不应变成 42"
+    _raw.height = 42                       # 走公开 property
+    assert _raw.size_y == SizeY.FIXED, "写 height 应同步为 FIXED"
+    assert _raw.get_effective_height() == 42
+    print("    ✅ 「直接写私有字段会绕过尺寸方式」的不变量已固化")
     
     print("\n✅ 回归契约断言全部通过")

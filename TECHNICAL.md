@@ -1,10 +1,12 @@
 # PythonPDFLayoutSystem 技术文档
 
-> 本文档由代码实读整理，对应工作区当前状态（git `master` @ `f718518` **之后的未提交工作树**）。
+> 本文档由代码实读整理，对应工作区当前状态（`master` 上的 `8af9962` **之后的未提交工作树**）。
 > 所有函数签名、参数、返回值均取自实际代码；标为"实测"的结论均附可复现的观测数据。
 >
-> **已完成批次**：批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）。
-> 批次 4 承载"矩形包围内容"，前置分析见 8.11。
+> **已完成批次**：基础设施（`.gitignore` + 字体说明 + `.pyproj` 入口）、
+> 批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）、
+> 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）。
+> 批次 4 承载"矩形包围内容"，前置分析见 8.11；批次 6（分页）暂缓。
 
 ---
 
@@ -55,10 +57,14 @@
 | --- | --- |
 | `py LayoutEngine.py` | ✅ 退出码 0，生成 `test_layout_engine_cached.pdf` |
 | `py ResumeTemplate.py` | ✅ 退出码 0，生成 `resume_template_v2_test.pdf` |
-| `py ResumeCore.py` | ❌ **退出码 1，`ModuleNotFoundError: No module named 'ResumeTemplateV2'`** |
+| `py ResumeCore.py` | ✅ 退出码 0，生成 `output/{姓名}_{职位}_{公司}.pdf` |
 
-`ResumeCore.py:65` 从 `ResumeTemplateV2` 导入，但文件已更名为 `ResumeTemplate.py`。
-**结果：一条完整简历的生成链路（`Resume.Generate`）当前不可运行。** 详见 7.1。
+> 上面是**当前工作树**的实测结果。三个入口此前均不可用：
+> `ResumeCore.py` 曾因 `from ResumeTemplateV2 import ...` 直接抛 `ModuleNotFoundError`
+> （导入断裂，批次 0 修复，详见 7.1）。
+>
+> 两个测试 PDF 与 `output/` **已被 `.gitignore` 忽略**（`*.pdf` 与 `output/` 规则）——
+> 它们随代码变化且可由测试入口复现，不入库。
 
 ### 1.3 解释器与依赖
 
@@ -72,6 +78,12 @@ fpdf2 2.8.8          ← 已安装，可用
 ### 1.4 资源缺口
 
 `Resources/` 实际只有 6 个字体文件（`LXGWWenKai*.ttf`）。
+
+> **字体不入库**（基础设施批次起）：`.gitignore` 已加入 `Resources/*.ttf`。
+> 字体约 117 MB，属本地资源；获取方式写在 README 的「资源获取」一节
+> （霞鹜文楷 LXGW WenKai，SIL OFL 1.1，可免费商用）。
+> **缺少字体会导致中文渲染为空白且不报错** —— 引擎静默降级到内置 helvetica。
+> 只忽略 `*.ttf`，未来补充的图标/照片仍应正常入库。
 
 但代码引用了以下**并不存在**的图片：
 
@@ -131,8 +143,9 @@ Colors、LayoutObject、Utils、PaddingsAligns、LayoutEngineV2、LayoutEngine�
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**当前的分层违规**：`split_column_advanced`（中层能力）住在 `ResumeTemplate.py`（顶层文件）里，
-`ResumeCore.py` 因此不得不 `from ResumeTemplate import ...` 才能分栏。第 8 章第 1 项即针对此点。
+**分层违规（批次 2 已消除）**：`split_column_advanced`（中层能力）原本住在 `ResumeTemplate.py`
+（顶层文件）里，`ResumeCore.py` 因此不得不 `from ResumeTemplate import ...` 才能分栏。
+批次 2 已把它连同新的 `create_band` 一起移入引擎（见 3.4），依赖方向恢复正常。
 
 ### 2.2 依赖图
 
@@ -290,9 +303,10 @@ LayoutObject(
 | `get_previous_flow_sibling` | `() -> Optional[LayoutObject]` | 前一个 `align_y == FLOW` 的兄弟 | FLOW 布局的核心 |
 | `get_flow_children` | `() -> List[LayoutObject]` | 所有 `align_y == FLOW` 的子元素 | **过滤式**，不保证返回全部子元素 |
 
-> ⚠️ `split_column_advanced` 绕过 `add_child`，直接 `container.children.append(...)`
-> （`ResumeTemplate.py:313, 323`），因此不会触发缓存失效，靠末尾手动 `parent.invalidate_wrap_cache()` 兜底。
-> 见 7.3。
+> ✅ **缺陷 7.3 已修（批次 2）**：`split_column_advanced` 原先绕过 `add_child`，
+> 直接 `container.children.append(...)` 并单独赋 `parent`，因此不触发缓存失效，
+> 靠末尾手动 `parent.invalidate_wrap_cache()` 兜底（且**几何缓存仍未失效**）。
+> 移入引擎后改为走 `create_band` → `add_child`，失效由机制保证。
 
 #### 几何查询（渲染的真相来源）
 
@@ -467,7 +481,54 @@ pdf.rect(abs_x, abs_y, eff_w, eff_h, 'F')
 
 即 `RectangleObject` 永远实心填充。见 7.9。
 
-### 3.4 中层：分栏
+### 3.4 中层：横向布局
+
+#### `create_band(...)` —— 批次 2 新增，横向布局的基础构件
+
+```python
+create_band(
+    parent: LayoutObject,
+    cells: List[Union[float, LayoutObject]],
+    gap: float = 0,
+    padding: Optional[Union[Padding, float]] = None,
+    height: float = 0,
+    names: Optional[List[str]] = None,
+    colors: Optional[List[Color]] = None,
+    layer: int = 0,
+    container_name: Optional[str] = None,
+) -> LayoutObject          # 返回新建的带容器
+```
+
+把若干个"格子"并排放在一个流式行里。`create_columns` 与 `split_column_advanced`
+都是它的包装。
+
+`cells` 的两种元素形式：
+
+| 元素类型 | 含义 |
+| --- | --- |
+| `float` | 视为**比例权重**，在带内新建一个空 `LayoutObject` 作为格子 |
+| `LayoutObject` | **直接复用**该对象作为格子（保留其自身 `_width`） |
+
+宽度分配（**严格按比例，不做"剩余空间均分"** —— 后者是 `create_columns` 独有的语义）：
+
+```
+可用宽 = 父内容区宽 - gap * (n - 1)
+比例权重格子 -> 可用宽 * (权重 / 权重之和)
+已构造对象   -> 保留自身 _width，由 gap 与前面的格子决定 _x
+```
+
+行为要点：
+
+1. 带容器尺寸 = `(父内容区宽, height)`，放在父内容区原点，`align_x/y = NONE`。
+2. `height = 0` → 取父内容区高；此时若父内容区高也为 0，抛 `ValueError`。
+3. 格子 `_x` 依次累加，相邻格子之间留 `gap`；格子 `_height` 统一为 `height`。
+4. 已构造对象会被**接管 `_x` / `_y` / `_height` 与 `align_*`**，但宽度保留。
+5. 全部挂载走 `add_child`，因此缓存失效被正确触发（对比缺陷 7.3）。
+6. `container_name` 默认 `"{parent.name}_band"`。
+
+**返回值与旧 API 的差异**：返回**新建的带容器**，不是传入的 `parent`。
+`create_columns` / `create_columns_balanced` 也随之改为返回带容器（此前它们返回 `parent`）。
+`split_column_advanced` 为保持链式调用兼容，**仍返回 `parent`**。
 
 #### `create_columns(...)`
 
@@ -482,20 +543,27 @@ create_columns(
     names: Optional[List[str]] = None,
     colors: Optional[List[Color]] = None,
     layer: int = 0,
-) -> LayoutObject          # 返回传入的 parent，支持链式
+) -> LayoutObject          # 返回新建的带容器
 ```
+
+实现是**两趟**：先用自己的语义算出各栏宽度，再交给 `create_band` 排放。
+`create_band` 只做严格按比例，所以"剩余量均分"这一步必须留在本函数里。
 
 行为要点：
 
 1. `column_widths` 与 `column_ratios` **互斥**，同时给出抛 `ValueError`。
 2. 宽度分配（`usable = content_w - gap*(n-1)`）：
-   - `column_widths` 给定：总和超出则等比缩小；不足则**把剩余空间均分加到每栏**；相等则原样使用。
+   - `column_widths` 给定：总和超出则等比缩小；不足则**把剩余空间按栏数均分追加到每栏**；相等则原样使用。
    - `column_ratios` 给定：按比例分配。
    - 都不给：等宽。
-3. **破坏性**：第 1822 行 `parent.children = []` 会**清空父元素已有子元素**
-   （直接赋值列表，不走 `remove_child`，故父指针残留且缓存不失效）。见 7.4。
+3. 各栏挂在**带容器之下**，不再是 `parent` 的直接子元素。
+   因此按名字取栏要用 `find_by_name`（深度优先），不能用 `get_child`（只看直接子元素）。
 4. `names` 默认 `["Column_0", "Column_1", ...]`；`colors` 默认全 `Gray`。
 5. 子栏尺寸为 `width × content_h`，`align_x/align_y` 均强制为 `NONE`。
+
+> ✅ **缺陷 7.4 已修（批次 2）**：旧实现在此处执行 `parent.children = []`，
+> 会静默丢弃父元素既有子元素。现已移除；新增格子走 `add_child`，
+> 既有子元素被保留且缓存正确失效。
 
 #### `create_columns_balanced(...)`
 
@@ -504,7 +572,7 @@ create_columns_balanced(parent, num_columns=2, gap=5, padding=None, layer=0) -> 
 ```
 等宽分栏，内部直接转发 `create_columns`。
 
-#### `split_column_advanced(...)` —— 在 `ResumeTemplate.py`，不在引擎里
+#### `split_column_advanced(...)` —— 批次 2 已移入引擎，改为 `create_band` 的包装
 
 ```python
 split_column_advanced(
@@ -515,17 +583,25 @@ split_column_advanced(
     gap: float = 0,
     padding: Padding = None,   # 默认 Padding.all(0)
     layer: int = 0,
-) -> LayoutObject              # 返回 parent
+) -> LayoutObject              # 返回 parent（保持链式调用兼容）
 ```
 
 与 `create_columns` 的区别：接收**已构造好的对象**（可为不同子类），直接挂载，不额外包装。
 
 行为要点：
 - 自动创建一个 `{parent.name}_split_container` 容器，尺寸 = 父内容区，`align_x/y = NONE`。
-- 左栏：`_x=0, _y=0, _width=left_width, _height=content_h`；右栏：`_x=left_width+gap`。
-- **直接改写传入对象的 `_x/_y/_width/_height` 与 `align_*`**，并直接 `container.children.append(...)`。
+- 左栏 `_width = (content_w - gap) * ratio[0]/sum(ratio)`；右栏 `_width = (content_w - gap) * ratio[1]/sum(ratio)`。
+- 左右对象作为"已构造格子"交给 `create_band` 排放：`_x` 由 `create_band` 依次累加，
+  `_height` 统一为 `content_h`，`align_x/y` 强制为 `NONE`。
 - `content_w <= 0` 或 `content_h <= 0` 时抛 `ValueError`。
-- 末尾只调用 `parent.invalidate_wrap_cache()`，**不调用几何缓存失效**。
+- **返回值仍是 `parent`**（与 `create_columns` 返回带容器不同），因为它被设计为支持链式调用。
+
+> ✅ **缺陷 7.3 已修（批次 2）**：旧实现在 `ResumeTemplate.py` 里直接
+> `container.children.append(...)` 并单独赋 `parent`，绕过 `add_child`，导致几何缓存不失效。
+> 现已改为走 `create_band` → `add_child`，缓存失效由机制保证，不再依赖末尾的手工补调。
+>
+> 移入引擎的意义：`ResumeCore.py` 此前为了分栏必须 `import ResumeTemplate`，
+> 现在可以直接从 `LayoutEngine` 取用，分层违规消除。
 
 #### `create_spacer(...)` —— 批次 1 新增
 
@@ -1048,20 +1124,25 @@ Resume(
 - **当前缓解**：`ResumeCore._fill_right_column` 让 `section_details_index` 在 summary 之前已经递增过，
   所以恰好不撞号——这是**巧合**，不是设计。
 
-### 7.3 绕过 `add_child` 直接挂载（一致性级）
+### 7.3 绕过 `add_child` 直接挂载（一致性级）— ✅ 批次 2 已修
 
-- **位置**：`ResumeTemplate.py:306-323`（`split_column_advanced`）
+- **原位置**：`ResumeTemplate.py:306-323`（`split_column_advanced`）
 - **现象**：`container.children.append(left_obj)` 直接改列表，`left_obj.parent = container` 单独赋值。
 - **后果**：`add_child` 里的 wrap + 几何缓存失效**都不会触发**；末尾只补了 `parent.invalidate_wrap_cache()`，
   **几何缓存没失效**。若左右栏在分栏前已被查询过几何值，会返回脏数据。
-- **同类**：`LayoutEngine.py:1822` `parent.children = []`（见 7.4）。
+- **修复**：`split_column_advanced` 移入 `LayoutEngine.py` 并改为 `create_band` 的包装，
+  对象挂载走 `add_child`，失效由机制保证，不再依赖手工补调。
+- **同类**：`LayoutEngine.py` 的 `parent.children = []`（见 7.4，同批已修）。
 
-### 7.4 `create_columns` 清空父元素子节点（破坏级）
+### 7.4 `create_columns` 清空父元素子节点（破坏级）— ✅ 批次 2 已修
 
-- **位置**：`LayoutEngine.py:1822` `parent.children = []`
+- **原位置**：`create_columns` 中的 `parent.children = []`
 - **现象**：调用 `create_columns(parent=...)` 会**丢弃 parent 已有的全部子元素**。
 - **后果**：被丢弃的子元素 `parent` 指针仍指向原 parent（悬空引用），
   且它们的 wrap/几何缓存未失效。调用方若先 `add_child(title)` 再 `create_columns`，title 就消失了。
+- **修复**：删除该行。`create_columns` 改为两趟实现 —— 先算各栏宽度，
+  再交给 `create_band` 建带容器并挂载，既有子元素被保留。
+  测试入口的断言已从"固化现状"反转为"既有子元素被保留"。
 
 ### 7.5 `get_true_height()` 空实现
 
@@ -1109,7 +1190,27 @@ Resume(
 - **后果**：默认对象在多次实例化间共享。当前无代码原地修改它们，所以**尚未爆雷**，
   但任何 `style.padding.left = 5` 或 `self.Lead["x"] = ...` 都会污染其他实例。
 
-### 7.11 渲染返回值契约不统一
+### 7.11 渲染返回值契约不统一 — ⚠️ 部分已修
+
+**（a）`render_debug()` 完全没有返回值 —— ✅ 已修**
+
+- **原现象**：四个 `render_debug` 实现（`LayoutObject` / `TextObject` / `ImageObject` /
+  `RectangleObject`）**末尾都没有 `return` 语句**，因此一律隐式返回 `None`。
+  而它们内部明明有 `for child in self.children: child.render_debug(...)` 的递归，
+  却不冒泡任何值。
+- **后果**：调试路径拿不到"最后渲染到哪"。更隐蔽的是 —— 一旦把测试入口的
+  `root.render(...)` 换成 `root.render_debug(...)`，
+  针对返回值的断言就会以 `AssertionError: ... 实际返回 NoneType` 形式炸掉，
+  而这个报错**与 `render()` 的契约毫无关系**，极易误判为回归。
+- **修复**：四个实现补上返回值，语义与各自的 `render()` 对齐
+  （`LayoutObject`/`TextObject` → 数值 y；`ImageObject`/`RectangleObject` → `(宽, 高)` 二元组）；
+  `pdf=None` 或有效尺寸非正时显式返回 `None`。
+- **顺带修掉一个隐藏崩溃**：`ImageObject` / `RectangleObject` 的 `eff_w`/`eff_h`
+  原先只在 `if show_name:` 分支内赋值。由于此前函数末尾没有 `return`，
+  这两变量在 `show_name=False` 时从未被读取，问题被掩盖；
+  补返回值后若直接引用就会 `UnboundLocalError`。已将取尺寸提到分支之外。
+
+**（b）`render()` 自身返回值不统一 —— 待批次 4**
 
 | 类 | `render()` 返回 |
 | --- | --- |
@@ -1119,6 +1220,8 @@ Resume(
 | `RectangleObject` | `Tuple[float, float]` |
 
 `LayoutObject.render` 里的 `last_y` 会被 tuple 覆盖，父元素拿到的"最后 y"含义漂移。
+测试入口的断言目前接受上述两种形态，但**拒绝 `None`**，因此能同时守住
+`render` 与 `render_debug` 两条路径。
 
 ### 7.12 `section_details_index` 双重递增
 
@@ -1319,33 +1422,29 @@ Resume(
 
 不满足的（如"节标题 = 图标 + 文字 + 分割线"）留在 `ResumeTemplate.py`。
 
-### 8.1 【核心】把 `split_column_advanced` 下沉为引擎的"横向带"构件
+### 8.1 【核心】把 `split_column_advanced` 下沉为引擎的"横向带"构件 — ✅ 批次 2 已完成
 
-- **现状**：分栏能力住在 `ResumeTemplate.py`，`ResumeCore.py` 为了分栏必须依赖模板层。
+- **原状**：分栏能力住在 `ResumeTemplate.py`，`ResumeCore.py` 为了分栏必须依赖模板层。
   引擎已有 `create_columns`，但它是"按数量造空栏"，`split_column_advanced` 是"按比例装已有对象"，
   两者在比例计算、`cumulative_x` 累加、`content_area` 取值上高度重复。
-- **建议**：在 `LayoutEngine.py` 新增
+- **实施**：在 `LayoutEngine.py` 新增 [`create_band(...)`](#create_band--批次-2-新增横向布局的基础构件)
+  （API 见 3.4 节），统一承担：按顺序排放格子 → 累加 x → 建带容器 → 通过 `add_child` 挂载。
+  与原方案的差异：
 
-  ```python
-  def layout_band(
-      parent: LayoutObject,
-      cells,                          # List[LayoutObject] | List[tuple] | List[float]
-      ratio: Optional[List[float]] = None,
-      gap: float = 0,
-      padding: Optional[Padding] = None,
-      height: float = 0,              # 0 → 取父内容区高
-      layer: int = 0,
-      container_name: Optional[str] = None,
-  ) -> LayoutObject:                  # 返回 parent
-  ```
+  | 原方案 | 实际实施 |
+  | --- | --- |
+  | 函数名 `layout_band` | **`create_band`**（与 `create_spacer` 命名风格一致） |
+  | 返回 `parent` | 返回**新建的带容器**；仅 `split_column_advanced` 为链式兼容仍返回 `parent` |
+  | `ratio` 参数 + `cells` | 只保留 `cells`，比例由 `float` 元素表达（`float` = 权重） |
 
-  统一承担：按比例算宽 → 累加 x → 建容器 → 挂载 → **通过 `add_child` 正确失效缓存**。
-  然后 `split_column_advanced(...)` 变成一个 3 行的兼容包装（保留旧签名，行为不变），
-  `create_columns(...)` 改为内部调用 `layout_band`。
 - **收益**：`ResumeCore.py` 不再需要为了分栏 import 模板层；两处重复的比例/累加逻辑归一；
-  顺手修掉 7.3、7.4。
-- **风险**：`create_columns` 的"宽度不足时把剩余均分"语义与 `split_column_advanced` 的"严格按比例"不同，
-  统一时必须显式区分（建议 `layout_band` 只做严格按比例，剩余均分作为 `create_columns` 的私有策略保留）。
+  7.3、7.4 一并修掉。
+- **风险已按原方案规避**：`create_columns` 的"宽度不足时把剩余均分"语义与
+  `split_column_advanced` 的"严格按比例"确实不同，所以 `create_band` **只做严格按比例**，
+  剩余均分留在 `create_columns` 里（两趟实现）。
+- **验证**：三个入口退出码 0；PDF 规范化比对**三个产物全部逐字节一致**。
+  引擎测试入口新增 `create_band` 断言 11 项（比例分宽、gap 累加、`height=0` 取父高、
+  复用已构造对象、4 条错误路径、包装函数返回值、`split_column_advanced` 包装）。
 
 ### 8.2 【核心】下沉"留白"/间距构件 — ✅ 批次 1 已完成
 
@@ -1426,7 +1525,10 @@ Resume(
 
 ### 8.8 渲染契约与日志
 
-- 统一 `render()` 返回值为 `float`（元素底边 y），或在 `LayoutObject` 里明确文档化 tuple 情形。
+- ✅ **`render_debug()` 补齐返回值**（已完成，见 7.11(a)）：四个实现现在返回与各自
+  `render()` 同类值。调试与正式渲染因此可互换，测试入口切到 `render_debug` 时断言不再失效。
+- **待办**：统一 `render()` 返回值为 `float`（元素底边 y），或在 `LayoutObject` 里
+  明确文档化 tuple 情形（7.11(b)，归入批次 4）。
 - `timer` 改为受模块级开关控制（`DEBUG_TIMING = False`），并改用 `logging` 而非 `print`。
 
 ### 8.9 配置与全局状态
@@ -1440,14 +1542,24 @@ Resume(
 
 | 批次 | 内容 | 风险 | 可验证性 | 状态 |
 | --- | --- | --- | --- | --- |
+| **基础设施** | `.gitignore`（生成物 + 字体）+ 字体下载说明 + `.pyproj` 入口改指 `LayoutEngine.py` | 极低 | 不影响任何 PDF | ✅ **已完成** |
 | **0** | 修 7.1 导入；修 7.15 换行；修 7.17 重复挂载；修 7.18 末尾间距 | 极低 | 三个入口都能跑通 | ✅ **已完成** |
 | **1** | 抽 `create_spacer`（8.2） | 低 | 输出 PDF 应与重构前**逐字节一致** | ✅ **已完成** |
-| **2** | 抽 `layout_band`，`split_column_advanced` 变包装（8.1） | 中 | 同上，逐字节比对 | 待办 |
+| **2** | 抽 `create_band`，`create_columns` / `split_column_advanced` 变包装；修 7.3、7.4（8.1） | 中 | 同上，逐字节比对 | ✅ **已完成** |
 | **3** | 抽 `create_text_block` / `from_style`（8.3、8.4） | 中 | 同上 | 待办 |
-| **4** | **矩形包围内容前置**：几何属性改 property（8.5）+ 修 7.19 父子高度自指 + 修 7.20 `_height` 卡死 + 明确 `wrap_content` 方向性 | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
+| **4** | **矩形包围内容前置**：几何属性改 property（8.5）+ 统一几何计算入口 + 修 7.19 父子高度自指 + 修 7.20 `_height` 卡死 + 明确 `wrap_content` 方向性 | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
 | **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | 待办（批次 4 内交付） |
 | **4b** | 修 7.21 `wrap_width` 完全不可用（阻断点 C） | 中 | 收窄包围盒断言 | 待办 |
 | **5** | 真实行数测量（8.7），去掉 `description_height` | 高 | 视觉验收 | 待办 |
+| **6** | **分页** —— 按页切分布局树 | 高 | 多页产物断言 | **暂缓**（多页需求出现时先在 `master` 完成） |
+
+> **批次 6 为何暂缓**：现阶段要排版的是简历，只需一页 A4，不涉及分页。
+> 将来排毕业论文一类多页文档时再做。推迟的代价接近于零 —— 引擎已把「对象尺寸」与
+> 「页面尺寸」分开（`Root` 由调用方挑，引擎从不读 `pdf` 页面尺寸），
+> 因此加批次 6 新增的是"按页切分"这一层，**不需要推翻现有尺寸体系**。
+>
+> ⚠️ **当前是单页假设**：`render()` 完全不处理分页，`FPDF.auto_page_break` 可能在任意位置触发，
+> 而 `LayoutObject` 的绝对坐标与页无关。在批次 6 落地之前，**不要假定本引擎支持多页**。
 
 > **批次 4 为何同时承载"矩形包围内容"**：见 8.11 —— 两者是同一件事的两半，
 > property 化解决"何时知道要重算"，修 7.19/7.20 解决"重算能不能算对"。
@@ -1485,15 +1597,32 @@ Resume(
 | `resume_template_v2_test.pdf` | **完全一致**（61370 字节） |
 | `output/利姆露_*.pdf` | **完全一致**（68478 字节） |
 
-批次 1 是一次**纯粹的等价重构**（只抽取构件、不改变行为），所以三个产物全部逐字节一致，
-这正是它追求的结果。
+批次 2 的实测结果（基线为批次 2 之前）：
 
-**这就是批次 2~3 的验收基线**：除了被有意修复的缺陷之外，
+| 产物 | 规范化后 |
+| --- | --- |
+| `test_layout_engine_cached.pdf` | **完全一致**（19316 字节） |
+| `resume_template_v2_test.pdf` | **完全一致**（61370 字节） |
+| `output/利姆露_*.pdf` | **完全一致**（68478 字节） |
+
+批次 1、2 都是**纯粹的等价重构**（只抽取构件、不改变行为），所以三个产物全部逐字节一致，
+这正是它们追求的结果。
+
+> ⚠️ **批次 2 的一次真实踩坑，值得记住**：`create_columns` 改为走 `create_band` 之后，
+> 各栏从"`parent` 的直接子元素"变成了"带容器的子元素"，多出一层。
+> 而引擎测试入口原先用 `container.get_child("Column_0")` 取栏（`get_child` 只看直接子元素），
+> 于是拿到 `None`，两段文本根本没被创建 —— 引擎 PDF 从 19316 字节掉到 18071。
+> **这不是引擎的问题，是测试的假设失效了。**
+> 改用 `find_by_name`（深度优先）后恢复一致。
+> **结论：包装层会改变树形，所有按名字取对象的地方都要检查用 `get_child` 还是 `find_by_name`。**
+> 逐字节比对把这个问题挡在了提交之前。
+
+**这就是批次 3 之后的验收基线**：除了被有意修复的缺陷之外，
 规范化后的 PDF 必须逐字节一致。任何未预期的差异都说明重构改变了行为，需要逐条解释。
 
 > 📌 **给下一批次的提示**：基线用的参考副本放在工作区外的临时目录
-> （`%TEMP%\batch1_baseline\`），不入库。
-> 批次 2 动工前请**以当前工作树的输出为新基线**重取一次：
+> （`%TEMP%\batch2_baseline\`），不入库。
+> 批次 3 动工前请**以当前工作树的输出为新基线**重取一次：
 > 跑一遍三个入口，把 `test_layout_engine_cached.pdf`、`resume_template_v2_test.pdf`、
 > `output/*.pdf` 复制到工作区外的临时目录，然后才开始改代码。
 
@@ -1597,7 +1726,7 @@ box._height = content_h
 
 | 命令（在项目根目录执行） | 覆盖 | 产出 |
 | --- | --- | --- |
-| `py LayoutEngine.py` | 几何、流式、分栏、图层、缓存、三种渲染对象 | `test_layout_engine_cached.pdf` |
+| `py LayoutEngine.py` | 几何、流式、分栏、横向带、留白、图层、缓存、三种渲染对象 | `test_layout_engine_cached.pdf` |
 | `py ResumeTemplate.py` | 全部 `generate_*` + `fill_*` + `split_column_advanced` | `resume_template_v2_test.pdf` |
 | `py ResumeCore.py` | 完整 `Resume.Generate` 链路 | `output/{姓名}_{职位}_{公司}.pdf` |
 
@@ -1605,9 +1734,10 @@ box._height = content_h
 
 1. **必须用 `py`**（3.14 + fpdf2 2.8.8）。DSH 自带运行时没有 fpdf2。
 2. 字体路径是相对路径 `.\Resources\...`，**必须在项目根目录执行**，否则字体会静默降级为 helvetica，
-   中文变空白。
+   中文变空白。字体需自行下载，见 README 的「资源获取」。
 3. `Resources/` 缺全部图片资源（1.4 节），图片相关的视觉验收目前无法进行。
 4. 三个入口都会在 stdout 打印大量渲染日志（7.13），建议重定向到文件再读尾部。
+5. **前两个入口的产物已被 `.gitignore` 忽略**（`*.pdf` 规则），它们由代码可复现，不入库。
 
 ---
 
@@ -1633,5 +1763,13 @@ fill_section_details_template: brief_height=10, brief_ratio=[2.0,1.0,2.0], descr
 generate_basic_subtemplate:    ratio=[1.0, 2.5], right_padding=Padding.left(5)
 split_column_advanced:         ratio=[1.0, 2.5], gap=0
 create_columns:                num_columns=2, gap=5
+create_band:                   gap=0, height=0（取父内容区高）, container_name="{parent.name}_band"
+create_spacer:                 parent=None, layer=0
 Resume:                        summary_height=30.0
+
+# 构造函数返回值对照（批次 2 变更）
+create_band                -> 新建的带容器
+create_columns             -> 新建的带容器   # 此前返回 parent
+create_columns_balanced    -> 新建的带容器   # 此前返回 parent
+split_column_advanced      -> parent         # 未变，保持链式调用兼容
 ```

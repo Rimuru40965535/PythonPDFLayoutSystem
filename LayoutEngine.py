@@ -29,6 +29,7 @@ PDF 排版引擎 - 完整实现 (缓存优化版)
 from enum import Enum
 from typing import Optional, Union, List, Tuple, Dict, Any, Callable
 from collections import defaultdict
+import inspect
 import os
 import time
 from functools import wraps
@@ -145,6 +146,94 @@ class Padding:
     @classmethod
     def bottom(cls, value: float):
         return cls(0, 0, 0, value)
+
+
+# ============================================================================
+# 3.5 样式类 (Style)
+# ============================================================================
+
+class Style:
+    """
+    样式类 - 纯数据类，用于存储排版样式属性
+
+    所有属性均为公有，除构造函数和调试方法外无任何方法。
+    样式类不包含位置信息，只包含"长什么样"的属性。
+
+    本类原先定义在模板层（ResumeTemplate.py），批次 3 移入引擎：
+    "样式"是与领域无关的底层概念（它只描述"长什么样"），
+    而"样式 → 渲染参数"的翻译（见 TextObject.from_style / ImageObject.from_style）
+    也属于引擎职责。
+
+    属性列表：
+        font_name: 字体名称 (str)
+        font_size: 字号 (float)
+        bold: 是否粗体 (bool)
+        italic: 是否斜体 (bool)
+        color: 文字颜色 (Color)
+        fill_color: 填充颜色 (Color)
+        image_path: 图片路径 (str)
+        padding: 内边距 (Padding)
+        fit_mode: 图片适配模式 (str) — 仅 ImageObject 使用
+
+    注意：
+        padding 的默认值是 Padding.all(0) 这一**可变对象**（缺陷 7.10）。
+        这是从模板层原样搬运过来的既有行为，本批次刻意不做修正，
+        以免破坏"纯搬运、输出不变"的验收前提。修正归入批次 4 的可变默认值审计。
+    """
+
+    def __init__(
+        self,
+        font_name: str = "helvetica",
+        font_size: float = 12,
+        bold: bool = False,
+        italic: bool = False,
+        color: Color = Black,
+        fill_color: Color = White,
+        image_path: str = "",
+        padding: Padding = Padding.all(0),
+        fit_mode="cover"
+    ):
+        """
+        初始化样式对象
+
+        Args:
+            font_name: 字体名称
+            font_size: 字号 (mm)
+            bold: 是否粗体
+            italic: 是否斜体
+            color: 文字颜色
+            fill_color: 填充颜色
+            image_path: 图片路径 (仅用于 ImageObject)
+            padding: 内边距
+            fit_mode: 图片适配模式 (仅用于 ImageObject)
+        """
+        self.font_name = font_name
+        self.font_size = font_size
+        self.bold = bold
+        self.italic = italic
+        self.color = color
+        self.fill_color = fill_color
+        self.image_path = image_path
+        self.padding = padding
+        self.fit_mode = fit_mode
+
+    def get_font_style(self) -> str:
+        """
+        获取 FPDF 兼容的字体样式字符串
+
+        Returns:
+            str: "B" 粗体, "I" 斜体, "BI" 粗斜体, "" 常规
+        """
+        style = ""
+        if self.bold:
+            style += "B"
+        if self.italic:
+            style += "I"
+        return style
+
+    def __repr__(self) -> str:
+        return (f"Style(font='{self.font_name}', size={self.font_size}, "
+                f"bold={self.bold}, italic={self.italic})")
 
 
 # ============================================================================
@@ -1078,6 +1167,60 @@ class TextObject(LayoutObject):
         self._cached_height = 0.0
         self._cache_valid = False
     
+    @classmethod
+    def from_style(
+        cls,
+        name: str,
+        style: Optional[Style] = None,
+        text: str = "",
+        **overrides,
+    ) -> 'TextObject':
+        """
+        按样式对象构造文本对象
+
+        把"样式 → 渲染参数"的翻译集中在此处，避免调用点反复手抄
+        font_name / font_size / font_style / text_color / padding 等参数。
+
+        字段映射：
+            Style.font_name   -> font_name
+            Style.font_size   -> font_size
+            Style.bold+italic -> font_style（经 get_font_style()，得 "B"/"I"/"BI"/""）
+            Style.color       -> **text_color**（文字颜色）
+            Style.fill_color  -> color（背景填充色）
+            Style.padding     -> padding
+            Style.image_path  -> 忽略（仅 ImageObject 使用）
+            Style.fit_mode    -> 忽略（仅 ImageObject 使用）
+
+        其余参数（align_x / align_y / multi_line / line_height / width / height /
+        parent / layer / wrap_width / wrap_height 等）通过 overrides 传入。
+
+        Args:
+            name: 对象名称
+            style: 样式对象。None 表示使用 Style() 的全默认值
+            text: 文本内容
+            **overrides: 覆盖或补充其它构造参数，**优先级高于 style**
+
+        Returns:
+            TextObject: 新建的文本对象（未挂载到任何父元素）
+
+        Example:
+            >>> t = TextObject.from_style("Title", STYLES["name_text"],
+            ...                           text="张三", align_x=AlignX.CENTER)
+        """
+        st = style if style is not None else Style()
+
+        params = {
+            "text": text,
+            "font_name": st.font_name,
+            "font_size": st.font_size,
+            "font_style": st.get_font_style(),
+            "text_color": st.color,
+            "color": st.fill_color,
+            "padding": st.padding,
+        }
+        params.update(overrides)
+        return cls(name=name, **params)
+    
     def set_text(self, text: str) -> 'TextObject':
         """
         设置文本内容（修改后使几何缓存和 wrap 缓存失效）
@@ -1355,6 +1498,53 @@ class ImageObject(LayoutObject):
         self._cached_render_width = 0.0
         self._cached_render_height = 0.0
         self._cache_valid = False
+    
+    @classmethod
+    def from_style(
+        cls,
+        name: str,
+        style: Optional[Style] = None,
+        image_path: str = "",
+        **overrides,
+    ) -> 'ImageObject':
+        """
+        按样式对象构造图像对象
+
+        字段映射：
+            Style.image_path -> image_path（若 image_path 实参非空，以实参优先）
+            Style.fill_color -> color（背景填充色）
+            Style.fit_mode   -> **fit_mode**（注意字段名不同：Style 叫 fit_mode，
+                                 ImageObject 的构造参数也叫 fit_mode，此处显式映射）
+            Style.padding    -> padding
+            Style.font_name / font_size / bold / italic / color -> 忽略（纯文本属性）
+
+        其余参数（keep_aspect_ratio / align_x / align_y / width / height /
+        parent / layer / wrap_* 等）通过 overrides 传入。
+
+        Args:
+            name: 对象名称
+            style: 样式对象。None 表示使用 Style() 的全默认值
+            image_path: 图片路径。非空时覆盖 style.image_path
+            **overrides: 覆盖或补充其它构造参数，**优先级高于 style**
+
+        Returns:
+            ImageObject: 新建的图像对象（未挂载到任何父元素）
+
+        Example:
+            >>> img = ImageObject.from_style("Photo", STYLES["profile_photo"],
+            ...                              image_path=".\\\\Resources\\\\photo_1.png",
+            ...                              align_x=AlignX.CENTER)
+        """
+        st = style if style is not None else Style()
+
+        params = {
+            "image_path": image_path if image_path else st.image_path,
+            "fit_mode": st.fit_mode,
+            "color": st.fill_color,
+            "padding": st.padding,
+        }
+        params.update(overrides)
+        return cls(name=name, **params)
     
     def set_image(self, image_path: str) -> 'ImageObject':
         """
@@ -2207,6 +2397,65 @@ def create_spacer(
     return spacer
 
 
+def create_text_block(
+    parent: LayoutObject,
+    name: str,
+    text: str = "",
+    style: Optional[Style] = None,
+    height: float = 0,
+    multi_line: bool = False,
+    line_height: Optional[float] = None,
+    align_x: AlignX = AlignX.LEFT,
+    align_y: AlignY = AlignY.FLOW,
+    padding: Optional[Union[Padding, float]] = None,
+    layer: int = 0,
+) -> TextObject:
+    """
+    创建一个文本块并挂载到父容器
+
+    与直接构造 TextObject 的区别：
+        - 走 TextObject.from_style，样式参数由 Style 对象统一提供
+        - height 是**显式参数**，不再由调用方把常量写死在构造里
+        - 自动挂载（走 add_child，缓存失效正确触发）
+
+    ⚠️ **height=0 的语义**：取父容器的可用高度，**不是**"按内容自动撑高"。
+        "按内容自动撑高"需要真实的行数测量，属于批次 5 的范围。
+        因此若希望文本块高度贴合内容，目前仍须显式给出 height。
+
+    Args:
+        parent: 父容器
+        name: 对象名称
+        text: 文本内容
+        style: 样式对象。None 表示 Style() 的全默认值
+        height: 文本块高度 (mm)。0 表示取父容器可用高
+        multi_line: 是否自动换行（pdf.multi_cell）
+        line_height: 行高。None 表示由字号推出（font_size * 0.6）
+        align_x: 水平对齐，默认 LEFT
+        align_y: 垂直对齐，默认 FLOW（接在流式序列的下一个位置）
+        padding: 内边距。None 表示沿用 style.padding
+        layer: 图层索引
+
+    Returns:
+        TextObject: 新建并已挂载的文本对象
+    """
+    overrides = {
+        "width": 0,
+        "height": height,
+        "multi_line": multi_line,
+        "line_height": line_height,
+        "align_x": align_x,
+        "align_y": align_y,
+        "layer": layer,
+    }
+    # padding 为 None 时让 from_style 沿用 style.padding，不覆盖
+    if padding is not None:
+        overrides["padding"] = padding
+
+    block = TextObject.from_style(name, style, text=text, **overrides)
+    parent.add_child(block)
+    return block
+
+
 # ============================================================================
 # 11. 测试入口
 # ============================================================================
@@ -2508,5 +2757,122 @@ if __name__ == "__main__":
     assert _sc_l.parent is _sc_container and _sc_r.parent is _sc_container, \
         "左右对象的父指针应指向分栏容器"
     print("    ✅ split_column_advanced 包装通过")
+    
+    # 6) Style 与 from_style 工厂（批次 3）
+    print("  --- Style / from_style ---")
+    # 6.1 Style 字段名与默认值快照。Style 从模板层搬运而来，这里固化"搬运无损"。
+    _style_names = [n for n in inspect.signature(Style.__init__).parameters if n != "self"]
+    assert _style_names == ["font_name", "font_size", "bold", "italic", "color",
+                            "fill_color", "image_path", "padding", "fit_mode"], \
+        f"Style 字段名或顺序变了: {_style_names}"
+    _d = Style()
+    assert (_d.font_name, _d.font_size, _d.bold, _d.italic) == ("helvetica", 12, False, False)
+    assert _d.color is Black and _d.fill_color is White
+    assert _d.image_path == "" and _d.fit_mode == "cover"
+    print("    ✅ Style 字段快照通过")
+    # 6.2 get_font_style 四种组合
+    for _b, _i, _exp in ((True, True, "BI"), (True, False, "B"),
+                         (False, True, "I"), (False, False, "")):
+        _got = Style(bold=_b, italic=_i).get_font_style()
+        assert _got == _exp, f"bold={_b} italic={_i} 应为 {_exp!r}，实际 {_got!r}"
+    print("    ✅ get_font_style 四种组合通过")
+    # 6.3 TextObject.from_style 的字段映射
+    _st = Style(font_name="Courier", font_size=17, bold=True, italic=True,
+                color=Red, fill_color=Green, padding=Padding.all(3))
+    _t = TextObject.from_style("T1", _st, text="hi")
+    assert _t.get_text() == "hi"
+    assert _t.font_name == "Courier" and _t.font_size == 17
+    assert _t.font_style == "BI", f"bold+italic 应为 'BI'，实际 {_t.font_style!r}"
+    assert _t.text_color is Red, "Style.color 应映射到 text_color"
+    assert _t.color is Green, "Style.fill_color 应映射到 color"
+    assert _t.padding.left == 3 and _t.padding.top == 3
+    print("    ✅ TextObject.from_style 字段映射通过")
+    # 6.4 overrides 优先级高于 style
+    _t2 = TextObject.from_style("T2", _st, text="x", font_size=99, text_color=Blue,
+                                align_x=AlignX.CENTER)
+    assert _t2.font_size == 99, "overrides 应覆盖 style.font_size"
+    assert _t2.text_color is Blue, "overrides 应覆盖 style.color"
+    assert _t2.align_x == AlignX.CENTER
+    assert _t2.font_name == "Courier", "未覆盖的字段应仍来自 style"
+    print("    ✅ overrides 优先级通过")
+    # 6.5 style=None 使用全默认值
+    _t3 = TextObject.from_style("T3")
+    assert _t3.font_name == "helvetica" and _t3.font_size == 12
+    assert _t3.font_style == "" and _t3.text_color is Black and _t3.color is White
+    assert _t3.get_text() == ""
+    print("    ✅ style=None 全默认值通过")
+    # 6.6 返回对象可继续链式调用
+    assert _t3.set_text("chained") is _t3 and _t3.get_text() == "chained"
+    print("    ✅ from_style 返回对象可链式调用通过")
+    # 6.7 ImageObject.from_style 的字段映射
+    _ist = Style(image_path="a.png", fill_color=Yellow, fit_mode="contain",
+                 padding=Padding.all(2), font_size=33, bold=True)
+    _i1 = ImageObject.from_style("I1", _ist)
+    assert _i1.get_image() == "a.png", "Style.image_path 应映射到 image_path"
+    assert _i1.fit_mode == "contain", "Style.fit_mode 应映射到 fit_mode"
+    assert _i1.color is Yellow, "Style.fill_color 应映射到 color"
+    assert _i1.padding.left == 2
+    assert _i1.keep_aspect_ratio is True, "未映射的字段应保持构造默认值"
+    _i2 = ImageObject.from_style("I2", _ist, image_path="b.png")
+    assert _i2.get_image() == "b.png", "image_path 实参应覆盖 style.image_path"
+    print("    ✅ ImageObject.from_style 字段映射通过")
+    
+    # 7) create_text_block（批次 3）
+    print("  --- create_text_block ---")
+    _tb_root = LayoutObject(name="TBRoot", width=100, height=200,
+                            padding=Padding.all(10))
+    assert _tb_root.get_content_area()[3] == 180, "前提：TBRoot 内容区高应为 180"
+    # 7.1 height=0 取父可用高（不是按内容撑高）
+    _tb1 = create_text_block(_tb_root, "TB1", text="a")
+    assert _tb1.parent is _tb_root and _tb1 in _tb_root.children, "应自动挂载"
+    assert _tb1._height == 0, "构造高度应保持 0（不是被改成父高）"
+    assert _tb1.get_effective_height() == 180, \
+        f"height=0 应取父内容区高 180，实际 {_tb1.get_effective_height()}"
+    print("    ✅ height=0 取父可用高通过")
+    # 7.2 height=N 生效。用独立父容器：FLOW 模式下前驱会吃掉全部可用高，
+    #     同容器里放第二个块会被截断 —— 那是引擎的既有语义（见技术文档 7.19 一节的截断描述），
+    #     不是 create_text_block 的问题。此处隔离以单独验证 height 参数。
+    _tb2_root = LayoutObject(name="TBRoot2", width=100, height=200,
+                             padding=Padding.all(10))
+    _tb2 = create_text_block(_tb2_root, "TB2", text="b", height=25)
+    assert _tb2._height == 25, f"构造高度应为 25，实际 {_tb2._height}"
+    assert _tb2.get_effective_height() == 25, \
+        f"有效高应为 25，实际 {_tb2.get_effective_height()}"
+    print("    ✅ 显式 height 通过")
+    # 7.2b 同容器内 height=0 的块会吃掉全部可用高，把后随 FLOW 兄弟挤成 0
+    _tb1b = create_text_block(_tb_root, "TB1b", text="b2", height=20)
+    assert _tb1b.get_effective_height() == 0, \
+        f"前驱占满后，后随块应被截断为 0，实际 {_tb1b.get_effective_height()}"
+    assert _tb1b._flow_clipped is True, "被截断时应置 _flow_clipped"
+    print("    ✅ 同容器后随块被截断的现状已固化（FLOW 既有语义）")
+    # 7.3 样式与其它参数透传（独立父容器，避免受 7.2b 的截断影响）
+    _tb3_root = LayoutObject(name="TBRoot3", width=100, height=200,
+                             padding=Padding.all(10))
+    _tb3 = create_text_block(_tb3_root, "TB3", text="c", style=_st,
+                             height=12, multi_line=True, align_x=AlignX.RIGHT,
+                             align_y=AlignY.TOP, padding=Padding.all(1), layer=3)
+    assert _tb3.font_name == "Courier" and _tb3.font_style == "BI"
+    assert _tb3.text_color is Red and _tb3.color is Green
+    assert _tb3.padding.left == 1, "显式 padding 应覆盖 style.padding"
+    assert _tb3.multi_line is True and _tb3.align_x == AlignX.RIGHT
+    assert _tb3.align_y == AlignY.TOP and _tb3.layer == 3
+    assert _tb3._line_height is None, "未传 line_height 时应保持 None（运行时按字号推）"
+    print("    ✅ 参数透传与 padding 覆盖通过")
+    # 7.4 padding=None 时沿用 style.padding
+    _tb4 = create_text_block(_tb3_root, "TB4", text="d", style=_st, height=10,
+                             align_y=AlignY.TOP)
+    assert _tb4.padding.left == 3, "padding 未传时应沿用 style.padding"
+    print("    ✅ padding=None 沿用样式通过")
+    # 7.5 style=None 可省略
+    _tb5 = create_text_block(_tb3_root, "TB5", text="e", height=8,
+                             align_y=AlignY.TOP)
+    assert _tb5.font_name == "helvetica" and _tb5.font_size == 12
+    print("    ✅ style=None 通过")
+    # 7.6 每次调用挂载一个新对象，父元素子元素唯一
+    _tb_ids = [id(c) for c in _tb_root.children]
+    assert len(_tb_ids) == len(set(_tb_ids)), "create_text_block 不应重复挂载同一对象"
+    assert len(_tb_root.children) == 2, f"TBRoot 应有 2 个块，实际 {len(_tb_root.children)}"
+    assert len(_tb3_root.children) == 3, f"TBRoot3 应有 3 个块，实际 {len(_tb3_root.children)}"
+    print("    ✅ 挂载唯一性通过")
     
     print("\n✅ 回归契约断言全部通过")

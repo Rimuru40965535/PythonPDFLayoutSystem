@@ -5,8 +5,13 @@
 >
 > **已完成批次**：基础设施（`.gitignore` + 字体说明 + `.pyproj` 入口）、
 > 批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）、
-> 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）。
+> 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）、
+> 批次 3（`Style` 下沉 + `from_style` + `create_text_block`，8.3 / 8.4）。
 > 批次 4 承载"矩形包围内容"，前置分析见 8.11；批次 6（分页）暂缓。
+>
+> ⚠️ **中层与顶层文件不在 `master` 上**（`ResumeTemplate.py` / `ResumeCore.py` 属功能分支）。
+> 因此有一部分改动**无法在 `master` 完成**，集中记录在 `SKILLS.md` 的
+> 「只在功能分支处理的事项」一节。
 
 ---
 
@@ -261,6 +266,39 @@ Padding(left: float = 0, top: float = 0, right: float = 0, bottom: float = 0)
 > ⚠️ `Padding` 是**可变对象**，但 7 个类方法名与实例属性名（`left/right/top/bottom`）重名。
 > 类方法遮蔽只发生在类上，实例属性访问 `p.left` 正常返回数值，功能无误，但阅读时容易混淆。
 
+#### `class Style` —— 批次 3 从模板层移入
+
+```python
+Style(
+    font_name: str = "helvetica",
+    font_size: float = 12,
+    bold: bool = False,
+    italic: bool = False,
+    color: Color = Black,
+    fill_color: Color = White,
+    image_path: str = "",
+    padding: Padding = Padding.all(0),
+    fit_mode="cover",
+)
+```
+
+纯数据类，只描述"长什么样"，不含位置信息。所有属性为公有。
+
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `get_font_style()` | `str` | `"B"` / `"I"` / `"BI"` / `""`，fpdf 兼容 |
+| `__repr__()` | `str` | 调试字符串 |
+
+**为什么它属于底层**：样式与"简历"无关；而且"样式 → 渲染参数"的翻译
+（见 `from_style`）本来就是引擎职责。它原先住在 `ResumeTemplate.py`，是分层违规。
+
+> ⚠️ `padding: Padding = Padding.all(0)` 是**可变默认参数**（缺陷 7.10）。
+> 这是从模板层**原样搬运**过来的既有行为 —— 批次 3 刻意不修，
+> 以维持"纯搬运、输出不变"的验收前提。修正归入批次 4 的可变默认值审计。
+>
+> 迁移自 `ResumeTemplate.Style`，字段名与顺序、默认值**逐项一致**，
+> 测试入口有字段快照断言固化这一点。
+
 ### 3.2 构件：`class LayoutObject`
 
 ```python
@@ -412,6 +450,30 @@ TextObject(
 | `append_text` | `(text: str) -> TextObject` | self | 追加 |
 | `calculate_text_size` | `(pdf) -> Tuple[float, float]` | `(宽, 高)` | 临时切换 pdf 字体测量后**恢复原字体**；行数估算 `int(宽/可用宽)+1` |
 | `get_cached_text_size` | `() -> Tuple[float, float]` | 缓存值，无效时 `(0,0)` | |
+| `from_style` | `(name, style=None, text="", **overrides) -> TextObject` | 按样式构造（见下） |
+
+**`TextObject.from_style(...)` —— 批次 3 新增（classmethod）**
+
+把"样式 → 渲染参数"的翻译集中一处，避免调用点反复手抄参数：
+
+| `Style` 字段 | → `TextObject` 参数 |
+| --- | --- |
+| `font_name` | `font_name` |
+| `font_size` | `font_size` |
+| `bold` + `italic` | `font_style`（经 `get_font_style()`，得 `"B"`/`"I"`/`"BI"`/`""`） |
+| `color` | **`text_color`** |
+| `fill_color` | `color`（背景填充色） |
+| `padding` | `padding` |
+| `image_path` / `fit_mode` | 忽略（仅 `ImageObject` 使用） |
+
+其余参数（`align_x` / `align_y` / `multi_line` / `line_height` / `width` / `height` /
+`parent` / `layer` / `wrap_*` 等）经 `**overrides` 传入，**优先级高于 `style`**。
+`style=None` 表示使用 `Style()` 的全默认值（`Style` 所有字段都有默认值，故良定义）。
+返回的对象**未挂载**到任何父元素。
+
+不把 `style=` 塞进 `__init__` 是刻意的：那会引出「`style` 与显式参数谁优先」
+以及「`None` 表示不覆盖」的二义。classmethod 是"我有样式对象"时的显式入口，
+直接写参数仍是快路径。
 
 `render()` 行为分歧：
 
@@ -451,6 +513,22 @@ ImageObject(
 | `get_image` | `() -> str` | 路径 |
 | `calculate_image_size` | `(pdf) -> Tuple[float, float]` | `(渲染宽, 渲染高)`；失败返回 `(0.0, 0.0)` |
 | `get_cached_image_size` | `() -> Tuple[float,float,float,float]` | `(原图宽, 原图高, 渲染宽, 渲染高)` |
+| `from_style` | `(name, style=None, image_path="", **overrides) -> ImageObject` | 按样式构造（见下） |
+
+**`ImageObject.from_style(...)` —— 批次 3 新增（classmethod）**
+
+| `Style` 字段 | → `ImageObject` 参数 |
+| --- | --- |
+| `image_path` | `image_path`（若 `image_path` 实参非空，**以实参优先**） |
+| `fill_color` | `color`（背景填充色） |
+| `fit_mode` | `fit_mode`（字段名相同，此处显式映射以便阅读） |
+| `padding` | `padding` |
+| `font_name` / `font_size` / `bold` / `italic` / `color` | 忽略（纯文本属性） |
+
+`**overrides` 优先级高于 `style`；`style=None` 用全默认值；返回对象**未挂载**。
+
+> `RectangleObject.from_style` **刻意不做**：矩形只用到 `fill_color`，
+> 而在引擎里那已经叫 `color`，加一层单字段翻译是负收益。等确有多矩形样式表时再补。
 
 `render()` 返回 `(render_w, render_h)` —— **与 `TextObject.render()` 返回 `float` 不一致**（见 7.11）。
 
@@ -637,6 +715,43 @@ create_spacer(
 | 自动命名 | 留白同样写入 `objectRegister`，自动命名会改变上层依赖的名字 |
 
 **用途**：`ResumeCore.py` 的 `Lead_*` 系列间距对象全部改由它创建（批次 1 完成，14 处）。
+
+#### `create_text_block(...)` —— 批次 3 新增
+
+```python
+create_text_block(
+    parent: LayoutObject,
+    name: str,
+    text: str = "",
+    style: Optional[Style] = None,
+    height: float = 0,
+    multi_line: bool = False,
+    line_height: Optional[float] = None,
+    align_x: AlignX = AlignX.LEFT,
+    align_y: AlignY = AlignY.FLOW,
+    padding: Optional[Union[Padding, float]] = None,
+    layer: int = 0,
+) -> TextObject
+```
+
+创建一个文本块并挂载到父容器。内部走 `TextObject.from_style(...)` 然后 `add_child`。
+
+与直接构造 `TextObject` 的区别：
+
+- 样式参数由 `Style` 对象统一提供（不再手抄 7 个参数）；
+- `height` 是**显式参数**，不再由调用方把常量写死在构造里；
+- 自动挂载，缓存失效正确触发。
+
+> ⚠️ **`height=0` 的语义是"取父容器可用高度"，不是"按内容自动撑高"。**
+> 后者需要真实的行数测量，属批次 5。因此想让文本块高度贴合内容，
+> **目前仍须显式给出 `height`**。
+
+**踩坑提醒（实测）**：同一流式父容器里，一个 `height=0` 的块会占满全部可用高，
+**把后随的 `FLOW` 兄弟挤成 0 高**（并置 `_flow_clipped`）。这是引擎 FLOW 的既有语义，
+不是 `create_text_block` 的问题；但用 `height=0` 时要意识到这一点。
+测试入口已把该现状固化为断言。
+
+`padding=None` 表示沿用 `style.padding`（与 `from_style` 一致）；给值则覆盖。
 
 ### 3.5 图层与注册表
 
@@ -1171,6 +1286,10 @@ Resume(
 - **位置**：`ResumeTemplate.py:1071`、`ResumeTemplate.py:1161`
 - **现象**：`height=50` 写死在构造里，靠 `fill_*` 改写 `_height` 才正确。
 - **后果**：忘记调用 `fill_section_details_data` / `fill_summary_data`，该块就固定占 50mm。
+- **状态**：**成因已在引擎侧消除（批次 3）** —— `create_text_block` 的 `height`
+  是显式参数，不再有硬编码常量。但模板层的两处 `height=50` 调用点
+  **属功能分支**，迁移时会显式传入 `50`（不能依赖新默认值 `0`）。见 `SKILLS.md`
+  的「只在功能分支处理的事项」。
 
 ### 7.9 `RectangleObject.render` 忽略 `is_fill`
 
@@ -1480,23 +1599,36 @@ Resume(
 
 - **现状**：`generate_section_details_template` 与 `generate_summary_template` 的
   `content → details → description` 结构**逐行相同**；高度靠外部改写 `_height` 传入。
-- **建议**：
-  1. 引擎层提供 `create_text_block(parent, name, style, text, height, ...)`，
-     把 `Style → TextObject 参数` 的翻译集中一处（目前这段翻译在 6 个模板函数里各写一遍）。
-  2. 模板层让 `generate_summary_template` 复用 details 模板的 `details` 部分，
-     并给它**独立命名前缀**（如 `_summary_{index}`），从根上消除 7.2。
-  3. `height` 改为模板函数的显式参数，默认值不再硬编码 `50`（消除 7.8）。
+- **批次 3 已完成的引擎侧部分**：
+  1. ✅ 引擎层提供 [`create_text_block(parent, name, text, style, height, ...)`](#create_text_block--批次-3-新增)，
+     把 `Style → TextObject 参数` 的翻译集中一处（`from_style`）。
+  2. ✅ `height` 成为**显式参数**，引擎里不再有硬编码 `50`（7.8 的成因消除）。
+  3. ✅ `from_style` 让"样式 → 对象"不再需要手抄 7 个参数。
+- **仍待功能分支处理**（`ResumeTemplate.py` / `ResumeCore.py` 不在 `master` 上）：
+  - 让 `generate_summary_template` 复用 details 模板的 `details` 部分，
+    并给它**独立命名前缀**（如 `_summary_{index}`），从根上消除 7.2；
+  - 把模板层约 25 处 `TextObject(...)` / `ImageObject(...)` 换成 `from_style`；
+  - 两处硬编码 `height=50` 改为显式传参（**必须传 50**，否则产物会变）。
 
-### 8.4 【核心】把 `Style` 与"样式→对象"翻译下沉
+### 8.4 【核心】把 `Style` 与"样式→对象"翻译下沉 — ✅ 批次 3 已完成
 
-- **现状**：`Style.get_font_style()` 是纯引擎概念（fpdf 的 `"B"/"I"/"BI"`），却住在模板层。
+- **原状**：`Style.get_font_style()` 是纯引擎概念（fpdf 的 `"B"/"I"/"BI"`），却住在模板层。
   且 `TextObject` 的 7 个参数（`font_name/font_size/font_style/text_color/padding/align_*/multi_line`）
   在每个 `generate_*` 里都要手抄一遍。
-- **建议**：把 `Style` 移入 `LayoutEngine.py`（或引擎内的 `Style` 基类），
-  并提供 `TextObject.from_style(name, style, text="", **overrides)` / `ImageObject.from_style(...)`。
-- **收益**：模板函数体量下降约 40%；样式定义与渲染参数解耦；`ResumeTemplate` 只剩"简历词汇 + STYLES 表"。
-- **注意**：这是**破坏性 API 变更**，`ResumeCore.py` 的 `STYLES["..."].get_font_style()` 等调用需同步。
-  建议保留 `Style.get_font_style()` 为兼容别名。
+- **实施**：`Style` 移入 `LayoutEngine.py`（放在 `Padding` 之后，与 `Color`/`Padding`
+  同属底层纯数据构件），并新增 `TextObject.from_style` / `ImageObject.from_style`。
+  API 见 3.1 与 3.3 节。
+- **迁移原则：纯搬运**。字段名、顺序、默认值逐项一致（测试入口有字段快照断言），
+  连 `padding` 的可变默认参数（缺陷 7.10）也**原样保留** —— 修它会破坏
+  "输出逐字节不变"的验收前提，故归入批次 4。
+- **与原方案的差异**：原建议"保留 `Style.get_font_style()` 为兼容别名"。
+  实际**不需要别名** —— `Style` 整个类搬过去了，方法随之搬家。
+  `RectangleObject.from_style` 刻意不做（只映射一个字段，负收益）。
+- **收益**：模板函数体量可下降约 40%（待功能分支替换后兑现）；
+  `ResumeTemplate` 只剩"简历词汇 + `STYLES` 表"。
+- **验证**：三个入口退出码 0；PDF 规范化比对**三个产物全部逐字节一致**
+  （本批只新增 API、未修改任何既有函数体）。测试入口新增 `Style` / `from_style` /
+  `create_text_block` 断言共 13 项。
 
 ### 8.5 统一缓存失效入口
 
@@ -1546,7 +1678,7 @@ Resume(
 | **0** | 修 7.1 导入；修 7.15 换行；修 7.17 重复挂载；修 7.18 末尾间距 | 极低 | 三个入口都能跑通 | ✅ **已完成** |
 | **1** | 抽 `create_spacer`（8.2） | 低 | 输出 PDF 应与重构前**逐字节一致** | ✅ **已完成** |
 | **2** | 抽 `create_band`，`create_columns` / `split_column_advanced` 变包装；修 7.3、7.4（8.1） | 中 | 同上，逐字节比对 | ✅ **已完成** |
-| **3** | 抽 `create_text_block` / `from_style`（8.3、8.4） | 中 | 同上 | 待办 |
+| **3** | 抽 `create_text_block` / `from_style` / `Style` 下沉（8.3、8.4） | 中 | 同上 | ✅ **已完成** |
 | **4** | **矩形包围内容前置**：几何属性改 property（8.5）+ 统一几何计算入口 + 修 7.19 父子高度自指 + 修 7.20 `_height` 卡死 + 明确 `wrap_content` 方向性 | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
 | **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | 待办（批次 4 内交付） |
 | **4b** | 修 7.21 `wrap_width` 完全不可用（阻断点 C） | 中 | 收窄包围盒断言 | 待办 |
@@ -1617,12 +1749,44 @@ Resume(
 > **结论：包装层会改变树形，所有按名字取对象的地方都要检查用 `get_child` 还是 `find_by_name`。**
 > 逐字节比对把这个问题挡在了提交之前。
 
-**这就是批次 3 之后的验收基线**：除了被有意修复的缺陷之外，
-规范化后的 PDF 必须逐字节一致。任何未预期的差异都说明重构改变了行为，需要逐条解释。
+批次 3 的实测结果（基线为批次 3 之前）：
+
+| 产物 | 规范化后 |
+| --- | --- |
+| `test_layout_engine_cached.pdf` | **完全一致**（19316 字节） |
+| `resume_template_v2_test.pdf` | **完全一致**（61370 字节） |
+| `output/利姆露_*.pdf` | **完全一致**（68478 字节） |
+
+批次 1、2、3 都是**纯粹的等价重构或纯新增**（只抽构件 / 只加 API，不改变既有行为），
+所以三个产物全部逐字节一致，这正是它们追求的结果。
+
+> ✅ **「只增不改」是一种可验证的强约束**：批次 3 新增了 `Style` 类、两个 `from_style`
+> 工厂与 `create_text_block`，**没有修改任何既有函数体**。因此逐字节基线是这个批次
+> 唯一需要的验收手段 —— 它一旦不同，就说明新增代码意外影响了既有路径。
+
+> ⚠️ **批次 2 的一次真实踩坑，值得记住**：`create_columns` 改为走 `create_band` 之后，
+> 各栏从"`parent` 的直接子元素"变成了"带容器的子元素"，多出一层。
+> 而引擎测试入口原先用 `container.get_child("Column_0")` 取栏（`get_child` 只看直接子元素），
+> 于是拿到 `None`，两段文本根本没被创建 —— 引擎 PDF 从 19316 字节掉到 18071。
+> **这不是引擎的问题，是测试的假设失效了。**
+> 改用 `find_by_name`（深度优先）后恢复一致。
+> **结论：包装层会改变树形，所有按名字取对象的地方都要检查用 `get_child` 还是 `find_by_name`。**
+> 逐字节比对把这个问题挡在了提交之前。
+
+**批次 1~3 的验收基线到此结束。** 这三个批次都是等价重构或纯新增，
+逐字节一致是它们唯一需要的验收手段。
+
+> ⚠️ **从批次 4 起，逐字节比对不再是充分的验收手段。** 批次 4 要修 7.19（父子高度自指）、
+> 7.20（`_height` 卡死）、7.21（`wrap_width`）并实现"矩形包围内容"，
+> 这些都会**有意识地改变**布局结果。
+>
+> 届时仍应保留基线副本，但用法从"要求完全一致"改为：
+> **逐条解释每一处差异，确认它正好对应预期的那一项修复，且没有多余的连带变化。**
+> 一个只有预期差异、没有意外差异的比对结果，才说明改动是受控的。
 
 > 📌 **给下一批次的提示**：基线用的参考副本放在工作区外的临时目录
-> （`%TEMP%\batch2_baseline\`），不入库。
-> 批次 3 动工前请**以当前工作树的输出为新基线**重取一次：
+> （`%TEMP%\batch3_baseline\`），不入库。
+> 批次 4 动工前请**以当前工作树的输出为新基线**重取一次：
 > 跑一遍三个入口，把 `test_layout_engine_cached.pdf`、`resume_template_v2_test.pdf`、
 > `output/*.pdf` 复制到工作区外的临时目录，然后才开始改代码。
 
@@ -1753,9 +1917,27 @@ Color: RimuruBlue Red Green Blue Yellow White Black Gray LightGray
 Padding: .all(v) .rectangle(h,v) .horizontal(v) .vertical(v)
          .left(v) .right(v) .top(v) .bottom(v)
 
+Style:  # 批次 3 从模板层移入
+    font_name="helvetica"  font_size=12  bold=False  italic=False
+    color=Black  fill_color=White  image_path=""
+    padding=Padding.all(0)  fit_mode="cover"
+    .get_font_style() -> "B" / "I" / "BI" / ""
+
 layer_manager: LayerManager()          # 全局单例
 objectRegister: dict                   # 全局注册表
 find_object_by_name(name="") -> Optional[Any]
+
+# from_style 字段映射（批次 3）
+Style.font_name   -> TextObject.font_name
+Style.font_size   -> TextObject.font_size
+Style.bold+italic -> TextObject.font_style   # 经 get_font_style()
+Style.color       -> TextObject.text_color   # 注意：不是 color
+Style.fill_color  -> TextObject.color / ImageObject.color
+Style.padding     -> *.padding
+Style.image_path  -> ImageObject.image_path  # 实参 image_path 优先
+Style.fit_mode    -> ImageObject.fit_mode
+# **overrides 优先级高于 style；style=None 用全默认值
+# RectangleObject.from_style 刻意不做
 
 # 默认值
 line_height 默认 = font_size * 0.6
@@ -1765,6 +1947,7 @@ split_column_advanced:         ratio=[1.0, 2.5], gap=0
 create_columns:                num_columns=2, gap=5
 create_band:                   gap=0, height=0（取父内容区高）, container_name="{parent.name}_band"
 create_spacer:                 parent=None, layer=0
+create_text_block:             height=0（取父可用高，**不是**按内容撑高）, align_x=LEFT, align_y=FLOW
 Resume:                        summary_height=30.0
 
 # 构造函数返回值对照（批次 2 变更）
@@ -1772,4 +1955,6 @@ create_band                -> 新建的带容器
 create_columns             -> 新建的带容器   # 此前返回 parent
 create_columns_balanced    -> 新建的带容器   # 此前返回 parent
 split_column_advanced      -> parent         # 未变，保持链式调用兼容
+create_text_block          -> 新建的 TextObject（已挂载）
+from_style                 -> 新建对象（**未挂载**）
 ```

@@ -559,6 +559,10 @@ class LayoutObject:
         self._laid_out_h = 0.0
         self._laid_out_x = 0.0            # 趟 2 算出的绝对位置
         self._laid_out_y = 0.0
+        # FILL 退化规则：父元素在对应轴上是否为 CONTENT（由 _measure 在递归前设置）
+        self._in_content_parent_x = False
+        self._in_content_parent_y = False
+        self._pdf = None                  # 测量期传入的 pdf，供内容尺寸估算使用
         
         # 自动注册到全局注册表
         if name:
@@ -891,11 +895,35 @@ class LayoutObject:
         return self
     
     def _source_w(self, pdf):
-        """本元素的内容固有宽度（内容 + 左右 padding）。子类按需覆盖。"""
+        """
+        本元素的内容固有宽度（内容 + 左右 padding）
+
+        子类按需覆盖以表达"我的内容天然有多宽"（如文本的字符串宽度）。
+        """
         if not self.children:
             return self.padding.left + self.padding.right
-        return (max(c._layout_size_w() for c in self.children)
+        return (max(c._contribution_w() for c in self.children)
                 + self.padding.left + self.padding.right)
+    
+    def _contribution_w(self) -> float:
+        """
+        本元素对"父元素 CONTENT 宽度"的贡献
+
+        | 自身 SizeX | 贡献 |
+        | --- | --- |
+        | `FIXED` | 声明宽度（不随父变化） |
+        | `FILL`，但父宽由内容决定 | **自身内容固有宽度**（此时 FILL 已退化为按内容定尺寸） |
+        | `FILL`，其余情况 | 0（宽度由父内容区决定，自身没有固有宽度） |
+        | `CONTENT` | 自身的内容固有宽度 |
+
+        注意不能直接用 `_laid_out_w`：退出方向要求子元素**先算完**，
+        而 FILL 子元素的尺寸来自父的内容区 —— 那正是父在算的东西。
+        """
+        if self._size_x == SizeX.FIXED:
+            return self._width
+        if self._size_x == SizeX.FILL and not self._in_content_parent_x:
+            return 0.0
+        return self._source_w(self._pdf)
     
     def _source_h(self, pdf):
         """本元素的内容固有高度（内容 + 上下 padding）。子类按需覆盖。"""
@@ -927,31 +955,53 @@ class LayoutObject:
         
         self._constraint_w = constraint_w
         self._constraint_h = constraint_h
+        self._content_overflows = False
+        # 供 FILL 退化规则使用：本元素在测量期内需要 pdf 来估算内容尺寸
+        self._pdf = pdf
         
-        # ---- 结构性冲突：CONTENT 父的直接 FILL 子 ----
-        # 父的尺寸由内容决定，而该子元素的尺寸又要填满父的内容区，两者互为前提。
-        # 这是结构性矛盾，与约束的数值无关，因此在进入方向即可判定。
-        if self._size_x == SizeX.CONTENT:
-            bad = [c for c in self.children if c._size_x == SizeX.FILL]
-            if bad:
-                raise LayoutError_CONTENT_FILL(self, bad, "X")
-        if self._size_y == SizeY.CONTENT:
-            bad = [c for c in self.children if c._size_y == SizeY.FILL]
-            if bad:
-                raise LayoutError_CONTENT_FILL(self, bad, "Y")
+        # ---- 结构性冲突检查：结论是「不需要」 ----
+        #
+        # 【为什么 CONTENT 父 + FILL 子不是循环】
+        #   关键在于 FILL 子元素需要的是**约束**，不是「父的最终尺寸」。
+        #   约束是作为参数往下传的，因此这个环在设计上就已经断开了：
+        #
+        #       水平轴：子宽 = min(父最终内容区宽, 传入约束) —— 收缩包裹，良定义
+        #       垂直轴：子高 = 传入约束                        —— 父再收缩包裹并夹紧
+        #
+        #   两个轴都是确定性的。若父收缩后的尺寸小于子元素所占，那是**溢出**
+        #   （`_content_overflows` 会置位），不是循环。
+        #
+        #   旧实现之所以在这里撞墙，是因为它回头问 `parent.get_effective_height()`，
+        #   而那时父的尺寸尚未确定 —— 是**实现方式**造成的环，不是语义上的环。
+        #   两趟遍历把约束改成传参之后，这个问题自然消失。
+        #
+        #   `LayoutError_CONTENT_FILL` 因此不再被触发；保留该类型以备将来需要
+        #   对某些组合做显式限制。真正的**结构循环**（元素成为自己的祖先）
+        #   仍然会报错，见本方法开头。
         
         # ---- 进入方向：定 FIXED 与 FILL ----
         # 定死值优先：代码里写死的尺寸不另行计算，也不被裁剪（装不下是溢出问题）
         if self._size_x == SizeX.FIXED:
             self._laid_out_w = self._width
         elif self._size_x == SizeX.FILL:
-            self._laid_out_w = max(constraint_w, 0.0)
+            if self._in_content_parent_x:
+                # 【退化规则】父元素是 CONTENT（尺寸由内容决定）时，FILL 子元素
+                # 拿到的"约束"没有意义 —— 那个约束正是由本子元素参与决定的。
+                # 因此退化为"按内容定尺寸"，与安卓 wrap_content 父强制
+                # match_parent 子退化是同一个处理。
+                # 若不退化，则"CONTENT 父只有 FILL 子"会收敛到 0，完全不可用。
+                self._laid_out_w = self._source_w(self._pdf)
+            else:
+                self._laid_out_w = max(constraint_w, 0.0)
         # SizeX == CONTENT：此轮不定，留给退出方向
         
         if self._size_y == SizeY.FIXED:
             self._laid_out_h = self._height
         elif self._size_y == SizeY.FILL:
-            self._laid_out_h = max(constraint_h, 0.0)
+            if self._in_content_parent_y:
+                self._laid_out_h = self._source_h(self._pdf)
+            else:
+                self._laid_out_h = max(constraint_h, 0.0)
         
         # ---- 推算子元素的约束 ----
         if self._size_x == SizeX.CONTENT:
@@ -968,6 +1018,10 @@ class LayoutObject:
         
         path = path + [self]
         for child in self.children:
+            # 【退化规则的前提】子元素需要知道"父的这条轴是否由内容决定"，
+            # 以便在 FILL 时退化为按内容定尺寸。标记设在子元素上，递归时读取。
+            child._in_content_parent_x = (self._size_x == SizeX.CONTENT)
+            child._in_content_parent_y = (self._size_y == SizeY.CONTENT)
             child._measure(child_cw, child_ch, path, pdf)
         
         # ---- 退出方向：定 CONTENT ----
@@ -1429,12 +1483,15 @@ class TextObject(LayoutObject):
         layer: int = 0,
         wrap_width: bool = False,
         wrap_height: bool = False,
+        size_x: Optional[SizeX] = None,
+        size_y: Optional[SizeY] = None,
     ):
         super().__init__(
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height
+            wrap_width=wrap_width, wrap_height=wrap_height,
+            size_x=size_x, size_y=size_y,
         )
         
         self._text = text
@@ -1559,6 +1616,45 @@ class TextObject(LayoutObject):
         if not self._cache_valid:
             return (0.0, 0.0)
         return (self._cached_width, self._cached_height)
+    
+    def _source_w(self, pdf=None) -> float:
+        """
+        文本的内容固有宽度（字符串宽度 + 左右 padding）
+
+        批次 4b 新增，用于让 SizeX.CONTENT 的父元素能收窄到文本宽度
+        （这是缺陷 7.21 的修复点）。
+
+        宽度目前按字符类别估算（真实测量属批次 5）：
+            CJK / 全角标点 -> 1.0 × 字号
+            其余字符        -> 0.5 × 字号
+        批次 5 会改为用外部 pdf 的 get_string_width 做精确测量；
+        那时把 `_estimate_text_width` 换成真实调用即可，接口不变。
+        """
+        if self.children:
+            return super()._source_w(pdf)
+        pad = self.padding.left + self.padding.right
+        if not self._text:
+            return pad
+        return self._estimate_text_width(self._text) + pad
+    
+    def _estimate_text_width(self, text: str) -> float:
+        """
+        按字符类别估算文本宽度（无外部 pdf 时的回退）
+
+        pdf 实例只在渲染时才有，而尺寸测量发生在渲染之前，
+        因此这里必须有一个不依赖 pdf 的估算。
+        """
+        wide = 0
+        for ch in text:
+            # CJK 统一表意文字、全角标点、假名等按全宽计
+            o = ord(ch)
+            if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+                    or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
+                    or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
+                    or 0xFFE0 <= o <= 0xFFE6):
+                wide += 1
+        narrow = len(text) - wide
+        return (wide * 1.0 + narrow * 0.5) * self.font_size
     
     def _source_h(self, pdf=None) -> float:
         """
@@ -1748,12 +1844,15 @@ class ImageObject(LayoutObject):
         layer: int = 0,
         wrap_width: bool = False,
         wrap_height: bool = False,
+        size_x: Optional[SizeX] = None,
+        size_y: Optional[SizeY] = None,
     ):
         super().__init__(
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height
+            wrap_width=wrap_width, wrap_height=wrap_height,
+            size_x=size_x, size_y=size_y,
         )
         
         self._image_path = image_path
@@ -2080,12 +2179,15 @@ class RectangleObject(LayoutObject):
         layer: int = 0,
         wrap_width: bool = False,
         wrap_height: bool = False,
+        size_x: Optional[SizeX] = None,
+        size_y: Optional[SizeY] = None,
     ):
         super().__init__(
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height
+            wrap_width=wrap_width, wrap_height=wrap_height,
+            size_x=size_x, size_y=size_y,
         )
     
     def _calculate_wrap_height(self) -> float:
@@ -3251,21 +3353,24 @@ if __name__ == "__main__":
         f"CONTENT 应被约束夹紧到 30，实际 {_cl.get_effective_height()}"
     assert _cl._content_overflows is True, "内容超出约束时应置 _content_overflows"
     print("    ✅ CONTENT 夹紧与溢出标记通过")
-    # 9.6 结构性冲突：CONTENT 父 + 直接 FILL 子 → LayoutError_CONTENT_FILL
+    # 9.6 CONTENT 父 + 直接 FILL 子 —— **不报错**，由"退化规则"处理
+    #     两趟遍历把约束改成传参后，这个组合不再是循环：
+    #     FILL 子需要的是**约束**而不是"父的最终尺寸"，而约束是传下去的。
+    #     父由内容决定时，FILL 子退化为"按内容定尺寸"（同安卓 wrap_content 父的语义）。
     _cf_root = LayoutObject(name="CF_Root", width=200, height=200)
     _cf = LayoutObject(name="CF_Box", width=0, height=0, size_y=SizeY.CONTENT,
-                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+                       padding=Padding.all(5), align_x=AlignX.NONE, align_y=AlignY.NONE)
     _cf_root.add_child(_cf)
-    _cf.add_child(LayoutObject(name="CF_Bad", width=0, height=0, size_y=SizeY.FILL,
-                               align_x=AlignX.NONE, align_y=AlignY.NONE))
-    try:
-        _cf_root.layout()
-    except LayoutError_CONTENT_FILL as _e:
-        assert "CF_Box" in str(_e) and "CF_Bad" in str(_e), "报错信息应含父与冲突子元素名"
-        assert "修法" in str(_e), "报错信息应给出修法"
-    else:
-        raise AssertionError("CONTENT 父 + 直接 FILL 子 应抛 LayoutError_CONTENT_FILL")
-    print("    ✅ 尺寸循环报错通过（含父/子元素名与修法）")
+    _cf.add_child(TextObject(name="CF_T", width=0, height=0, text="中文", font_size=10,
+                             align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _cf_root.layout()          # 不应抛错
+    _cf_t = _cf.children[0]
+    assert _cf_t.get_effective_height() > 0, \
+        "CONTENT 父下的 FILL 子应退化为按内容定高，而不是被压成 0"
+    assert abs(_cf.get_effective_height() - (_cf_t.get_effective_height() + 10)) < 1e-9, \
+        (f"CONTENT 父高应为 子高 + padding(10)，"
+         f"实际 {_cf.get_effective_height()} vs 子 {_cf_t.get_effective_height()}")
+    print(f"    ✅ CONTENT 父 + FILL 子 由退化规则处理通过（父高 {_cf.get_effective_height():.2f}）")
     # 9.7 结构循环：元素成为自己的祖先
     _cy_a = LayoutObject(name="CY_A", width=50, height=50)
     _cy_b = LayoutObject(name="CY_B", width=50, height=50)
@@ -3395,5 +3500,74 @@ if __name__ == "__main__":
     assert _raw.size_y == SizeY.FIXED, "写 height 应同步为 FIXED"
     assert _raw.get_effective_height() == 42
     print("    ✅ 「直接写私有字段会绕过尺寸方式」的不变量已固化")
+    
+    # 11) 内容固有宽度 / 收窄包围盒（批次 4b，修 7.21）
+    print("  --- SizeX.CONTENT 收窄包围盒 ---")
+    # 11.1 无固有宽度的子元素 -> 收窄到 padding；有 FIXED 子元素 -> 收窄到该宽度
+    def _shrink(extra_w):
+        _r = LayoutObject(name=f"SH_root_{extra_w}", width=200, height=300)
+        _b = RectangleObject(name=f"SH_box_{extra_w}", width=0, height=20,
+                             size_x=SizeX.CONTENT, align_x=AlignX.NONE, align_y=AlignY.NONE)
+        _r.add_child(_b)
+        _b.add_child(LayoutObject(name=f"SH_c0_{extra_w}", width=0, height=10,
+                                  align_x=AlignX.NONE, align_y=AlignY.NONE))
+        if extra_w:
+            _b.add_child(LayoutObject(name=f"SH_c1_{extra_w}", width=extra_w, height=10,
+                                      align_x=AlignX.NONE, align_y=AlignY.NONE))
+        _r.layout()
+        return _b.get_effective_width()
+    assert _shrink(0) == 0.0, f"无固有宽度的子元素应使包围宽为 0，实际 {_shrink(0)}"
+    assert _shrink(30) == 30.0, f"应收窄到 FIXED 子元素的 30，实际 {_shrink(30)}"
+    print("    ✅ 收窄到内容固有宽通过（0 / 30，旧实现三条路径全返回 0）")
+    # 11.2 文本固有宽度按字符类别估算
+    _tw_latin = TextObject(name="TW_latin", width=0, height=0, text="Hello World", font_size=12)
+    _tw_cjk = TextObject(name="TW_cjk", width=0, height=0, text="中文测试", font_size=12)
+    assert _tw_latin._source_w(None) == 11 * 0.5 * 12, \
+        f"11 个半角字符应为 66，实际 {_tw_latin._source_w(None)}"
+    assert _tw_cjk._source_w(None) == 4 * 1.0 * 12, \
+        f"4 个全角字符应为 48，实际 {_tw_cjk._source_w(None)}"
+    assert TextObject(name="TW_e", width=0, height=0, text="")._source_w(None) == 0
+    print("    ✅ 文本固有宽度估算通过（半角 0.5×、全角 1.0× 字号）")
+    # 11.3 双向 CONTENT 包围文本：宽高都收窄到文本固有尺寸 + padding
+    _bb_root = LayoutObject(name="BB_root", width=200, height=300)
+    _bb = RectangleObject(name="BB_box", width=0, height=0, size_x=SizeX.CONTENT,
+                          size_y=SizeY.CONTENT, padding=Padding.all(3),
+                          align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _bb_root.add_child(_bb)
+    _bb.add_child(TextObject(name="BB_t", width=0, height=0, text="中文测试", font_size=12,
+                             align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _bb_root.layout()
+    _bb_t = _bb.children[0]
+    assert abs(_bb.get_effective_width() - (_bb_t._source_w(None) + 6)) < 1e-9, \
+        f"包围宽应为 文本固有宽+6={_bb_t._source_w(None)+6}，实际 {_bb.get_effective_width()}"
+    assert abs(_bb.get_effective_height() - (_bb_t._source_h(None) + 6)) < 1e-9, \
+        f"包围高应为 文本固有高+6={_bb_t._source_h(None)+6}，实际 {_bb.get_effective_height()}"
+    print(f"    ✅ 双向包围文本通过（{_bb.get_effective_width():.2f} x {_bb.get_effective_height():.2f}）")
+    # 11.4 包围盒受祖辈约束夹紧 + 溢出标记
+    _cl2_root = LayoutObject(name="CL2_root", width=30, height=300)
+    _cl2 = RectangleObject(name="CL2_box", width=0, height=0, size_x=SizeX.CONTENT,
+                           align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _cl2_root.add_child(_cl2)
+    _cl2.add_child(TextObject(name="CL2_t", width=0, height=0, text="很长的一段中文文本内容",
+                              font_size=12, align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _cl2_root.layout()
+    assert _cl2.get_effective_width() == 30, \
+        f"包围宽应被祖辈约束夹紧到 30，实际 {_cl2.get_effective_width()}"
+    assert _cl2._content_overflows is True, "内容超出约束时应置 _content_overflows"
+    print("    ✅ 包围盒受祖辈约束夹紧通过")
+    # 11.5 FILL 子元素在 CONTENT 父下退化为按内容定尺寸（同安卓 wrap_content 语义）
+    _dg_root = LayoutObject(name="DG_root", width=200, height=300)
+    _dg = LayoutObject(name="DG_box", width=0, height=0, size_x=SizeX.CONTENT,
+                       size_y=SizeY.CONTENT, align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _dg_root.add_child(_dg)
+    _dg_t = TextObject(name="DG_t", width=0, height=0, text="退化规则", font_size=10,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _dg.add_child(_dg_t)
+    _dg_root.layout()
+    assert _dg_t._size_x == SizeX.FILL and _dg_t._size_y == SizeY.FILL, "前提：子元素默认 FILL"
+    assert _dg_t.get_effective_width() > 0 and _dg_t.get_effective_height() > 0, \
+        "CONTENT 父下的 FILL 子应退化为按内容定尺寸，不能被压成 0"
+    print(f"    ✅ FILL 子退化规则通过（子 {_dg_t.get_effective_width():.2f} "
+          f"x {_dg_t.get_effective_height():.2f}）")
     
     print("\n✅ 回归契约断言全部通过")

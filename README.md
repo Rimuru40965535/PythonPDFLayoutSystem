@@ -251,6 +251,55 @@ social_media.png  contact_address.png  website.png
   4b（修 `wrap_width`）；包围自动换行的长文本依赖批次 5 的真实行数测量。
 - 技术文档新增 8.11 节完整记录该分析。
 
+#### **批次 4.1：四轴设计（尺寸轴与对齐轴分离）**
+
+> 待提交。本次提交的内容简述如下。
+
+**设计动机**：`wrap` 只改变元素**大小**，`flow` 只改变元素**位置** ——
+两者本就不该共用一条枚举轴。旧实现把尺寸（`wrap_width` / `wrap_height` 两个布尔量）
+与位置（`align_y == FLOW`）混在一起，`get_effective_height()` 里那段
+「用前驱位置算自身截断高度」正是 7.19 的温床。
+
+**新增**：
+
+- `SizeX` / `SizeY` 两个尺寸枚举（`FILL` / `FIXED` / `CONTENT`），与
+  `AlignX` / `AlignY` 并列，构成四轴。**对齐枚举不新增成员** ——
+  测试入口有断言固化这一点，防止 `wrap` 又被塞回对齐轴。
+- `LayoutCycleError`：布局循环依赖的专门异常类型（旧代码用裸 `RuntimeError`，
+  测试无法区分错误种类）。两种情形：结构循环、`CONTENT` 父 + 直接 `FILL` 子。
+
+**兼容映射**（保持旧行为，构造时自动完成）：
+
+| 旧写法 | 新枚举 |
+| --- | --- |
+| `wrap_width=True` | `SizeX.CONTENT` |
+| `wrap_width=False` + `width > 0` | `SizeX.FIXED` |
+| `wrap_width=False` + `width <= 0` | `SizeX.FILL` |
+
+`wrap_height` 同理。解析优先级为「显式 `size_*` > `wrap_*` > 由 `width`/`height` 推断」。
+`wrap_width` / `wrap_height` 改为**派生 property**，不再是独立真相。
+
+**为后续步骤埋下的一个关键区分**：
+
+> **`width == 0` 不再等价于 `FILL`。** 旧实现里 `_width == 0` 一个值同时承担
+> 「没给」和「要撑满」两种含义，导致 `CONTENT` 无法表达 —— 这正是 7.21
+> （`wrap_width` 三条路径全返回 0）的根源。迁移后 `width` 是纯数值，`FILL` 是显式枚举值。
+
+**另一处按决策记录的行为变化**（将在后续步骤兑现）：
+
+> 旧实现里 `FIXED` 会被父可用空间夹紧（`min(_width, avail_w)`）。
+> 按「代码里定死的尺寸不动、不另行计算」的原则，**这个夹紧要去掉** ——
+> 定死就是定死，装不下是**溢出**问题，不是改尺寸的理由。
+
+**测试**
+
+- 三个入口退出码 0；
+- **规范化比对：三个产物全部逐字节一致** —— 4.1 是**纯门面变更**
+  （新增枚举 + 兼容映射 + 派生 property），必须无行为变化，逐字节基线因此仍是有效验收手段；
+- 引擎测试入口新增 7 组断言：枚举成员集合、旧写法→新枚举映射（8 例）、
+  显式 `size_*` 优先级、`wrap_*` 派生属性读写往返、`size_*` setter 触发失效、
+  尺寸轴类型校验（按轴分开，`size_y` 传 `SizeX` 必须报错）、`LayoutCycleError` 类型。
+
 #### **批次 3：`Style` 下沉与内容构件**
 
 - **`Style` 移入 `LayoutEngine.py`**（放在 `Padding` 之后，与 `Color`/`Padding`
@@ -298,6 +347,71 @@ social_media.png  contact_address.png  website.png
   这不是 `create_text_block` 的问题，但用 `height=0` 时必须意识到。
 - 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**
   （批次 3 是"只增不改"，没有修改任何既有函数体，因此这是它唯一需要的验收手段）。
+
+#### **批次 4.2：两趟遍历（几何核心重写）**
+
+> 待提交。本次提交的内容简述如下。
+
+**把尺寸计算从「惰性求值 + 父子互相递归」改成「两趟遍历」。**
+
+旧实现的子元素在测量阶段会回头问父容器（`get_parent_available_area()` →
+`parent.get_effective_height()`），而父的尺寸正要靠子元素算出来 —— **自指**，
+于是 `wrap_height=True` 只能塌缩成 padding（缺陷 7.19）。新实现把两个量分开传播：
+
+| 趟 | 方向 | 传什么 | 定下什么 |
+| --- | --- | --- | --- |
+| 趟 1 `_measure` | 进入 | `constraint` 向下 | `FIXED` / `FILL` 的尺寸 |
+| 趟 1 `_measure` | 退出 | `size` 向上 | `CONTENT` 的尺寸 |
+| 趟 2 `_place` | 进入 | 只读 `AlignX` / `AlignY` | 绝对坐标 |
+
+**子元素的约束是作为参数拿到的，不再回头问父容器** —— 那条造成循环的回边根本不存在。
+
+**新增**：`layout(pdf=None, force=False)` 公开入口；`_source_w/_source_h` 内容固有尺寸钩子
+（批次 5 只改这两个方法的文本实现即可接入真实行数测量）；
+`LayoutError_CONTENT_FILL`（CONTENT 父 + 直接 FILL 子，报错含父/子元素名与两条修法）。
+
+**删除**：`wrap_content()` / `wrap_content_width()`（语义由 `layout()` 完全取代）、
+`_calculate_wrap_width()`，以及 `_wrap_cache_valid` / `_height_set_by_wrap` /
+`_cached_wrap_height` / `_is_wrapping` / `_geom_cache_valid` 等整套惰性缓存字段。
+失效只剩一个布尔标记 `_layout_valid`。
+
+**行为变化**（按你的决策）：
+
+> **`FIXED` 不再被父约束裁剪。** 旧实现是 `min(_width, avail_w)`；按「代码里定死的尺寸
+> 不动、不另行计算」的原则，现在不裁剪 —— 装不下是**溢出**问题，不是改尺寸的理由。
+> FLOW 的溢出裁剪也从尺寸函数移到了趟 2（它属于"溢出策略"，不属于尺寸计算）。
+
+**过程中修掉的 4 个自身 bug**（都由逐字节比对暴露）：
+
+1. `_place` 里 padding 被减了两次，可用高被吃掉 20mm，后续元素全被裁成 0；
+2. 传给子元素的"原点"语义搞错，子元素把自己的 padding 加在了父的坐标上；
+3. `_place` 内部调 `get_content_area()` 触发 `_ensure_layout()` → 无限递归；
+4. `create_band` / `split_column_advanced` 在**构造之后**才给格子设 `_width`，
+   而尺寸方式在构造时按 `width=0` 推成了 `FILL`，把定死的宽度覆盖掉。
+
+**顺手清掉一处遮蔽**：`ResumeTemplate.py` 里还留着一份批次 2 就已移入引擎的
+`split_column_advanced` 旧副本，它的定义**遮蔽**了 import 的引擎版本，
+且直接写 `_width` / `_x` 而不声明尺寸方式 —— 已删除该副本（102 行），改为从引擎 import。
+
+**新增迁移注意**（已写入技术文档）：
+
+> `obj._height = N` 这种"先构造、后设尺寸"的旧写法会**失效** ——
+> 构造时若 `height=0`，尺寸方式被推成 `FILL`，之后直接写 `_height` 不会改回 `FIXED`。
+> 请改用 `obj.height = N`（新增的公开属性会同步尺寸方式）。
+> 已把 `ResumeTemplate.py` 里 4 处这类写法改正。
+
+**新增工具** `verify_pdfs.py`：把上一段那种手工比对固化成可复用工具。
+标准工具链里没有 pypdf / PyMuPDF，而生成的 PDF 含 CreationDate / ID 等易变字段，
+直接比字节永远失败。该工具剥离这些字段后比对，`py verify_pdfs.py --baseline <目录>` 即可。
+
+**测试**
+
+- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**。
+  这是很强的结果 —— 引擎的整棵测试树走全新遍历，输出与旧实现完全相同；
+- 跑两次结果一致（确定性）；引擎入口整体耗时 **1.32 秒**；
+- 引擎测试入口新增 13 项断言：FIXED 不被裁剪、FILL 撑满、CONTENT 包围内容、
+  **包围高与父高无关（父高 100/300/800 下均为 55）**、CONTENT 夹紧与溢出标记、
+  尺寸循环报错、结构循环报错、失效传导（加子/改子元素后重算拿到新值）、FLOW 溢出裁剪。
 
 ---
 

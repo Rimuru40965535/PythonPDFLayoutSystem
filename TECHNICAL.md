@@ -1,16 +1,15 @@
 # PythonPDFLayoutSystem 技术文档
 
-> 本文档由代码实读整理，对应工作区当前状态（`master` 上的 `8af9962` **之后的未提交工作树**）。
+> 本文档由代码实读整理，对应工作区当前状态（`master` 上 `f2556a2` **之后的未提交工作树**）。
 > 所有函数签名、参数、返回值均取自实际代码；标为"实测"的结论均附可复现的观测数据。
 >
 > **已完成批次**：基础设施（`.gitignore` + 字体说明 + `.pyproj` 入口）、
 > 批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）、
 > 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）、
 > 批次 3（`Style` 下沉 + `from_style` + `create_text_block`，8.3 / 8.4）、
-> **批次 4.1（四轴：`SizeX` / `SizeY` / `LayoutCycleError`）、
-> 批次 4.2（两趟遍历，修 7.19 / 7.20）、批次 4.3（几何属性 property 化，8.5）、
-> 批次 4b（内容固有宽度与收缩包裹，修 7.21）**。
-> 批次 4.4（删 `wrap_*` 兼容属性）、4.5（包围盒兑现）、
+> **批次 4 全部完成**：4.1 四轴枚举 · 4.2 两趟遍历（修 7.19 / 7.20）·
+> 4.3 几何属性 property 化（8.5）· 4b 内容固有宽度（修 7.21）·
+> 4.4 删 `wrap_*` 兼容面（修 7.6 / 7.10 的引擎侧）。
 > 批次 5（真实行数测量）、批次 6（分页）待办。
 >
 > ⚠️ **中层与顶层文件不在 `master` 上**（`ResumeTemplate.py` / `ResumeCore.py` 属功能分支）。
@@ -234,24 +233,18 @@ LayoutEngine.py
 | `FIXED` | 使用代码中写死的 `width` / `height`，**不另行计算、不被裁剪** |
 | `CONTENT` | 由内容圈定（`SizeX` 取子元素最大宽 + 左右 padding；`SizeY` 取子元素高之和 + 上下 padding），再对传入约束夹紧 |
 
-**旧写法 → 新枚举的推断映射**（构造时自动完成，保持旧行为）：
+构造参数解析：**显式 `size_x` / `size_y` 优先**；未给则按声明值推断 ——
+`width` / `height` 大于 0 推成 `FIXED`，否则 `FILL`。
 
-| 旧写法 | 新枚举 |
-| --- | --- |
-| `wrap_width=True` | `SizeX.CONTENT` |
-| `wrap_width=False` + `width > 0` | `SizeX.FIXED` |
-| `wrap_width=False` + `width <= 0` | `SizeX.FILL` |
-| `wrap_height=True` | `SizeY.CONTENT` |
-| `wrap_height=False` + `height > 0` | `SizeY.FIXED` |
-| `wrap_height=False` + `height <= 0` | `SizeY.FILL` |
+> ✅ **批次 4.4 起 `wrap_width` / `wrap_height` 已彻底删除**（构造参数、兼容属性、
+> `_calculate_wrap_height` 垫片全部移除）。它们只是 `SizeX.CONTENT` / `SizeY.CONTENT`
+> 的旧写法，长期并存会让"谁是真相"含糊 —— 而真相只有 `_size_x` / `_size_y`。
+>
+> 迁移写法：`wrap_width=True` → `size_x=SizeX.CONTENT`；
+> `wrap_height=True` → `size_y=SizeY.CONTENT`。
+> 读取用 `size_x` / `size_y`（都是 property，赋值会触发失效）。
 
-构造参数解析优先级：**显式 `size_x` / `size_y` > `wrap_*` 布尔量 > 由 `width` / `height` 推断**。
-显式给 `size_*` 的同时又给 `wrap_*`，会打印一条警告并以 `size_*` 为准。
-
-`wrap_width` / `wrap_height` 现已改为**派生 property**（读写 `size_x` / `size_y`），
-**不再是独立真相**。写 `False` 时按声明尺寸退回 `FIXED` / `FILL`。
-
-> ⚠️ **`width == 0` 不再等价于 `FILL`**（迁移后 `width` 是纯数值，`FILL` 是显式枚举值）。
+> ⚠️ **`width == 0` 不再等价于 `FILL`**（`width` 是纯数值，`FILL` 是显式枚举值）。
 > 旧实现里 `_width == 0` 一个值承担了两种含义（"没给"和"要撑满"），
 > 这正是 7.21（`wrap_width` 不可用）的根源。
 
@@ -379,8 +372,8 @@ LayoutObject(
     align_x: AlignX = AlignX.NONE,
     align_y: AlignY = AlignY.NONE,
     layer: int = 0,
-    wrap_width: bool = False,
-    wrap_height: bool = False,
+    size_x: Optional[SizeX] = None,
+    size_y: Optional[SizeY] = None,
 )
 ```
 
@@ -433,30 +426,39 @@ LayoutObject(
   "align":       {"x","y"},                # 枚举的 .value 字符串
   "flow_clipped": bool,
   "layer": int,
-  "wrap": {"width","height","height_set_by_wrap","width_set_by_wrap"},
-  "geom_cache_valid": bool,
+  "size_mode": {"x": "fill|fixed|content", "y": "..."},
+  "layout_valid": bool,
+  "constraint": {"w", "h"},
+  "content_overflows": bool,
 }
 ```
 
-#### 尺寸推算（wrap_content）
+#### 尺寸计算：两趟遍历（批次 4.2 起）
+
+尺寸**不再有惰性缓存**。全部由 [`layout()`](#34b-两趟遍历批次-42几何核心) 的两趟遍历统一计算，
+`get_effective_*()` / `get_absolute_*()` 退化为纯读取（必要时触发一次 `layout()`）。
 
 | 方法 | 签名 | 返回 | 说明 |
 | --- | --- | --- | --- |
-| `wrap_content` | `(force: bool = False) -> float` | 计算出的高度 | 走 `_calculate_wrap_height()`；`_height > 0` 时直接采用 `_height` 并跳过计算 |
-| `wrap_content_width` | `(force: bool = False) -> float` | 计算出的宽度 | 走 `_calculate_wrap_width()` |
-| `invalidate_wrap_cache` | `() -> None` | — | 清标志并**向上传播到父** |
-| `is_wrapped` | `() -> bool` | `wrap_width or wrap_height` | |
-| `is_height_wrapped` | `() -> bool` | `_wrap_height` | |
-| `is_width_wrapped` | `() -> bool` | `_wrap_width` | |
-| `get_wrap_status` | `() -> Dict[str, Any]` | 缓存状态快照 | |
-| `_calculate_wrap_height` | `() -> float` | 内部，子类各自重写 | 见 3.3 |
-| `_calculate_wrap_width` | `() -> float` | 内部 | 取子元素最大宽度 + 左右 padding，再夹到父可用宽 |
+| `layout` | `(pdf=None, force=False) -> LayoutObject` | self | 从自身开始跑两趟；pdf 供文本/图片的内容测量 |
+| `_measure` | `(constraint_w, constraint_h, path, pdf)` | — | 趟 1：内部方法 |
+| `_place` | `()` | — | 趟 2：内部方法 |
+| `_source_w` | `(pdf=None) -> float` | 内容固有宽度 | 子类按需覆盖 |
+| `_source_h` | `(pdf=None) -> float` | 内容固有高度 | 子类按需覆盖 |
+| `_contribution_w` | `() -> float` | 对父 `CONTENT` 宽度的贡献 | 见 3.4b |
+| `invalidate_geom_cache` | `() -> None` | — | 置失效并**向上传播到父** |
+| `invalidate_wrap_cache` | `() -> None` | — | [兼容] 等价于 `invalidate_geom_cache()` |
+| `is_wrapped` | `() -> bool` | `size_x` 或 `size_y` 为 `CONTENT` | |
+| `is_height_wrapped` | `() -> bool` | `size_y == SizeY.CONTENT` | |
+| `is_width_wrapped` | `() -> bool` | `size_x == SizeX.CONTENT` | |
+| `get_wrap_status` | `() -> Dict[str, Any]` | 尺寸与失效状态快照 | |
 
-**防循环**：`_is_wrapping` 标志。`wrap_content()` 在重入时抛 `RuntimeError`；
-`_calculate_wrap_*()` 在重入时返回当前 `_height`/`_width`（软降级）。
+**已删除**：`wrap_content()`、`wrap_content_width()`、`_calculate_wrap_width()`、
+`_calculate_wrap_height()` 及其重入保护 `_is_wrapping`。
+`wrap_content()` 的语义完全由 `layout()` 取代，两者并存只会造成"该调哪个"的困惑。
 
-**优先级约定**：`_height > 0` ⇒ 显式高度胜出，wrap 不生效。
-这就是 `fill_section_details_data` 用 `desc_obj._height = description_height` 调参能work的原因。
+**循环依赖**：不再靠 `_is_wrapping` 静默降级，而是构建**祖先路径栈**显式检测，
+发现成环就抛 `LayoutCycleError`（含完整路径 `A > B > A`）。
 
 #### 缓存管理
 
@@ -486,7 +488,7 @@ LayoutObject(
 
 ### 3.3 渲染对象：三个子类
 
-三者共同点：都继承 `LayoutObject`，都重写 `_calculate_wrap_height()`，都重写 `render()` 与 `render_debug()`。
+三者共同点：都继承 `LayoutObject`，都按需覆盖 `_source_w()` / `_source_h()`，都重写 `render()` 与 `render_debug()`。
 
 #### `class TextObject(LayoutObject)`
 
@@ -504,7 +506,7 @@ TextObject(
     multi_line: bool = False,
     line_height: Optional[float] = None,   # None → font_size * 0.6
     layer: int = 0,
-    wrap_width: bool = False, wrap_height: bool = False,
+    size_x=None, size_y=None,
 )
 ```
 
@@ -562,7 +564,7 @@ ImageObject(
     parent=None, padding=None,
     align_x=AlignX.NONE, align_y=AlignY.NONE,
     layer: int = 0,
-    wrap_width: bool = False, wrap_height: bool = False,
+    size_x=None, size_y=None,
 )
 ```
 
@@ -608,11 +610,11 @@ RectangleObject(
     parent=None, padding=None,
     align_x=AlignX.NONE, align_y=AlignY.NONE,
     layer: int = 0,
-    wrap_width: bool = False, wrap_height: bool = False,
+    size_x=None, size_y=None,
 )
 ```
 
-只多了一个 `_calculate_wrap_height()` 重写（无内容，仅累加子元素 + padding）。
+没有额外覆盖 —— 它的内容固有尺寸就是基类默认的「子元素累加 + padding」。
 
 `render()` 返回 `(eff_w, eff_h)`，并且 **`is_fill` 参数被完全忽略**：
 
@@ -928,7 +930,8 @@ class LayoutError_CONTENT_FILL(LayoutCycleError)   # 保留但**不再触发**�
 | **`width` / `height` 成为公开尺寸声明** | 赋正值会把尺寸方式同步为 `FIXED`，赋 0 退回 `FILL`。**直接写 `_width` / `_height` 会绕过尺寸方式解析**（见下） |
 | `get_parent_available_area()` 退化为纯查询 | 尺寸计算不再需要它；保留为兼容入口 |
 | `wrap_content()` / `wrap_content_width()` | **已删除**。语义由 `layout()` 完全取代 |
-| `_calculate_wrap_height()` | 已从布局计算中移除；子类保留同名兼容方法，委托给 `_source_h()` |
+| `_calculate_wrap_height()` | **已删除**（连同兼容垫片）；内容固有尺寸改由 `_source_h()` 表达 |
+| `wrap_width` / `wrap_height` | **已删除**（构造参数与兼容属性）；改用 `size_x` / `size_y` |
 
 > ⚠️ **迁移注意**：`obj._height = N` 这种"先构造、后设尺寸"的旧写法会**失效** ——
 > 构造时若 `height=0`，尺寸方式被推成 `FILL`，之后直接写 `_height` 不会改回 `FIXED`，
@@ -1447,13 +1450,16 @@ Resume(
 - **现象**：函数体只有一行 `None`（表达式语句），**隐式返回 `None`**。
 - **后果**：名字暗示返回浮点高度，实际返回 `None`。任何 `h = obj.get_true_height() * 2` 都会 `TypeError`。
 
-### 7.6 `ImageObject._calculate_wrap_height` 内部新建 FPDF 实例
+### 7.6 `ImageObject._calculate_wrap_height` 内部新建 FPDF 实例 — ✅ 批次 4.2 已修
 
-- **位置**：`LayoutEngine.py:1426-1434`
-- **现象**：为读图片宽高比，临时 `from fpdf import FPDF; pdf = FPDF()`。
-- **后果**：每次 wrap 计算都构造一个 PDF 对象；且 `try/except` 吞掉所有异常后
-  回退成 `total_height = self._width`（把宽度当高度用）。
-- **正解**：`ImageObject` 应在 `set_image` 时缓存原始尺寸，或接受外部注入的 `pdf`。
+- **原位置**：`ImageObject._calculate_wrap_height` 内为读图片宽高比，
+  临时 `from fpdf import FPDF; pdf = FPDF()`。
+- **原后果**：每次尺寸计算都构造一个 PDF 对象；且 `try/except` 吞掉所有异常后
+  回退成"高 = 宽"。
+- **修复**：改为 `ImageObject._source_h(pdf=None)` + `_image_aspect_ratio(pdf=None)`：
+  优先用**外部传入的** `pdf`（`layout(pdf=...)` 一路传进 `_measure`），
+  没有时用 Pillow 直接读图片头部，两者都不可用时才退回保守估算。
+  **不再有任何地方内部 new FPDF 实例。**
 
 ### 7.7 两套不一致的文本行数估算
 
@@ -1480,16 +1486,19 @@ Resume(
   与 `TextObject` / `ImageObject` 的 `is_fill` 语义不一致。
   调试渲染时所有矩形都是实心的，会盖住下层内容。
 
-### 7.10 可变默认参数
+### 7.10 可变默认参数 — ⚠️ 引擎侧已修，上层待功能分支
 
-| 位置 | 参数 |
-| --- | --- |
-| `ResumeTemplate.py:74` | `padding: Padding = Padding.all(0)` |
-| `ResumeCore.py:152-155` | `skills: List[str] = []`、`qualifications`、`awards` |
-| `ResumeCore.py:315` | `Lead: dict = {}` |
+| 位置 | 参数 | 状态 |
+| --- | --- | --- |
+| `LayoutEngine.py`（`Style.__init__`） | `padding: Padding = Padding.all(0)` | ✅ **批次 4.4 已修**：改为 `padding=None` → 构造时 `Padding.all(0)`，每次新建 |
+| `ResumeCore.py:152-155` | `skills: List[str] = []`、`qualifications`、`awards` | 待功能分支 |
+| `ResumeCore.py:315` | `Lead: dict = {}` | 待功能分支 |
 
-- **后果**：默认对象在多次实例化间共享。当前无代码原地修改它们，所以**尚未爆雷**，
+- **后果**：默认对象在多次实例化间共享。此前无代码原地修改它们，所以尚未爆雷，
   但任何 `style.padding.left = 5` 或 `self.Lead["x"] = ...` 都会污染其他实例。
+- **引擎侧的修法**：`padding` 默认值改为 `None`，在 `__init__` 里 `Padding.all(0) if padding is None else padding`。
+  对外行为不变（默认仍是全 0），但每个实例拿到独立的 `Padding`。
+  测试入口有断言固化（8.6：两个 `Style` 的 padding 必须是不同对象）。
 
 ### 7.11 渲染返回值契约不统一 — ⚠️ 部分已修
 
@@ -1919,11 +1928,25 @@ Resume(
 | **1** | 抽 `create_spacer`（8.2） | 低 | 输出 PDF 应与重构前**逐字节一致** | ✅ **已完成** |
 | **2** | 抽 `create_band`，`create_columns` / `split_column_advanced` 变包装；修 7.3、7.4（8.1） | 中 | 同上，逐字节比对 | ✅ **已完成** |
 | **3** | 抽 `create_text_block` / `from_style` / `Style` 下沉（8.3、8.4） | 中 | 同上 | ✅ **已完成** |
-| **4** | **矩形包围内容前置**：几何属性改 property（8.5）+ 统一几何计算入口 + 修 7.19 父子高度自指 + 修 7.20 `_height` 卡死 + 明确 `wrap_content` 方向性 | 高 | 需新老 PDF 对比 + 缓存失效单测 | 待办 |
-| **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | 待办（批次 4 内交付） |
-| **4b** | 修 7.21 `wrap_width` 完全不可用（阻断点 C） | 中 | 收窄包围盒断言 | 待办 |
+| **4** | **几何核心重构**：4.1 四轴枚举 · 4.2 两趟遍历（修 7.19 / 7.20）· 4.3 几何属性 property（8.5）· 4b 内容固有宽度（修 7.21）· 4.4 删 `wrap_*` 兼容面 | 高 | 逐字节比对 + 两趟遍历断言 | ✅ **已完成** |
+| **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | ✅ 已由 4b 的断言兑现 |
 | **5** | 真实行数测量（8.7），去掉 `description_height` | 高 | 视觉验收 | 待办 |
 | **6** | **分页** —— 按页切分布局树 | 高 | 多页产物断言 | **暂缓**（多页需求出现时先在 `master` 完成） |
+
+**批次 4 实际执行的五步**（与原计划的差异）：
+
+| 步 | 内容 | 与原计划 |
+| --- | --- | --- |
+| 4.1 | 四轴枚举 | 原为"新增 `SizeX`/`SizeY`" |
+| 4.2 | 两趟遍历（修 7.19 / 7.20） | 原为"几何属性改 property" —— 顺序调整，因为遍历是尺寸体系的地基 |
+| 4.3 | 几何属性 property 化（8.5） | 原为 4.4 |
+| 4b | 内容固有宽度（修 7.21） | 原为 4b，**提前**到 4.4 之前，因为它才是"矩形包围内容"的实现 |
+| 4.4 | 删 `wrap_*` 兼容面 | 新增的一步 |
+
+> **顺序调整的理由**：原计划先做 property 化，但"何时知道要重算"（property）与
+> "重算能不能算对"（两趟遍历）必须同时成立才有意义 ——
+> 只做前者会得到"失效通知发出去了、结果还是旧的"这种更难排查的状态。
+> 因此把遍历重写提前，property 化随后。
 
 > **批次 6 为何暂缓**：现阶段要排版的是简历，只需一页 A4，不涉及分页。
 > 将来排毕业论文一类多页文档时再做。推迟的代价接近于零 —— 引擎已把「对象尺寸」与

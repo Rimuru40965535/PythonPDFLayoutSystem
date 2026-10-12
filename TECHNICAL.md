@@ -10,7 +10,8 @@
 > **批次 4 全部完成**：4.1 四轴枚举 · 4.2 两趟遍历（修 7.19 / 7.20）·
 > 4.3 几何属性 property 化（8.5）· 4b 内容固有宽度（修 7.21）·
 > 4.4 删 `wrap_*` 兼容面（修 7.6 / 7.10 的引擎侧）。
-> 批次 5（真实行数测量）、批次 6（分页）待办。
+> **批次 5 已完成**：真实文本测量（修 7.7）· 分段样式（`TextRun` + `measure_text`）·
+> Markdown 内联语法 · P1 时序。批次 6（分页）暂缓。
 >
 > ⚠️ **中层与顶层文件不在 `master` 上**（`ResumeTemplate.py` / `ResumeCore.py` 属功能分支）。
 > 因此有一部分改动**无法在 `master` 完成**，集中记录在 `SKILLS.md` 的
@@ -938,6 +939,81 @@ class LayoutError_CONTENT_FILL(LayoutCycleError)   # 保留但**不再触发**�
 > `FILL` 会覆盖它。请改用 `obj.height = N`（公开属性会同步尺寸方式）。
 > 批次 4.2 已把 `ResumeTemplate.py` 里 4 处这类写法改为公开属性。
 
+### 3.4c 文本片段与真实测量（批次 5）
+
+#### `class TextRun`
+
+一段连续文字 + 它自己的样式。这是"一段文字内部可以有多种样式"的最小单位。
+
+```python
+TextRun(text="", font_name="helvetica", font_size=12,
+        bold=False, italic=False, color=Black)
+```
+
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `get_font_style()` | `str` | `"B"` / `"I"` / `"BI"` / `""` |
+| `font_key()` | `tuple` | `(font_name, font_style, font_size)` —— 测量缓存的键（颜色不影响字宽，不入键） |
+| `with_text(text)` | `TextRun` | 只替换文字的副本 |
+| `derive(**overrides)` | `TextRun` | 按 overrides 覆盖的副本 |
+| `from_style(text, style, **overrides)` | `TextRun` | 从 `Style` 派生（字段映射同 `TextObject.from_style`） |
+
+**不可变**：所有"修改"都返回新对象。因此 `runs` 列表可以安全共享。
+
+#### `parse_inline_markdown(text, base=None, mono_font=None) -> List[TextRun]`
+
+把带内联标记的文本解析成片段。支持：
+
+| 语法 | 效果 |
+| --- | --- |
+| `**粗体**` | `bold=True` |
+| `*斜体*` | `italic=True` |
+| `` `等宽` `` | 换用 `mono_font`（未指定则保持原字体） |
+| `<b>…</b>` `<i>…</i>` | HTML 风格粗体 / 斜体（读 `.md` 时常见） |
+| `<c:RRGGBB>…</c>` | 指定颜色 |
+| `\*` `\`` `\<` | 转义，输出字面量 |
+
+**不支持的标记原样保留为文本**（不静默丢弃，写错时看得见）；**未闭合的标记也原样保留**。
+嵌套标记暂不支持（内层会被当普通文字）。
+
+#### `measure_text(pdf, runs, available_width, line_height_ratio=1.2) -> TextMetrics`
+
+用真实 pdf 测量：**摊平成可断行单元 → 贪心装行**。
+
+| 切分规则 | 说明 |
+| --- | --- |
+| CJK **逐字** | 中文没有空格，逐字断行是标准做法 |
+| 非 CJK **按空白切词** | 拉丁文按词断行，不在词中间断开 |
+| 空白单独成段 | 便于行尾丢弃 |
+| `\n` | 变成硬换行单元 |
+
+宽度在**各自的字体**下用 `pdf.get_string_width()` 测量 —— 这正是分段样式的关键。
+
+`available_width` **为 0 或负数表示不换行**（量整段自然宽度）。
+
+返回的 `TextMetrics`：
+
+```python
+lines: List[List[(run_index, text, x_offset, width)]]
+line_heights: List[float]        # 每行 = 该行内最大字号 × line_height_ratio
+line_count / total_height / max_line_width
+line_top(index)                  # 第 index 行的顶边偏移
+iter_pieces()                    # 按行产出片段
+```
+
+**关键设计**：渲染时**复用同一份 `lines`**，因此"测量出的行数"与"画出来的行数"
+必然一致 —— **一致性由构造保证**，不依赖 fpdf 内部断行行为（缺陷 7.7 的根治）。
+
+> 实测：可用宽 120 / 60 / 30 对同一段中文分别断出 2 / 3 / 5 行，逐行填满到接近可用宽。
+
+#### `font_context(pdf, font_name, font_style, font_size)`
+
+上下文管理器：临时切换字体、退出时恢复原状。测量与渲染共用，只有一处实现。
+
+**变体缺失时优雅降级**：调用方未必把 `"B"`/`"I"`/`"BI"` 每个变体都 `add_font` 注册过，
+fpdf 在字体未注册时会抛 `FPDFException`，若直接冒泡会让整份文档渲染失败。
+因此退回"同字体、无样式"，并**明确打印提示**（不静默 —— 静默降级是本项目的既有教训）。
+
 ### 3.5 图层与注册表
 
 #### `class LayerManager`
@@ -1461,15 +1537,17 @@ Resume(
   没有时用 Pillow 直接读图片头部，两者都不可用时才退回保守估算。
   **不再有任何地方内部 new FPDF 实例。**
 
-### 7.7 两套不一致的文本行数估算
+### 7.7 两套不一致的文本行数估算 — ✅ 批次 5 已修
 
-- **位置**：`LayoutEngine.py:1105-1107`（`calculate_text_size`：`int(text_width / effective_width) + 1`）
-  与 `LayoutEngine.py:1150-1152`（`_calculate_wrap_height`：`len(self._text) // 20 + 1`）
-- **现象**：同一段文本，两个方法给出的行数不同。
-- **后果**：`wrap_height` 算出的高度与渲染时的实际换行数不匹配，
-  多行文本会出现裁切或溢出。
+- **原位置**：`calculate_text_size` 用 `int(text_width / effective_width) + 1`；
+  `_calculate_wrap_height` 用 `len(self._text) // 20 + 1`。
+- **现象**：同一段文本，两个方法给出的行数不同，且**两套都不准**。
+- **后果**：算出的高度与渲染时的实际换行数不匹配，多行文本会被裁切或溢出。
+- **修复（批次 5）**：两者都改为调用同一个 `measure_text(pdf, runs, available_width)`。
+  **渲染时复用同一份 `lines`**，因此测量行数与绘制行数的一致性**由构造保证**，
+  不再依赖估算公式。测试入口 12.1 / 12.2 固化（行数随可用宽单调、总高 = 行数 × 行高）。
 
-### 7.8 `description.height` 硬编码 50（调用方必须记得改）
+### 7.8 `description.height` 硬编码 50（调用方必须记得改） — ✅ 引擎侧已消除（批次 3 起）
 
 - **位置**：`ResumeTemplate.py:1071`、`ResumeTemplate.py:1161`
 - **现象**：`height=50` 写死在构造里，靠 `fill_*` 改写 `_height` 才正确。
@@ -1930,7 +2008,7 @@ Resume(
 | **3** | 抽 `create_text_block` / `from_style` / `Style` 下沉（8.3、8.4） | 中 | 同上 | ✅ **已完成** |
 | **4** | **几何核心重构**：4.1 四轴枚举 · 4.2 两趟遍历（修 7.19 / 7.20）· 4.3 几何属性 property（8.5）· 4b 内容固有宽度（修 7.21）· 4.4 删 `wrap_*` 兼容面 | 高 | 逐字节比对 + 两趟遍历断言 | ✅ **已完成** |
 | **4a** | 包围**固定高度**内容（矩形 / 图片 / 显式高度文本块） | 中 | 包围盒尺寸断言 | ✅ 已由 4b 的断言兑现 |
-| **5** | 真实行数测量（8.7），去掉 `description_height` | 高 | 视觉验收 | 待办 |
+| **5** | **真实文本测量 + 分段样式**：`measure_text`（修 7.7）· `TextRun` · Markdown 内联语法 · P1 时序 | 中 | 测量行数=绘制行数、同字号分段断行一致 | ✅ **已完成** |
 | **6** | **分页** —— 按页切分布局树 | 高 | 多页产物断言 | **暂缓**（多页需求出现时先在 `master` 完成） |
 
 **批次 4 实际执行的五步**（与原计划的差异）：
@@ -1947,6 +2025,71 @@ Resume(
 > "重算能不能算对"（两趟遍历）必须同时成立才有意义 ——
 > 只做前者会得到"失效通知发出去了、结果还是旧的"这种更难排查的状态。
 > 因此把遍历重写提前，property 化随后。
+
+### 8.10b 签出功能分支前的收尾核查（已完成）
+
+按 `SKILLS.md` 的「底层功能完整」三条判定标准逐项核查。核查是**只读**的，
+用引擎公开接口搭一个完整文档，不外改任何私有字段。
+
+#### 判定标准 1：引擎能独立完成一次多元素排版
+
+用纯公开接口搭出：容器 → `create_band` 按比例分栏 → 按 `Style` 建文本块 →
+`runs` 分段样式 → `SizeX/Y.CONTENT` 矩形包围内容 → `create_spacer` 流式堆叠。
+
+布局结果（自洽性核对）：
+
+```
+C_Root    210.00 x 297.00   abs=( 0.00,  0.00)
+C_Body    190.00 x  82.40   abs=(10.00, 10.00)   ← CONTENT
+C_Band    180.00 x  40.00   abs=(15.00, 15.00)
+C_Box      22.93 x  20.40   abs=(15.00, 55.00)   ← 紧接带下方
+C_BoxT     16.93 x  14.40   abs=(18.00, 58.00)
+```
+
+`C_Body` 的内容高 = 40（带）+ 20.4（包围盒）+ 6（留白）+ 10（padding）= **82.40** ✅
+
+**全程未手工改写 `_height` / `_x` / `_width`。**
+
+#### 判定标准 2：缓存失效不需要调用方操心
+
+| 操作 | 结果 |
+| --- | --- |
+| 改子元素 `height` | ✅ 父的包围高从 10 变 40 |
+| `add_child` | ✅ 变为 65 |
+| 改 `padding` | ✅ 变为 75 |
+| 改 `size_y` + `height` | ✅ 变为 77（`FIXED`） |
+| `remove_child` 后父重算 | ✅ 回到 300 |
+
+#### 判定标准 3：引擎自检覆盖上述能力，不依赖 `ResumeCore.py`
+
+- 测试入口的 import 只有 `fpdf` / `inspect` / `io` —— **对中层/顶层零依赖**；
+- **192 条 assert**，覆盖四轴尺寸、两趟遍历、包围内容、分栏/横向带、留白、
+  文本块、缓存失效、循环报错、文本测量、分段样式、Markdown、P1 时序。
+
+#### 核查中发现并修复的一个引擎缺口
+
+**`create_band` 缺少 `align_y` 参数**，导致它建的带容器**无法参与纵向流式排列**
+（只能绝对定位在 `avail_y`）。这不是"用法问题"而是真缺口：
+几乎总要显式把它改成 `FLOW`，否则与后续兄弟重叠。
+
+已修复：`create_band` / `create_columns` / `create_columns_balanced` 都新增
+`align_y: AlignY = AlignY.NONE`（默认值保持既有行为，故既有产物逐字节不变）。
+
+> `split_column_advanced` **不**加此参数：它是**包装层**，默认把左右对象设为
+> `align_x/y = NONE` 并返回 `parent` 供链式调用。直接改它的 `align_y` 会破坏
+> "左右栏各占自己那一栏"的语义。若要让分栏容器参与流式排列，
+> 直接用 `create_band` 并传 `align_y=AlignY.FLOW`。
+
+#### 核查结论
+
+| 判定标准 | 结论 |
+| --- | --- |
+| 1 引擎独立完成多元素排版 | ✅ 通过（核查中发现并修复 `create_band` 的 `align_y` 缺口） |
+| 2 缓存失效自动触发 | ✅ 通过 |
+| 3 引擎自检独立且覆盖完整 | ✅ 通过（192 条 assert，零中层依赖） |
+
+**底层已具备签出功能分支的条件。** 剩余待办全部记在 `SKILLS.md` 的
+「只在功能分支处理的事项」一节。
 
 > **批次 6 为何暂缓**：现阶段要排版的是简历，只需一页 A4，不涉及分页。
 > 将来排毕业论文一类多页文档时再做。推迟的代价接近于零 —— 引擎已把「对象尺寸」与

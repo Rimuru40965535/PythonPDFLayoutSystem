@@ -39,8 +39,12 @@ PDF 排版引擎
 from enum import Enum
 from typing import Optional, Union, List, Tuple, Dict, Any, Callable
 from collections import defaultdict
+from dataclasses import dataclass, field, replace as dataclasses_replace
+import contextlib
+import dataclasses
 import inspect
 import os
+import re
 import time
 from functools import wraps
 
@@ -325,6 +329,381 @@ class Style:
 
 
 # ============================================================================
+# 3.6 文本片段与内联语法 (TextRun / Markdown)
+# ============================================================================
+
+# 内联标记正则。按顺序尝试，先匹配转义，再匹配成对标记，最后是裸文本。
+_MD_TOKEN_RE = re.compile(
+    r"""
+    (?P<escape>\\[*`<])                       # \*  \`  \<   -> 字面量
+  | <b>(?P<b>.*?)</b>                         # HTML 风格粗体
+  | <i>(?P<i>.*?)</i>                         # HTML 风格斜体
+  | <c:(?P<col>[0-9A-Fa-f]{6})>(?P<c>.*?)</c> # <c:RRGGBB>…</c> 指定颜色
+  | \*\*(?P<bold>.+?)\*\*                     # **粗体**
+  | \*(?P<ital>.+?)\*                         # *斜体*
+  | `(?P<code>[^`]+?)`                        # `等宽`
+  | (?P<text>[^\\*`<]+|.)                     # 裸文本（含单个特殊字符兜底）
+    """,
+    re.S | re.X,
+)
+
+
+@dataclass
+class TextRun:
+    """
+    文本片段：一段连续文字 + 它自己的样式
+
+    这是"一段文字内部可以有多种样式"的最小单位。
+    `TextObject` 持有一个 `TextRun` 列表，绘制时逐段切换字体与颜色。
+
+    与 `Style` 的关系：`TextRun` 是 `Style` 在**文字绘制**上的投影 ——
+    只取 font_name / font_size / bold / italic / color 五个字段。
+    通过 `from_style()` 从 `Style` 派生。
+    """
+    text: str = ""
+    font_name: str = "helvetica"
+    font_size: float = 12
+    bold: bool = False
+    italic: bool = False
+    color: Color = Black
+
+    def get_font_style(self) -> str:
+        """FPDF 兼容的字体样式串："B" / "I" / "BI" / "" """
+        s = ""
+        if self.bold:
+            s += "B"
+        if self.italic:
+            s += "I"
+        return s
+
+    def font_key(self) -> tuple:
+        """
+        字体标识（不含颜色）
+
+        测量缓存以它为键 —— 颜色不影响字的宽度，所以不进键。
+        """
+        return (self.font_name, self.get_font_style(), self.font_size)
+
+    def with_text(self, text: str) -> 'TextRun':
+        """返回一个只替换了 text 的副本（原对象不变）"""
+        return dataclasses.replace(self, text=text)
+
+    def derive(self, **overrides) -> 'TextRun':
+        """返回按 overrides 覆盖后的副本（原对象不变）"""
+        return dataclasses.replace(self, **overrides)
+
+    @classmethod
+    def from_style(cls, text: str, style: Optional['Style'] = None,
+                   **overrides) -> 'TextRun':
+        """
+        从 Style 派生一个文本片段
+
+        字段映射与 `TextObject.from_style` 一致（Style.color → 文字的 color）。
+        """
+        st = style if style is not None else Style()
+        params = {
+            "text": text,
+            "font_name": st.font_name,
+            "font_size": st.font_size,
+            "bold": st.bold,
+            "italic": st.italic,
+            "color": st.color,
+        }
+        params.update(overrides)
+        return cls(**params)
+
+    def __repr__(self) -> str:
+        flags = ""
+        if self.bold:
+            flags += "B"
+        if self.italic:
+            flags += "I"
+        return (f"TextRun({self.text!r}, {self.font_name}/{self.font_size}"
+                f"{'/' + flags if flags else ''})")
+
+
+def parse_inline_markdown(text: str, base: Optional[TextRun] = None,
+                          mono_font: Optional[str] = None) -> List[TextRun]:
+    """
+    把带内联标记的文本解析成 TextRun 列表
+
+    支持的标记：
+        **粗体**            -> bold=True
+        *斜体*              -> italic=True
+        `等宽`              -> 换用 mono_font（未指定则保持原标题字体）
+        <b>…</b> <i>…</i>   -> HTML 风格的粗体 / 斜体（读 .md 时常见）
+        <c:RRGGBB>…</c>     -> 指定颜色的文字
+        \\*  \\`  \\<        -> 转义，输出字面量
+
+    **不支持的标记原样保留为文本** —— 不做静默丢弃，写错时看得见。
+    嵌套标记暂不支持（内层会被当成普通文字）。
+
+    Args:
+        text: 待解析文本
+        base: 基础样式（各片段的默认值）。None 表示 TextRun() 全默认
+        mono_font: 行内代码使用的字体名。None 表示不换字体
+
+    Returns:
+        List[TextRun]: 解析出的片段。文本为空时返回空列表。
+    """
+    if not text:
+        return []
+    base = base if base is not None else TextRun()
+
+    runs: List[TextRun] = []
+    pending = ""                # 累积裸文本，最后并成一个 run，避免碎片化
+
+    def flush():
+        nonlocal pending
+        if pending:
+            runs.append(base.with_text(pending))
+            pending = ""
+
+    for m in _MD_TOKEN_RE.finditer(text):
+        kind = m.lastgroup
+        if kind == "escape":
+            pending += text[m.start() + 1]      # 去掉反斜杠
+            continue
+        if kind == "text":
+            pending += m.group(0)
+            continue
+        # 命中了某个标记：先把累积的裸文本落盘，再追加标记片段
+        flush()
+        if kind == "b":
+            runs.append(base.with_text(m.group("b")).derive(bold=True))
+        elif kind == "i":
+            runs.append(base.with_text(m.group("i")).derive(italic=True))
+        elif kind == "c":
+            hexs = m.group("col")
+            runs.append(base.with_text(m.group("c")).derive(
+                color=Color(int(hexs[0:2], 16), int(hexs[2:4], 16), int(hexs[4:6], 16))))
+        elif kind == "bold":
+            runs.append(base.with_text(m.group("bold")).derive(bold=True))
+        elif kind == "ital":
+            runs.append(base.with_text(m.group("ital")).derive(italic=True))
+        elif kind == "code":
+            runs.append(base.with_text(m.group("code")).derive(
+                **({"font_name": mono_font} if mono_font else {})))
+        else:
+            pending += m.group(0)               # 兜底：当普通文字
+    flush()
+    return runs
+
+
+@contextlib.contextmanager
+def font_context(pdf, font_name: str, font_style: str, font_size: float):
+    """
+    临时切换 pdf 字体并在退出时恢复原状的上下文管理器
+
+    测量与渲染都要"换成这一段文字的字体、量完/画完再换回来"。
+    此前这段存取逻辑散落在各处（缺陷 7.7 的伴生问题），批次 5 起集中在此。
+
+    **变体缺失时优雅降级**：分段样式可以请求任意 `font_style`（"B"/"I"/"BI"），
+    但调用方未必把每个变体都 `add_font` 注册过。
+    fpdf 在字体未注册时抛 `FPDFException`，若直接冒泡会让整份文档渲染失败 ——
+    因此这里退回"同字体、无样式"，并**明确告知**降级了哪一段
+    （静默降级正是本项目的既有教训：缺字体时中文变空白而无提示）。
+    """
+    old_family = pdf.font_family
+    old_style = pdf.font_style
+    old_size = pdf.font_size_pt
+    try:
+        try:
+            pdf.set_font(font_name, font_style, font_size)
+        except Exception:
+            if font_style:
+                print(f"  >>>⚠ 字体变体未注册: {font_name}/{font_style}，"
+                      f"退回 {font_name}/''（请确认调用方已 add_font 该变体）")
+                pdf.set_font(font_name, "", font_size)
+            else:
+                raise
+        yield pdf
+    finally:
+        try:
+            pdf.set_font(old_family, old_style, old_size)
+        except Exception:
+            pass
+
+
+@dataclass
+class TextMetrics:
+    """
+    文本测量结果
+
+    lines: 每一行是若干片段 `(run 下标, 该行内的文字, 行内 x 偏移, 宽度)`
+    line_heights: 每一行的行高（= 该行内最大字号 × 行高系数）
+    """
+    lines: List[List[Tuple[int, str, float, float]]] = field(default_factory=list)
+    line_heights: List[float] = field(default_factory=list)
+    line_count: int = 0
+    total_height: float = 0.0
+    max_line_width: float = 0.0
+    line_height_ratio: float = 1.2
+
+    def iter_pieces(self):
+        """按行产出 (行号, run 下标, 文字, x 偏移, 宽度, 该行行高)"""
+        for li, line in enumerate(self.lines):
+            lh = self.line_heights[li] if li < len(self.line_heights) else 0.0
+            for (ri, txt, x, w) in line:
+                yield li, ri, txt, x, w, lh
+
+    def line_top(self, index: int) -> float:
+        """第 index 行的顶边偏移（相对文本块内容区顶部）"""
+        return sum(self.line_heights[:index])
+
+    def __repr__(self) -> str:
+        return (f"TextMetrics(lines={self.line_count}, "
+                f"height={self.total_height:.2f}, max_w={self.max_line_width:.2f})")
+
+
+def measure_text(pdf, runs: List[TextRun], available_width: float,
+                 line_height_ratio: float = 1.2) -> TextMetrics:
+    """
+    用真实 pdf 测量文本：逐段量宽、按可用宽断行
+
+    **断行复用 fpdf2 自己的逻辑**（`pdf.multi_cell(dry_run=True, output="LINES")`），
+    而不是自写一套 —— 这样"测量出的行数"与"渲染时的行数"必然一致（缺陷 7.7 的根治）。
+
+    ⚠️ 两个必须显式指定的参数：
+        - `align="L"`：multi_cell 的 align **默认是 'J'（两端对齐）**，
+          两端对齐会改变断行结果，必须与渲染时保持一致；
+        - `wrapmode`：默认 `"WORD"`（按词断行，超长单词退化）。
+          CJK 文本在 WORD 模式下也能正确断行（实测）。
+
+    对多个 run 的处理：**逐 run 断行，然后按行拼接**。
+    因此同一行的片段必然来自各自的 run，天然支持分段样式。
+    同一行内不同字号时**基线对齐**（各片段底部对齐），
+    行高取该行内最大字号 × `line_height_ratio`。
+
+    Args:
+        pdf: FPDF 实例
+        runs: 文本片段列表
+        available_width: 断行宽度。**0 或负数表示不换行**（量整段自然宽度）
+        line_height_ratio: 行高系数
+
+    Returns:
+        TextMetrics
+    """
+    metrics = TextMetrics(line_height_ratio=line_height_ratio)
+
+    if not runs:
+        return metrics
+
+    # ---- 1. 把 runs 摊平成"可断行单元"序列 ----
+    # 每个单元带自己的 run 下标与字体，因此分段样式天然可用。
+    units = _flatten_runs_to_units(pdf, runs)
+    if not units:
+        return metrics
+
+    # ---- 2. 贪心装行 ----
+    # 规则：
+    #   - 硬换行单元强制换行；
+    #   - 空白单元只在"后面还有内容"时才保留（行尾空白丢弃）；
+    #   - 非空白单元放不下就换行；若它本身比整行还宽（超长单词/单字），
+    #     独占一行并允许溢出，避免死循环。
+    lines: List[List[Tuple[int, str, float, float]]] = []
+    heights: List[float] = []
+    cur: List[Tuple[int, str, float, float]] = []
+    cur_w = 0.0
+    cur_max_size = 0.0
+
+    def flush_line():
+        nonlocal cur, cur_w, cur_max_size
+        # 去掉行尾空白
+        while cur and cur[-1][1].strip() == "":
+            cur_w -= cur[-1][3]
+            cur.pop()
+        # 合并相邻的"同 run 且 x 连续"的片段。
+        # 摊平阶段把 CJK 逐字切开（断行需要），但渲染时逐字 cell 太低效；
+        # 合并后 line_height/offsets 全部不变（宽度是加和的），只是片段更少。
+        merged: List[Tuple[int, str, float, float]] = []
+        for (ri, txt, x, w) in cur:
+            if (merged and merged[-1][0] == ri
+                    and abs(merged[-1][2] + merged[-1][3] - x) < 1e-9):
+                pri, ptxt, px, pw = merged[-1]
+                merged[-1] = (pri, ptxt + txt, px, pw + w)
+            else:
+                merged.append((ri, txt, x, w))
+        lines.append(merged)
+        heights.append((cur_max_size or (runs[0].font_size if runs else 12))
+                       * line_height_ratio)
+        metrics.max_line_width = max(metrics.max_line_width, cur_w)
+        cur = []
+        cur_w = 0.0
+        cur_max_size = 0.0
+
+    for u in units:
+        if u.is_break:
+            flush_line()
+            continue
+        w = u.width
+        if (available_width and available_width > 0
+                and cur and cur_w + w > available_width + 1e-9):
+            flush_line()
+        cur.append((u.run_index, u.text, cur_w, w))
+        cur_w += w
+        cur_max_size = max(cur_max_size, u.font_size)
+    if cur:
+        flush_line()
+
+    metrics.lines = lines
+    metrics.line_heights = heights
+    metrics.line_count = len(lines)
+    metrics.total_height = sum(heights)
+    return metrics
+
+
+@dataclass
+class _TextUnit:
+    """摊平后的可断行单元（measure_text 内部使用）"""
+    run_index: int
+    text: str
+    font_size: float
+    width: float
+    is_break: bool = False        # True 表示硬换行标记
+
+
+# 摊平用的切分正则：
+#   空白段 | 连续非 CJK 非空白（一个"词"） | 单个 CJK 字符 | 其它单字符
+_UNIT_RE = re.compile(
+    r"(\s+|"
+    r"[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]"
+    r"|"
+    r"[^\s\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]+"
+    r"|"
+    r".)",
+    re.S,
+)
+
+
+def _flatten_runs_to_units(pdf, runs: List[TextRun]) -> List['_TextUnit']:
+    """
+    把 runs 摊平成可断行单元序列
+
+    切分规则（直接决定断行质量）：
+        - CJK 逐字（中文没有空格，逐字断行是标准做法）
+        - 非 CJK 按空白切词（拉丁文按词断行）
+        - 空白单独成段，便于行尾丢弃
+        - `\\n` 变成硬换行单元
+
+    宽度在**各自的字体**下测量 —— 这正是分段样式的关键。
+    """
+    units: List[_TextUnit] = []
+    for ri, r in enumerate(runs):
+        if not r.text:
+            continue
+        with font_context(pdf, r.font_name, r.get_font_style(), r.font_size):
+            for hard_idx, hard in enumerate(r.text.split("\n")):
+                if hard_idx > 0:
+                    units.append(_TextUnit(ri, "", r.font_size, 0.0, is_break=True))
+                for m in _UNIT_RE.finditer(hard):
+                    piece = m.group(0)
+                    units.append(_TextUnit(
+                        ri, piece, r.font_size, pdf.get_string_width(piece)))
+    return units
+
+
+# ============================================================================
 # 4. 图层管理器 (LayerManager)
 # ============================================================================
 
@@ -570,6 +949,8 @@ class LayoutObject:
         self._in_content_parent_x = False
         self._in_content_parent_y = False
         self._pdf = None                  # 测量期传入的 pdf，供内容尺寸估算使用
+        # 批次 5（P1）：当前布局是否用真实 pdf 测过。render(pdf) 会据此补测重排一次。
+        self._measured_with_pdf = False
         
         # 自动注册到全局注册表
         if name:
@@ -870,6 +1251,7 @@ class LayoutObject:
         # 先标记有效：定位阶段（_place）会查询父元素的内容区，
         # 那些查询属于纯读取，不应再触发一次布局。
         self._layout_valid = True
+        self._measured_with_pdf = pdf is not None
         self._place()
         return self
     
@@ -1179,11 +1561,20 @@ class LayoutObject:
     # 然后返回结果。它们不再"边算边问父容器"，因此不存在自指。
     # ------------------------------------------------------------------------
     
-    def _ensure_layout(self):
-        """若布局未算好，从根节点跑一次两趟遍历"""
-        if self._layout_valid:
+    def _ensure_layout(self, pdf=None):
+        """
+        若布局未算好，从根节点跑一次两趟遍历
+
+        批次 5（P1 时序）：如果传入了 `pdf`，而当前布局是**没有 pdf 时**算出来的，
+        则用真实 pdf 强制重排一次 —— 文本的真实字宽只有 pdf 能给。
+        这让 `render(pdf)` 成为"最后一次精确测量"的时机，而调用方接口不变。
+        """
+        root = self._layout_root()
+        if pdf is not None and not root._measured_with_pdf:
+            root.layout(pdf=pdf, force=True)
             return
-        self._layout_root().layout()
+        if not self._layout_valid:
+            root.layout()
     
     def _layout_root(self) -> 'LayoutObject':
         """向上找到根节点（没有父元素的那个）"""
@@ -1295,8 +1686,17 @@ class LayoutObject:
     
     @timer
     def render(self, pdf, is_fill: bool = False):
-        """渲染当前对象及其所有子对象到 PDF"""
+        """
+        渲染当前对象及其所有子对象到 PDF
+
+        批次 5（P1 时序）：进入渲染前会用真实 `pdf` **补测并重排一次**
+        （若此前的布局是在没有 pdf 的情况下算出来的）。
+        这样调用方只需照旧写 `root.render(pdf)`，文本的真实字宽就能生效。
+        """
         print(f"  >>> 正在渲染PDF文件。现在渲染LayoutObject节点：{self.name}")
+        
+        # 最后一次精确测量的时机：拿到 pdf 后按需重排
+        self._ensure_layout(pdf=pdf)
         
         last_y = self.get_absolute_y()
         
@@ -1439,7 +1839,16 @@ class LayoutObject:
 # ============================================================================
 
 class TextObject(LayoutObject):
-    """文本渲染对象"""
+    """
+    文本渲染对象
+
+    批次 5 起支持**分段样式**：内部持有 `TextRun` 列表，
+    一段文字里可以有多种字体/字号/粗斜体/颜色。
+
+    `text=` 参数默认会做**内联 Markdown 解析**（见 parse_inline_markdown），
+    因此 `text="这段是**重点**"` 也能得到分段样式；`markdown=False` 可关闭。
+    `runs=` 与 `text=` 同时给出时 **`runs` 优先**（并打印提示）。
+    """
     
     def __init__(
         self,
@@ -1463,6 +1872,10 @@ class TextObject(LayoutObject):
         layer: int = 0,
         size_x: Optional[SizeX] = None,
         size_y: Optional[SizeY] = None,
+        runs: Optional[List[TextRun]] = None,
+        markdown: bool = True,
+        line_height_ratio: float = 1.2,
+        mono_font: Optional[str] = None,
     ):
         super().__init__(
             name=name, x=x, y=y, width=width, height=height,
@@ -1471,17 +1884,38 @@ class TextObject(LayoutObject):
             size_x=size_x, size_y=size_y,
         )
         
-        self._text = text
         self.font_name = font_name
         self.font_size = font_size
         self.font_style = font_style
         self.text_color = text_color
         self.multi_line = multi_line
         self._line_height = line_height
+        self.markdown = markdown
+        self.line_height_ratio = line_height_ratio
+        self.mono_font = mono_font
+        
+        # ---- 分段样式：runs 是唯一真相 ----
+        if runs is not None:
+            if text:
+                print(f"  >>>⚠ {name}: 同时给出了 runs 与 text，以 runs 为准")
+            self._runs = list(runs)
+        else:
+            base = self._base_run()
+            self._runs = (parse_inline_markdown(text, base, mono_font=mono_font)
+                          if (markdown and text) else
+                          ([base.with_text(text)] if text else []))
         
         self._cached_width = 0.0
         self._cached_height = 0.0
         self._cache_valid = False
+    
+    def _base_run(self) -> TextRun:
+        """按构造参数生成基础片段（供 text= 解析与 set_text 使用）"""
+        return TextRun(
+            text="", font_name=self.font_name, font_size=self.font_size,
+            bold="B" in self.font_style, italic="I" in self.font_style,
+            color=self.text_color,
+        )
     
     @classmethod
     def from_style(
@@ -1537,90 +1971,132 @@ class TextObject(LayoutObject):
         params.update(overrides)
         return cls(name=name, **params)
     
+    def _invalidate_text(self) -> None:
+        """文本变更后的统一失效（测量缓存 + 布局）"""
+        self._cache_valid = False
+        self.invalidate_geom_cache()
+    
     def set_text(self, text: str) -> 'TextObject':
         """
-        设置文本内容（修改后使几何缓存和 wrap 缓存失效）
+        设置文本内容 —— **重建为单段** runs
+
+        会走与构造相同的内联 Markdown 解析（`markdown` 为 True 时）。
+        分段样式请改用 `set_runs()`。
         """
-        self._text = text
-        self._cache_valid = False
-        self.invalidate_wrap_cache()
-        # 【新增】几何缓存失效
-        self.invalidate_geom_cache()
+        base = self._base_run()
+        self._runs = (parse_inline_markdown(text, base, mono_font=self.mono_font)
+                      if (self.markdown and text) else
+                      ([base.with_text(text)] if text else []))
+        self._invalidate_text()
         return self
     
     def get_text(self) -> str:
-        return self._text
+        """
+        纯文本视图（runs 的拼合）
+
+        分段样式信息不在这里体现 —— 要拿样式请用 `get_runs()`。
+        """
+        return "".join(r.text for r in self._runs)
+    
+    def get_runs(self) -> List[TextRun]:
+        """取得片段列表（返回副本，避免外部直接改内部状态）"""
+        return [dataclasses_replace(r) for r in self._runs]
+    
+    def set_runs(self, runs: List[TextRun]) -> 'TextObject':
+        """设置片段列表（分段样式的正式入口）"""
+        self._runs = list(runs)
+        self._invalidate_text()
+        return self
     
     def append_text(self, text: str) -> 'TextObject':
-        self._text += text
-        self._cache_valid = False
-        self.invalidate_wrap_cache()
-        # 【新增】几何缓存失效
-        self.invalidate_geom_cache()
+        """
+        追加文本 —— 追加到**最后一段**（保持其样式）
+
+        没有已存在的片段时，等价于 `set_text(text)`。
+        """
+        if not self._runs:
+            return self.set_text(text)
+        self._runs[-1] = self._runs[-1].derive(
+            text=self._runs[-1].text + text)
+        self._invalidate_text()
         return self
     
     def calculate_text_size(self, pdf) -> Tuple[float, float]:
-        if not self._text:
+        """
+        [兼容] 测量文本尺寸
+
+        批次 5 起改为调用真实测量 `measure()`（逐段量宽、按可用宽断行），
+        不再使用"字宽 ÷ 可用宽再取整"的估算（缺陷 7.7 已修）。
+        """
+        if not self._runs:
             return (0.0, 0.0)
         
-        old_font_family = pdf.font_family
-        old_font_style = pdf.font_style
-        old_font_size = pdf.font_size_pt
+        m = self.measure(pdf)
         
-        try:
-            pdf.set_font(self.font_name, self.font_style, self.font_size)
-            text_width = pdf.get_string_width(self._text)
-            line_height = self._line_height or (self.font_size * 0.6)
-            effective_width = self.get_effective_width()
-            if effective_width > 0 and text_width > effective_width:
-                approx_lines = max(1, int(text_width / effective_width) + 1)
-                text_height = approx_lines * line_height
-            else:
-                text_height = line_height
-            
-            self._cached_width = text_width
-            self._cached_height = text_height
-            self._cache_valid = True
-            
-            return (text_width, text_height)
-        finally:
-            try:
-                pdf.set_font(old_font_family, old_font_style, old_font_size)
-            except:
-                pass
+        self._cached_width = m.max_line_width
+        self._cached_height = m.total_height
+        self._cache_valid = True
+        
+        return (m.max_line_width, m.total_height)
     
     def get_cached_text_size(self) -> Tuple[float, float]:
         if not self._cache_valid:
             return (0.0, 0.0)
         return (self._cached_width, self._cached_height)
     
+    # ------------------------------------------------------------------
+    # 真实测量（批次 5）
+    # ------------------------------------------------------------------
+    
+    def measure(self, pdf, available_width: Optional[float] = None) -> 'TextMetrics':
+        """
+        用真实 pdf 测量本对象的 runs（逐段量宽、按可用宽断行）
+
+        Args:
+            pdf: FPDF 实例（唯一能给出真实字宽的东西）
+            available_width: 断行宽度。None 表示取本对象的内容区宽
+
+        Returns:
+            TextMetrics
+        """
+        if available_width is None:
+            _, _, w, _ = self._content_rect_local()
+            available_width = w
+        return measure_text(pdf, self._runs, available_width,
+                            line_height_ratio=self.line_height_ratio)
+    
     def _source_w(self, pdf=None) -> float:
         """
         文本的内容固有宽度（字符串宽度 + 左右 padding）
 
-        批次 4b 新增，用于让 SizeX.CONTENT 的父元素能收窄到文本宽度
-        （这是缺陷 7.21 的修复点）。
-
-        宽度目前按字符类别估算（真实测量属批次 5）：
-            CJK / 全角标点 -> 1.0 × 字号
-            其余字符        -> 0.5 × 字号
-        批次 5 会改为用外部 pdf 的 get_string_width 做精确测量；
-        那时把 `_estimate_text_width` 换成真实调用即可，接口不变。
+        批次 4b 新增，用于让 SizeX.CONTENT 的父元素能收窄到文本宽度（缺陷 7.21）。
+        批次 5 起：有 `pdf` 时用**真实字宽**；无 `pdf` 时退回字符类别估算。
         """
         if self.children:
             return super()._source_w(pdf)
         pad = self.padding.left + self.padding.right
-        if not self._text:
+        if not self._runs:
             return pad
-        return self._estimate_text_width(self._text) + pad
+        if pdf is None:
+            return self._estimate_runs_width(self._runs) + pad
+        return measure_text(pdf, self._runs, available_width=0).max_line_width + pad
     
-    def _estimate_text_width(self, text: str) -> float:
+    def _estimate_runs_width(self, runs: List[TextRun]) -> float:
+        """按字符类别估算 runs 的总宽度（无 pdf 时的回退）"""
+        total = 0.0
+        for r in runs:
+            for line in r.text.split("\n"):
+                total = max(total, self._estimate_text_width(line, r.font_size))
+        return total
+    
+    def _estimate_text_width(self, text: str, font_size: Optional[float] = None) -> float:
         """
-        按字符类别估算文本宽度（无外部 pdf 时的回退）
+        按字符类别估算文本宽度（无外部 pdf 时的**最后兜底**）
 
-        pdf 实例只在渲染时才有，而尺寸测量发生在渲染之前，
-        因此这里必须有一个不依赖 pdf 的估算。
+        批次 5 起正常路径走真实测量（`measure_text`）；本方法只在没有 pdf 时使用，
+        并会由 `_source_*` 的调用方打印提示（不是静默）。
         """
+        fs = self.font_size if font_size is None else font_size
         wide = 0
         for ch in text:
             # CJK 统一表意文字、全角标点、假名等按全宽计
@@ -1631,83 +2107,111 @@ class TextObject(LayoutObject):
                     or 0xFFE0 <= o <= 0xFFE6):
                 wide += 1
         narrow = len(text) - wide
-        return (wide * 1.0 + narrow * 0.5) * self.font_size
+        return (wide * 1.0 + narrow * 0.5) * fs
     
     def _source_h(self, pdf=None) -> float:
         """
         文本的内容固有高度（不含对父约束的夹紧）
 
-        批次 4.2 起由 _measure 的退出方向调用，取代表格外的旧 wrap 高度计算。
+        批次 4.2 起由 _measure 的退出方向调用。
         注意：这里**不**做任何对父可用空间的裁剪 —— 裁剪发生在测量退出方向（夹紧）
         与定位阶段（FLOW 溢出裁剪）。旧实现在这里就地裁剪，正是 7.19 的成因之一。
 
-        行数目前仍是估算（真实测量属批次 5）。pdf 参数在此保留，
-        批次 5 会用 pdf.multi_cell(dry_run=True) 做精确测量。
+        批次 5 起：
+            有 pdf 且启用 multi_line -> **真实断行测量**（缺陷 7.7 的根治）
+            其余情况                 -> 退回单行/估算
         """
         if self.children:
             # 有子元素时按容器处理
             return super()._source_h(pdf)
         
-        line_height = self._line_height or (self.font_size * 0.6)
-        text_height = self.font_size * 0.6
-        if self.multi_line and self._text:
-            approx_lines = max(1, len(self._text) // 20 + 1)
-            text_height = approx_lines * line_height
-        return text_height + self.padding.top + self.padding.bottom
+        pad = self.padding.top + self.padding.bottom
+        if not self._runs:
+            return pad
+        
+        if pdf is not None and self.multi_line:
+            # 断行宽度取"父能提供的宽度"（self._constraint_w 由 _measure 传入）
+            m = measure_text(pdf, self._runs,
+                             available_width=max(self._constraint_w, 0.0),
+                             line_height_ratio=self.line_height_ratio)
+            return m.total_height + pad
+        
+        # 不换行，或没有 pdf：按单行处理
+        if pdf is not None:
+            m = measure_text(pdf, self._runs, available_width=0,
+                             line_height_ratio=self.line_height_ratio)
+            return m.total_height + pad
+        single = max((r.font_size for r in self._runs), default=self.font_size)
+        return single * self.line_height_ratio + pad
     
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> float:
-        """渲染文本"""
-        print(f"  >>> 正在渲染PDF文件。现在渲染TextObject节点：{self.name}:{self._text}")
+        """
+        渲染文本（批次 5 起逐 run 绘制，支持分段样式）
+
+        对齐规则：
+            - 断行宽度取有效宽（`eff_w`）
+            - 同一行内的多个片段按各自宽度依次摆放（**基线对齐**：各片段底边对齐）
+            - `align_x` 控制整行在有效宽内的水平位置
+        """
+        print(f"  >>> 正在渲染PDF文件。现在渲染TextObject节点：{self.name}:{self.get_text()}")
         
         abs_x = self.get_absolute_x()
         abs_y = self.get_absolute_y()
         eff_w = self.get_effective_width()
         eff_h = self.get_effective_height()
         
-        if eff_w <= 0 or eff_h <= 0 or not self._text:
+        if eff_w <= 0 or eff_h <= 0 or not self._runs:
             return abs_y
         
         if is_fill:
             pdf.set_fill_color(self.color.r, self.color.g, self.color.b)
             pdf.rect(abs_x, abs_y, eff_w, eff_h, 'F')
         
-        pdf.set_text_color(self.text_color.r, self.text_color.g, self.text_color.b)
-        pdf.set_font(self.font_name, self.font_style, self.font_size)
+        # 逐 run 测量：断行宽度 = 有效宽
+        m = measure_text(pdf, self._runs, available_width=eff_w,
+                         line_height_ratio=self.line_height_ratio)
+        if m.line_count == 0:
+            return abs_y
         
-        line_height = self._line_height or (self.font_size * 0.6)
+        # 内容区左上角（abs 已是外框，需内缩 padding）
+        cx = abs_x + self.padding.left
+        cy = abs_y + self.padding.top
+        inner_w = max(eff_w - self.padding.left - self.padding.right, 0.0)
         
-        if self.multi_line:
-            pdf.set_xy(abs_x, abs_y)
-            align_map = {AlignX.LEFT: 'L', AlignX.CENTER: 'C', AlignX.RIGHT: 'R', AlignX.NONE: 'L'}
-            pdf.multi_cell(
-                w=eff_w, h=line_height, txt=self._text,
-                border=0, align=align_map.get(self.align_x, 'L'), fill=False
-            )
-            return pdf.get_y()
+        for li, line in enumerate(m.lines):
+            if not line:
+                continue
+            line_h = m.line_heights[li]
+            line_top = m.line_top(li)
+            line_w = line[-1][2] + line[-1][3]     # 最后一片的 x + 宽
+            
+            # 整行水平位置（align_x 作用于行，不作用于单个片段）
+            if self.align_x == AlignX.CENTER:
+                dx = (inner_w - line_w) / 2
+            elif self.align_x == AlignX.RIGHT:
+                dx = inner_w - line_w
+            else:
+                dx = 0.0
+            
+            for (ri, txt, px, _w) in line:
+                r = self._runs[ri]
+                # 基线对齐：本行底边对齐，故片段顶边 = 行顶 + (行高 − 自身行高)
+                own_h = r.font_size * self.line_height_ratio
+                py = cy + line_top + (line_h - own_h)
+                pdf.set_text_color(r.color.r, r.color.g, r.color.b)
+                with font_context(pdf, r.font_name, r.get_font_style(), r.font_size):
+                    pdf.set_xy(cx + dx + px, py)
+                    pdf.cell(_w, own_h, txt)
         
-        text_width = pdf.get_string_width(self._text)
-        
-        if self.align_x == AlignX.CENTER:
-            x_offset = (eff_w - text_width) / 2
-        elif self.align_x == AlignX.RIGHT:
-            x_offset = eff_w - text_width
-        else:
-            x_offset = 0
-        
-        y_offset = (eff_h - line_height) / 2 if eff_h > line_height else 0
-        
-        pdf.set_xy(abs_x + x_offset, abs_y + y_offset)
-        pdf.cell(text_width, line_height, self._text)
+        drawn_height = m.total_height
 
         for child in self.children:
-            child_y = child.render(pdf, is_fill)
-            if child_y is not None:
-                last_y = child_y
+            child.render(pdf, is_fill)
 
         print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
-        return abs_y + line_height
+        return abs_y + max(drawn_height, 0.0)
 
     @timer
     def render_debug(self, pdf, is_fill: bool = False, has_border: bool = True,
@@ -2276,6 +2780,7 @@ def create_band(
     colors: Optional[List[Color]] = None,
     layer: int = 0,
     container_name: Optional[str] = None,
+    align_y: AlignY = AlignY.NONE,
 ) -> LayoutObject:
     """
     横向带构件 —— 把若干个"格子"并排放在一个流式行里
@@ -2370,7 +2875,7 @@ def create_band(
         parent=parent,
         padding=band_padding,
         align_x=AlignX.NONE,
-        align_y=AlignY.NONE,
+        align_y=align_y,
         layer=layer,
     )
     parent.add_child(band)
@@ -2507,6 +3012,7 @@ def create_columns(
     names: Optional[List[str]] = None,
     colors: Optional[List[Color]] = None,
     layer: int = 0,
+    align_y: AlignY = AlignY.NONE,
 ) -> LayoutObject:
     """
     在父对象中创建分栏
@@ -2623,6 +3129,7 @@ def create_columns(
         padding=Padding(),
         height=content_h,
         layer=layer,
+        align_y=align_y,
     )
 
 
@@ -2632,6 +3139,7 @@ def create_columns_balanced(
     gap: float = 5,
     padding: Optional[Union[Padding, float]] = None,
     layer: int = 0,
+    align_y: AlignY = AlignY.NONE,
 ) -> LayoutObject:
     """创建等宽分栏（create_columns 的等宽包装，返回新建的带容器）"""
     return create_columns(
@@ -2640,6 +3148,7 @@ def create_columns_balanced(
         gap=gap,
         padding=padding,
         layer=layer,
+        align_y=align_y,
     )
 
 
@@ -3526,5 +4035,148 @@ if __name__ == "__main__":
         "CONTENT 父下的 FILL 子应退化为按内容定尺寸，不能被压成 0"
     print(f"    ✅ FILL 子退化规则通过（子 {_dg_t.get_effective_width():.2f} "
           f"x {_dg_t.get_effective_height():.2f}）")
+    
+    # 12) 真实文本测量与分段样式（批次 5）
+    print("  --- 文本测量与分段样式 ---")
+    # 12.1 CJK 逐字断行：行数随可用宽单调不增，且填满到接近可用宽
+    _mt = TextRun(text="主修课程：数据结构与算法、操作系统、计算机网络、数据库原理。",
+                  font_name=font_name, font_size=12)
+    _lines_at = {}
+    for _w in (120, 60, 30):
+        _m = measure_text(pdf, [_mt], available_width=_w)
+        _lines_at[_w] = _m.line_count
+        assert _m.line_count >= 1
+        assert _m.max_line_width <= _w + 1e-6 or _m.line_count == 1, \
+            f"宽 {_w}: 行宽 {_m.max_line_width:.2f} 不应超出可用宽"
+        # 每行高度应等于 字号 × 系数
+        for _lh in _m.line_heights:
+            assert abs(_lh - 12 * 1.2) < 1e-6, f"行高应为 14.4，实际 {_lh}"
+    assert _lines_at[120] <= _lines_at[60] <= _lines_at[30], \
+        f"断行数应随可用宽减小而增加，实际 {_lines_at}"
+    assert _lines_at[30] > _lines_at[120], "可用宽 30 应比 120 断出更多行"
+    print(f"    ✅ CJK 断行通过（宽 120/60/30 -> {_lines_at[120]}/{_lines_at[60]}/{_lines_at[30]} 行）")
+    # 12.2 总高 == 行数 × 行高
+    _m = measure_text(pdf, [_mt], available_width=60)
+    assert abs(_m.total_height - _m.line_count * 14.4) < 1e-6, \
+        f"总高应为 行数×行高 = {_m.line_count * 14.4}，实际 {_m.total_height}"
+    print("    ✅ 总高 = 行数 × 行高 通过")
+    # 12.3 硬换行：\n 一定断行
+    _m2 = measure_text(pdf, [TextRun(text="甲\n乙\n丙", font_name=font_name, font_size=12)],
+                       available_width=999)
+    assert _m2.line_count == 3, f"两个 \\n 应产生 3 行，实际 {_m2.line_count}"
+    print("    ✅ 硬换行通过（\\n 强制断行）")
+    # 12.4 拉丁按词断行（不在词中间断开）
+    _m3 = measure_text(pdf, [TextRun(text="alpha beta gamma delta epsilon",
+                                     font_name=font_name, font_size=12)],
+                       available_width=35)
+    for _ln in _m3.lines:
+        _s = "".join(p[1] for p in _ln).strip()
+        assert _s == "" or _s in ("alpha", "beta", "gamma", "delta", "epsilon",
+                                  "alpha beta", "gamma delta"), \
+            f"拉丁不应在词中间断开，实际行内容 {_s!r}"
+    print(f"    ✅ 拉丁按词断行通过（{_m3.line_count} 行）")
+    # 12.5 分段样式：同一行内多 run，x 依次累加，且各自字体正确
+    _runs = parse_inline_markdown("这是**加粗**与普通文字",
+                                  TextRun(font_name=font_name, font_size=12))
+    assert len(_runs) == 3, f"应解析出 3 段，实际 {len(_runs)}"
+    assert _runs[0].get_font_style() == "" and _runs[1].get_font_style() == "B", \
+        "中间段应为粗体"
+    _ms = measure_text(pdf, _runs, available_width=200)
+    assert _ms.line_count == 1, "整段应在一行内"
+    _xs = [p[2] for p in _ms.lines[0]]
+    assert _xs == sorted(_xs) and _xs[0] == 0.0, f"x 偏移应递增且从 0 开始，实际 {_xs}"
+    print(f"    ✅ 分段样式测量通过（3 段同行，x={[round(x, 2) for x in _xs]}）")
+    # 12.6 同字号分段 vs 单段：断行位置必须完全一致（R3 的核心保证）
+    _plain = "这段文字用于验证同字号分段的断行位置与整段完全一致"
+    _md = "这段**文字**用于验证*同字号*分段的断行位置与整段完全一致"
+    _la = ["".join(p[1] for p in ln) for ln in measure_text(
+        pdf, [TextRun(text=_plain, font_name=font_name, font_size=12)],
+        available_width=45).lines]
+    _lb = ["".join(p[1] for p in ln) for ln in measure_text(
+        pdf, parse_inline_markdown(_md, TextRun(font_name=font_name, font_size=12)),
+        available_width=45).lines]
+    assert _la == _lb, f"同字号分段的断行位置应与单段一致\n  单段={_la}\n  分段={_lb}"
+    print("    ✅ 同字号分段断行一致通过")
+    # 12.7 markdown 解析的各种情形
+    _base = TextRun(font_name=font_name, font_size=12)
+    assert "".join(r.text for r in parse_inline_markdown(
+        "转义 \\*\\* 不是粗体", _base)) == "转义 ** 不是粗体", "转义应还原为字面量"
+    _unclosed = parse_inline_markdown("未闭合的 **标记", _base)
+    assert "".join(r.text for r in _unclosed) == "未闭合的 **标记", \
+        "未闭合标记应原样保留"
+    _col = parse_inline_markdown("色 <c:FF0000>红</c> 尾", _base)
+    _red = [r for r in _col if r.color is not None and r.color.r == 255 and r.color.g == 0]
+    assert _red and _red[0].text == "红", "颜色标记应生效"
+    _html = parse_inline_markdown("<b>粗</b><i>斜</i>", _base)
+    assert _html[0].get_font_style() == "B" and _html[1].get_font_style() == "I", \
+        "HTML 风格 b/i 应生效"
+    assert "".join(r.text for r in parse_inline_markdown("普通文本", _base)) == "普通文本"
+    print("    ✅ markdown 解析通过（转义/未闭合/颜色/HTML/纯文本）")
+    # 12.8 runs 优先于 text，且 markdown=False 关闭解析
+    import io as _io, contextlib as _ctx
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _prio = TextObject(name="MD_PRIO", text="**粗**",
+                           runs=[TextRun(text="显式", font_name=font_name)],
+                           font_name=font_name)
+    assert _prio.get_text() == "显式", "runs 应优先于 text"
+    assert "以 runs 为准" in _buf.getvalue(), "runs 与 text 同时给出时应打印提示"
+    _off = TextObject(name="MD_OFF", text="**粗**", markdown=False, font_name=font_name)
+    assert _off.get_text() == "**粗**", "markdown=False 时应保留原始字符"
+    print("    ✅ runs 优先 / markdown 开关 通过")
+    # 12.9 get_text / set_text / append_text 的语义
+    _to = TextObject(name="MD_SEM", text="甲", font_name=font_name, font_size=12)
+    assert _to.get_text() == "甲"
+    _to.append_text("乙")
+    assert _to.get_text() == "甲乙" and len(_to.get_runs()) == 1, \
+        "append_text 应追加到最后一段"
+    _to.set_text("**粗**细")
+    assert _to.get_text() == "粗细" and len(_to.get_runs()) == 2, \
+        "set_text 应重建（并解析 markdown）"
+    assert _to.get_runs()[0].get_font_style() == "B"
+    _to.set_runs([TextRun(text="唯一", font_name=font_name)])
+    assert _to.get_text() == "唯一" and len(_to.get_runs()) == 1
+    assert _to.get_runs() is not _to.get_runs(), "get_runs 应返回副本"
+    print("    ✅ get_text / set_text / append_text / set_runs 语义通过")
+    # 12.10 尺寸计算用真实测量；无 pdf 时退回估算（且不崩）
+    #       注意必须是 SizeX.CONTENT 才谈得上"尺寸来自测量" ——
+    #       默认 FILL 的文本对象有效宽是父内容区宽，与文本多宽无关。
+    _tw_root = LayoutObject(name="TW5_root", width=200, height=300)
+    _tw = TextObject(name="TW5_t", text="中文测量", font_name=font_name, font_size=12,
+                     size_x=SizeX.CONTENT, size_y=SizeY.CONTENT,
+                     align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _tw_root.add_child(_tw)
+    _tw_root.layout(pdf=pdf)
+    _expect_w = measure_text(pdf, _tw._runs, available_width=0).max_line_width
+    assert abs(_tw.get_effective_width() - _expect_w) < 1e-6, \
+        f"CONTENT 文本的有效宽应为真实测量 {_expect_w:.2f}，实际 {_tw.get_effective_width():.2f}"
+    assert _tw_root._measured_with_pdf is True
+    print(f"    ✅ 真实测量接入尺寸计算通过（宽 {_expect_w:.2f}）")
+    # 12.11 P1 时序：无 pdf 布局后再 render(pdf) 应触发一次精确重排
+    _tw_root2 = LayoutObject(name="TW5_root2", width=200, height=300)
+    _tw2 = TextObject(name="TW5_t2", text="中文测量", font_name=font_name, font_size=12,
+                      size_x=SizeX.CONTENT, size_y=SizeY.CONTENT,
+                      align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _tw_root2.add_child(_tw2)
+    _tw_root2.layout()                       # 无 pdf -> 估算
+    assert _tw_root2._measured_with_pdf is False
+    _pre = _tw2.get_effective_width()
+    _buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf2):
+        _tw_root2._ensure_layout(pdf=pdf)    # 相当于 render 入口
+    assert _tw_root2._measured_with_pdf is True, "render 入口应触发带 pdf 的重排"
+    assert abs(_tw2.get_effective_width() - _expect_w) < 1e-6, \
+        f"重排后宽应为真实测量 {_expect_w:.2f}，实际 {_tw2.get_effective_width():.2f}"
+    assert abs(_pre - _expect_w) > 1e-9, \
+        "此例中估算值应与实测不同，否则这条断言证明不了重排真的发生了"
+    print(f"    ✅ P1 时序（render 补测重排）通过（估算 {_pre:.2f} -> 实测 {_expect_w:.2f}）")
+    # 12.12 变体缺失时优雅降级（不抛异常）
+    _bad = [TextRun(text="斜体未注册", font_name=font_name, font_size=12, italic=True)]
+    _buf3 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf3):
+        _mb = measure_text(pdf, _bad, available_width=100)
+    assert _mb.line_count >= 1, "变体缺失时仍应测量成功"
+    assert "变体未注册" in _buf3.getvalue(), "变体缺失时应有明确提示（不静默降级）"
+    print("    ✅ 字体变体缺失优雅降级通过")
     
     print("\n✅ 回归契约断言全部通过")

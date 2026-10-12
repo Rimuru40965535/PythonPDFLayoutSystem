@@ -50,45 +50,97 @@
 - 缓存失效不需要调用方操心：任何尺寸/位置/对齐的改动都自动触发失效，重算拿得到新值。
 - 引擎自检覆盖上述能力：LayoutEngine.py 自己的测试入口能断言这些行为，不依赖 ResumeCore.py。
 
+### 核查结果（已完成，见 TECHNICAL.md 8.10b）
+
+| 判定标准 | 结论 |
+| --- | --- |
+| 1 引擎独立完成多元素排版 | ✅ 通过（核查中修复了 `create_band` 缺 `align_y` 的缺口） |
+| 2 缓存失效自动触发 | ✅ 通过 |
+| 3 引擎自检独立且覆盖完整 | ✅ 通过（192 条 assert，零中层依赖） |
+
+**底层已具备签出功能分支的条件。**
+
 
 ## 只在功能分支处理的事项
 
-底层（`master` 上的 `LayoutEngine.py` 及其文档）已经稳定，但**中层与顶层文件不在 `master` 上**
-（`ResumeTemplate.py`、`ResumeCore.py` 属于功能分支）。因此有一类改动**无法在 `master` 完成**，
-必须等签出功能分支后再做。此处集中记录，以免遗忘。
+底层（`master` 上的 `LayoutEngine.py` 及其文档）已经稳定。中层与顶层文件
+（`ResumeTemplate.py` **1523 行**、`ResumeCore.py` **1221 行**）
+**不在 `master` 上**，因此有一类改动无法在 `master` 完成。
 
-记录格式：来源批次 → 事项 → 为什么不能在 master 做。
+> **重要更正**：这两个文件当前是**未跟踪**状态，但**它们不阻塞签出**。
+> `master` 只有 `LayoutEngine.py` 一个源文件，它自洽且自检通过。
+> 正确顺序是：**先在 `master` 提交 → 签出功能分支 → 把这两个文件加进分支**。
 
-### 来自批次 3（Style 下沉）
+### A. 文档与元数据层（无行为风险，建议最先做）
 
-- **`ResumeTemplate.py` 删除本地的 `class Style`**（约 48–115 行），改为
-  `from LayoutEngine import Style`。方案 A：单一来源，不留别名。
-    原因：该文件不在 `master` 上。
-- **`ResumeCore.py` 的导入块**（约 65–78 行）把 `Style` 改从 `LayoutEngine` 取，
-  不再经 `ResumeTemplate` 转手。
-- **`ResumeTemplate.py` 中约 25 处 `TextObject(...)` 手抄参数的调用**
-  改用 `TextObject.from_style(...)`；`ImageObject(...)` 同理。
-    原因：调用点在功能分支。
-- **`ResumeTemplate.py` 中两处硬编码 `height=50`** 改为经 `create_text_block` 的
-  显式 `height` 参数传入。**迁移时必须显式传 50**，不能依赖新默认值 `0`，
-  否则产物会变（`height=0` 的语义是"取父可用高"，见技术文档 3.5）。
-- **`ResumeCore.py` 的技能/证书/荣誉三段**（约 200 行）用 `create_text_block` 收敛，
-  并顺带处理其中 `TextObject(parent=root)` 父指针错挂、`align_y` 不一致等既有问题。
-- **`ResumeCore.py` 的 `Generate()` print 与 `main()` print 的差异**：
-  `Generate` 用 `print(f"   >>>✅ ...")`（带缩进与颜文字），`main` 用 `print(f"  生成成功: ...")`。
-  合并时统一为一处。
+| 优先级 | 事项 | 说明 |
+| --- | --- | --- |
+| A1 | **`.pyproj` 补编译项** | 目前只 `Include` 了 `LayoutEngine.py`；加入 `ResumeTemplate.py` / `ResumeCore.py` |
+| A2 | **`Resources/` 图标入库** | `ResumeTemplate.py` / `ResumeCore.py` 引用的 **11 个**图片文件尚未入库（`.ttf` 已被 `.gitignore` 排除，小素材应正常入库） |
 
-### 来自批次 4（几何属性与包围内容）
+> 已核实：两个文件都是**完好的 UTF-8**（无 BOM、0 个替换字符、2376 / 2177 个正常中文字符）。
+> 之前担心的"编码损坏"是 PowerShell 以 GBK 读取 UTF-8 的显示问题，**不是文件问题**。
 
-- **上层对 `_height` / `_x` / `_width` 的直接改写**（如 `ResumeCore.py` 的
-  `content_obj._height = ...`、`ResumeTemplate.py` 直接改 `_x/_width/align_*`）
-  改为走新的 `set_size` / `set_position` / `set_align` 接口。
-    原因：这些写点全在中层/顶层。
+### B. 顶层 · 模板层（`ResumeTemplate.py`）—— 收益最大
 
-### 通用
+现状核实（行号为当前值）：
 
-- **`Resources/` 的图标与照片**：`ResumeCore.py` / `ResumeTemplate.py` 引用的
-  11 个图片文件尚未入库。它们只在中层/顶层使用，与底层无关。
-- **`.pyproj` 的编译项**：目前只 `Include` 了 `LayoutEngine.py`。
-  功能分支加入 `ResumeTemplate.py` / `ResumeCore.py` 时需一并补上。
+| 现状 | 数量 |
+| --- | --- |
+| 本地 `class Style` | 1 处（**第 49 行**） |
+| `TextObject(...)` 手抄参数 | 7 处 |
+| `ImageObject(...)` 手抄参数 | 3 处 |
+| 硬编码 `height=50` | 2 处（**第 979 / 1069 行**） |
+| `from_style` 调用 | **0 处** |
+| `create_text_block` 调用 | **0 处** |
+
+| 优先级 | 事项 | 说明 |
+| --- | --- | --- |
+| **B1** | **删除本地 `class Style`**（第 49 行起），改 `from LayoutEngine import Style` | **最高优先级**。方案 A：单一来源，不留别名。现在本地 `Style` 遮蔽引擎版本，引擎侧 `Style` 的改动（如 4.4 修的可变默认 `padding`）**在模板层拿不到**，两边会悄悄漂移 |
+| B2 | 7 处 `TextObject(...)` + 3 处 `ImageObject(...)` 改用 `from_style(...)` | 每处从手抄 7 个参数缩到 1 行 |
+| **B3** | 2 处 `height=50` 改经 `create_text_block` 显式传参 | ⚠️ **迁移时必须显式传 50**，不能依赖新默认值 `0` —— 后者的语义是"取父可用高"（见 TECHNICAL.md 3.5），否则产物会变 |
+
+### C. 顶层 · 领域层（`ResumeCore.py`）
+
+现状核实：`from ResumeTemplate import` **1 处**；`Style` 引用 **2 处**；
+`create_spacer` 已在用 **15 处**；技能/证书/荣誉三段各 1 处。
+
+| 优先级 | 事项 | 说明 |
+| --- | --- | --- |
+| C1 | 导入块把 `Style` 改从 `LayoutEngine` 取 | 不再经 `ResumeTemplate` 转手（与 B1 配套） |
+| C2 | **技能/证书/荣誉三段**（约 200 行）用 `create_text_block` 收敛 | 三段几乎逐行相同；顺带处理其中父指针错挂、`align_y` 不一致等既有问题 |
+| C3 | `Details.description_height` 的移除 | 批次 5 的真实测量已让这个手动调参旋钮**不再必需**；改由 `SizeY.CONTENT` 自动定高 |
+| C4 | `Generate()` 与 `main()` 的 print 差异统一 | `Generate` 用 `print(f"   >>>✅ ...")`，`main` 用 `print(f"  生成成功: ...")` |
+| C5 | 两个可变默认参数 | `skills/qualifications/awards: List[str] = []`、`Lead: dict = {}`；改 `field(default_factory=list)` / `None` 模式 |
+
+### D. 引擎侧跟进（可在功能分支做，也可回 `master`）
+
+| 优先级 | 事项 | 说明 |
+| --- | --- | --- |
+| D1 | **`_calculate_wrap_height` 已彻底删除** | ✅ 无需处理 —— 功能分支不会调到它 |
+| D2 | 上层若需"先构造、后声明尺寸" | 用 `obj.height = N`（公开 property 会同步尺寸方式）；**直接写 `_height` 会绕过尺寸方式解析** |
+| D3 | `timer` 装饰器改受开关控制 | 一次简历生成打印数千行（TECHNICAL.md 7.13）；改 `logging` 更好 |
+| D4 | 全局单例可重入 | `layer_manager` / `objectRegister` 是模块级全局（7.14），同进程生成多份文档会互相污染 |
+| D5 | 边框 / `is_fill`（缺陷 7.9） | `RectangleObject.render()` 永远实心填充，忽略 `is_fill`。**仍未排期** |
+
+### E. 已决定不做 / 暂缓
+
+| 项 | 结论 |
+| --- | --- |
+| 外边距 margin | **已决定不做**。padding + `create_spacer` + `create_band` 的 gap 已覆盖全部场景 |
+| 分页 | **暂缓**（批次 6）。现阶段简历只需一页 A4；多页需求出现时先在 `master` 完成再签分支 |
+| 行内图片 / 上标下标 / 两端对齐 / 链接 | 独立特性，未排期 |
+
+### F. 功能分支的验收方式
+
+底层在 `master` 上时，验收靠**逐字节基线比对**（`py verify_pdfs.py --baseline <目录>`）。
+功能分支改动中层/顶层后的验收方式：
+
+1. 先在功能分支**取一次基线**（跑三个入口，产物另存到工作区外）；
+2. 改动后比对；
+3. 差异**逐条对应到预期改动**，确认没有多余的连带变化。
+
+> ⚠️ 批次 5 起，文本的**行高从 `0.6×字号` 改为 `1.2×字号`**（有意修正：
+> 旧值会让多行文本行距过密、单行垂直偏上）。功能分支若沿用旧产物做基线，
+> 需把这一项差异预期在内。
 

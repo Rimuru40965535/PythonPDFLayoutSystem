@@ -52,11 +52,53 @@ def timer(func):
 
 
 # ============================================================================
-# 1. 对齐方式枚举
+# 1. 对齐方式枚举与尺寸方式枚举
+# ============================================================================
+#
+# 【四轴设计】每个元素在两条轴上各有两种独立属性：
+#
+#     轴    | 尺寸（元素自身多大）  | 位置（元素落在父内容区的哪里）
+#     ------+----------------------+--------------------------------
+#      水平 | SizeX                | AlignX
+#      垂直 | SizeY                | AlignY
+#
+# 两轴严格分离：
+#     - 尺寸枚举只决定"多大"，不决定"在哪"
+#     - 对齐枚举只决定"在哪"，不决定"多大"
+#
+# 因此 wrap（内容定尺寸）与 flow（流式接续定位）可以**同时**成立 ——
+# 一个高度由内容决定的元素，位置依然可以接在前一个 FLOW 兄弟下方。
+# 这正是批次 5「文本按实际行数定高」所需要的形态。
 # ============================================================================
 
+class SizeX(Enum):
+    """
+    水平尺寸计算方式
+
+    FILL    : 撑满父元素内容区宽度
+    FIXED   : 使用代码中写死的 width，不另行计算、不被裁剪
+    CONTENT : 由内容圈定（子元素最大宽 + 左右 padding），再对传入约束夹紧
+    """
+    FILL = "fill"
+    FIXED = "fixed"
+    CONTENT = "content"
+
+
+class SizeY(Enum):
+    """
+    垂直尺寸计算方式
+
+    FILL    : 撑满父元素内容区高度
+    FIXED   : 使用代码中写死的 height，不另行计算、不被裁剪
+    CONTENT : 由内容圈定（子元素高之和 + 上下 padding），再对传入约束夹紧
+    """
+    FILL = "fill"
+    FIXED = "fixed"
+    CONTENT = "content"
+
+
 class AlignX(Enum):
-    """水平对齐方式枚举"""
+    """水平对齐方式枚举（只决定位置，不决定尺寸）"""
     LEFT = "left"
     CENTER = "center"
     RIGHT = "right"
@@ -64,12 +106,48 @@ class AlignX(Enum):
 
 
 class AlignY(Enum):
-    """垂直对齐方式枚举"""
+    """垂直对齐方式枚举（只决定位置，不决定尺寸）"""
     TOP = "top"
     VCENTER = "vcenter"
     BOTTOM = "bottom"
     NONE = "none"
     FLOW = "flow"
+
+
+class LayoutCycleError(RuntimeError):
+    """
+    布局循环依赖错误
+
+    两种情形：
+        1. 结构循环：元素成为自己的祖先（对象树被接成了环）
+        2. 尺寸循环：SizeY/SizeX 为 CONTENT 的父元素，直接子元素却是 FILL ——
+           父的高度由内容决定，而子元素的高度又要填满父的内容区，两者互为前提。
+    """
+
+
+class LayoutError_CONTENT_FILL(LayoutCycleError):
+    """
+    尺寸循环：CONTENT 父元素拥有直接的 FILL 子元素
+
+    父的尺寸由内容决定，而该子元素的尺寸又要填满父的内容区 —— 两者互为前提。
+    这是**结构性**矛盾，与约束的数值大小无关，因此在遍历的进入方向即可判定。
+    """
+
+    def __init__(self, parent, bad_children, axis: str):
+        size_attr = "size_x" if axis == "X" else "size_y"
+        axis_cn = "水平" if axis == "X" else "垂直"
+        child_lines = "、".join(
+            f"{c.name}({getattr(c, size_attr).value})" for c in bad_children
+        )
+        super().__init__(
+            f"布局错误: 尺寸循环依赖（{axis_cn}轴）\n"
+            f"  父元素    : {parent.name}  ({size_attr}={getattr(parent, size_attr).value})\n"
+            f"  冲突子元素: {child_lines}\n"
+            f"  原因      : 父的尺寸由内容决定，而该子元素的尺寸又要填满父的内容区，"
+            f"两者互为前提。\n"
+            f"  修法      : 把冲突子元素改为 Size{axis}.CONTENT 或 Size{axis}.FIXED，"
+            f"或把父元素改为 Size{axis}.FILL / Size{axis}.FIXED。"
+        )
 
 
 # ============================================================================
@@ -419,8 +497,12 @@ class LayoutObject:
                  align_y: AlignY = AlignY.NONE,
                  layer: int = 0,
                  wrap_width: bool = False,
-                 wrap_height: bool = False):
+                 wrap_height: bool = False,
+                 size_x: Optional[SizeX] = None,
+                 size_y: Optional[SizeY] = None):
         # 基本属性
+        # 注意：形参 width/height 与即将建立的同名 property 不同名空间，故此处安全；
+        # 但构造函数体内必须用 _width/_height，否则会触发 setter 的失效逻辑。
         self.name = name
         self._x = x
         self._y = y
@@ -447,27 +529,175 @@ class LayoutObject:
         self._layer = layer
         layer_manager.add_object(self, layer)
         
-        # ---- wrap_content 相关属性 ----
-        self._wrap_width = wrap_width
-        self._wrap_height = wrap_height
-        self._wrap_cache_valid = False
-        self._cached_wrap_width = 0.0
-        self._cached_wrap_height = 0.0
-        self._is_wrapping = False
-        self._height_set_by_wrap = False
-        self._width_set_by_wrap = False
+        # ---- 尺寸轴（四轴设计，批次 4） ----
+        # 解析优先级：显式 size_* 参数 > wrap_* 布尔量 > width/height 推断
+        # 推断规则保持与旧行为一致：定死值 -> FIXED；未定死(<=0) -> FILL
+        self._size_x = self._resolve_size(
+            explicit=size_x,
+            wrap_flag=wrap_width,
+            declared=width,
+            fill=SizeX.FILL, fixed=SizeX.FIXED, content=SizeX.CONTENT,
+            axis="X", name=name,
+        )
+        self._size_y = self._resolve_size(
+            explicit=size_y,
+            wrap_flag=wrap_height,
+            declared=height,
+            fill=SizeY.FILL, fixed=SizeY.FIXED, content=SizeY.CONTENT,
+            axis="Y", name=name,
+        )
         
-        # ---- 【新增】几何缓存 ----
-        # 缓存四个几何计算的返回值，避免重复递归计算
-        self._geom_cache_valid = False          # 缓存是否有效
-        self._cached_abs_x = None               # get_absolute_x 的缓存
-        self._cached_abs_y = None               # get_absolute_y 的缓存
-        self._cached_eff_w = None               # get_effective_width 的缓存
-        self._cached_eff_h = None               # get_effective_height 的缓存
+        # ---- 两趟遍历（批次 4.2） ----
+        # 趟 1 测量：约束向下传、尺寸向上收；趟 2 定位：只读对齐轴
+        self._layout_valid = False        # 自身与子树的尺寸/位置是否已算好
+        self._constraint_w = 0.0          # 父内容区能提供的宽
+        self._constraint_h = 0.0          # 父内容区能提供的高
+        self._content_overflows = False   # CONTENT 内容超出约束（被夹紧）
+        self._laid_out_w = 0.0            # 趟 1 算出的尺寸
+        self._laid_out_h = 0.0
+        self._laid_out_x = 0.0            # 趟 2 算出的绝对位置
+        self._laid_out_y = 0.0
         
         # 自动注册到全局注册表
         if name:
             objectRegister[name] = self
+    
+    # ------------------------------------------------------------------------
+    # 6.0 尺寸轴（四轴设计，批次 4）
+    # ------------------------------------------------------------------------
+    
+    @staticmethod
+    def _resolve_size(explicit, wrap_flag, declared, fill, fixed, content,
+                      axis: str, name: str):
+        """
+        解析尺寸方式：显式枚举 > wrap 布尔量 > 声明值推断
+
+        推断规则刻意保持与旧行为一致：
+            声明值 > 0  -> FIXED（定死的尺寸）
+            声明值 <= 0 -> FILL （撑满父内容区）
+        """
+        if explicit is not None:
+            # 必须按轴分别校验：SizeX 与 SizeY 是不同枚举，
+            # 但 isinstance(x, (SizeX, SizeY)) 对两者都成立，不能用来分轴。
+            expected = SizeX if axis == "X" else SizeY
+            if not isinstance(explicit, expected):
+                raise TypeError(
+                    f"size_{axis.lower()} 必须是 Size{axis} 枚举，"
+                    f"收到 {type(explicit).__name__}"
+                )
+            if wrap_flag:
+                print(f"  >>>⚠ {name}: 同时给出了 size_{axis.lower()} 与 wrap_*，"
+                      f"以 size_{axis.lower()} 为准")
+            return explicit
+        if wrap_flag:
+            return content
+        return fixed if declared > 0 else fill
+    
+    @property
+    def width(self) -> float:
+        """
+        声明的宽度数值
+
+        批次 4.2 起这是**公开尺寸声明**：赋正值会把尺寸方式同步为 SizeX.FIXED，
+        赋 0 则退回 SizeX.FILL，然后触发失效重算。
+        这样"先构造、后声明尺寸"的旧写法（如 ResumeCore 的 content_obj._height = N）
+        才能正确生效 —— 直接写 _width 会绕过尺寸方式解析。
+        """
+        return self._width
+    
+    @width.setter
+    def width(self, value: float) -> None:
+        self._width = value
+        if self._size_x != SizeX.CONTENT:
+            self._size_x = SizeX.FIXED if value > 0 else SizeX.FILL
+        self.invalidate_geom_cache()
+    
+    @property
+    def height(self) -> float:
+        """声明的宽度数值（语义同 width，作用于 SizeY）"""
+        return self._height
+    
+    @height.setter
+    def height(self, value: float) -> None:
+        self._height = value
+        if self._size_y != SizeY.CONTENT:
+            self._size_y = SizeY.FIXED if value > 0 else SizeY.FILL
+        self.invalidate_geom_cache()
+    
+    @property
+    def x(self) -> float:
+        """声明的横向偏移（无父容器时即绝对 x）"""
+        return self._x
+    
+    @x.setter
+    def x(self, value: float) -> None:
+        self._x = value
+        self.invalidate_geom_cache()
+    
+    @property
+    def y(self) -> float:
+        """声明的纵向偏移（无父容器时即绝对 y）"""
+        return self._y
+    
+    @y.setter
+    def y(self, value: float) -> None:
+        self._y = value
+        self.invalidate_geom_cache()
+    
+    @property
+    def size_x(self) -> SizeX:
+        """水平尺寸计算方式"""
+        return self._size_x
+    
+    @size_x.setter
+    def size_x(self, value: SizeX) -> None:
+        if self._size_x != value:
+            self._size_x = value
+            self.invalidate_geom_cache()
+    
+    @property
+    def size_y(self) -> SizeY:
+        """垂直尺寸计算方式"""
+        return self._size_y
+    
+    @size_y.setter
+    def size_y(self, value: SizeY) -> None:
+        if self._size_y != value:
+            self._size_y = value
+            self.invalidate_geom_cache()
+    
+    @property
+    def wrap_width(self) -> bool:
+        """
+        [兼容] 宽度是否由内容决定
+
+        派生自 size_x，**不是独立真相**。请优先使用 size_x = SizeX.CONTENT。
+        """
+        return self._size_x == SizeX.CONTENT
+    
+    @wrap_width.setter
+    def wrap_width(self, value: bool) -> None:
+        # 关闭 wrap 时退回 FIXED/FILL，按声明宽度推断，与构造时的规则一致
+        if value:
+            self.size_x = SizeX.CONTENT
+        else:
+            self.size_x = SizeX.FIXED if self._width > 0 else SizeX.FILL
+    
+    @property
+    def wrap_height(self) -> bool:
+        """
+        [兼容] 高度是否由内容决定
+
+        派生自 size_y，**不是独立真相**。请优先使用 size_y = SizeY.CONTENT。
+        """
+        return self._size_y == SizeY.CONTENT
+    
+    @wrap_height.setter
+    def wrap_height(self, value: bool) -> None:
+        if value:
+            self.size_y = SizeY.CONTENT
+        else:
+            self.size_y = SizeY.FIXED if self._height > 0 else SizeY.FILL
     
     # ------------------------------------------------------------------------
     # 6.1 图层属性
@@ -498,196 +728,256 @@ class LayoutObject:
     
     def invalidate_geom_cache(self) -> None:
         """
-        使几何缓存失效（递归向上传播到父元素）
-        
+        使布局缓存失效（递归向上传播到父元素）
+
+        批次 4.2 起，尺寸与位置由 layout() 的两趟遍历统一计算，
+        因此"几何缓存"只剩一个布尔标记 _layout_valid：
+        失效即表示自身与子树的尺寸/位置需要整体重算。
+
         当以下情况发生时应调用此方法：
             1. 子元素被添加或移除
             2. 自身尺寸、对齐方式、内边距被修改
-            3. 子元素的几何发生变化
+            3. 尺寸方式（size_x / size_y）被修改
         """
-        if not self._geom_cache_valid and self._cached_abs_x is None:
-            # 快速路径：如果自身缓存已经无效，可能父元素也无效
-            # 但仍然需要向上传播（因为父元素可能还有效）
-            pass
+        self._layout_valid = False
         
-        self._geom_cache_valid = False
-        self._cached_abs_x = None
-        self._cached_abs_y = None
-        self._cached_eff_w = None
-        self._cached_eff_h = None
-        
-        # 向上传播到父元素
-        if self.parent is not None and hasattr(self.parent, 'invalidate_geom_cache'):
+        # 向上传播到父元素：子树的尺寸会传导给祖先（CONTENT 父要重算）
+        if self.parent is not None:
             self.parent.invalidate_geom_cache()
     
     def invalidate_geom_cache_subtree(self) -> None:
         """
-        使自身及所有子树的几何缓存失效（向下传播）
-        
-        当父元素的尺寸或位置发生变化时，需要让所有子元素失效。
-        与 invalidate_geom_cache() 不同，此方法只向下传播，不向上传播。
+        [兼容] 使自身及所有子树的布局缓存失效（向下传播）
+
+        批次 4.2 起，失效只需一个布尔标记，而 layout() 会重算整棵树，
+        因此"向上传播"的 invalidate_geom_cache() 已足够。
+        此方法保留为兼容入口，语义等同于 invalidate_geom_cache()。
         """
-        self._geom_cache_valid = False
-        self._cached_abs_x = None
-        self._cached_abs_y = None
-        self._cached_eff_w = None
-        self._cached_eff_h = None
+        self.invalidate_geom_cache()
+    
+    # ------------------------------------------------------------------------
+    # 6.3 两趟遍历（批次 4.2）
+    # ------------------------------------------------------------------------
+    #
+    # 【为什么是两趟】
+    #   旧实现的尺寸计算是"惰性 + 互相递归"：子元素在测量阶段就去问父元素
+    #   get_parent_available_area() -> parent.get_effective_height()，
+    #   而父的高度正要靠子元素算出来 —— 自指，于是 wrap_height 只能塌缩成 padding（7.19）。
+    #
+    #   新实现把两个量分开传播：
+    #       趟 1 测量：constraint 向下传、size 向上收
+    #       趟 2 定位：只读对齐轴 + 已定的 size
+    #   子元素的约束是**作为参数拿到**的，不再回头问父容器，
+    #   因此那条造成循环的回边根本不存在。
+    # ------------------------------------------------------------------------
+    
+    def layout(self, pdf=None, force: bool = False) -> 'LayoutObject':
+        """
+        从自身开始跑两趟布局（趟 1 测量尺寸，趟 2 计算位置）
+
+        根节点没有父容器，因此它的约束就是它自己声明的尺寸。
+        若自身是 CONTENT 且没有约束，会回退到声明尺寸。
+
+        Args:
+            pdf: 可选的 FPDF 实例。文本/图片的 CONTENT 尺寸需要它才能精确测量；
+                 不传时退回估算（并打印提示）。纯几何的 CONTENT 不需要它。
+            force: 强制重算，忽略缓存
+
+        Returns:
+            LayoutObject: self（支持链式调用）
+        """
+        if self._layout_valid and not force:
+            return self
+        
+        # 根节点的约束 = 自身声明尺寸（没有父容器给它别的约束）
+        cx = self._width if self._width > 0 else 0.0
+        cy = self._height if self._height > 0 else 0.0
+        
+        self._measure(cx, cy, [], pdf)
+        # 先标记有效：定位阶段（_place）会查询父元素的内容区，
+        # 那些查询属于纯读取，不应再触发一次布局。
+        self._layout_valid = True
+        self._place()
+        return self
+    
+    def _source_w(self, pdf):
+        """本元素的内容固有宽度（内容 + 左右 padding）。子类按需覆盖。"""
+        if not self.children:
+            return self.padding.left + self.padding.right
+        return (max(c._layout_size_w() for c in self.children)
+                + self.padding.left + self.padding.right)
+    
+    def _source_h(self, pdf):
+        """本元素的内容固有高度（内容 + 上下 padding）。子类按需覆盖。"""
+        if not self.children:
+            return self.padding.top + self.padding.bottom
+        return (sum(c._layout_size_h() for c in self.children)
+                + self.padding.top + self.padding.bottom)
+    
+    def _layout_size_w(self) -> float:
+        """趟 1 已算出的尺寸（内部使用，不触发任何计算）"""
+        return self._laid_out_w
+    
+    def _layout_size_h(self) -> float:
+        """趟 1 已算出的尺寸（内部使用，不触发任何计算）"""
+        return self._laid_out_h
+    
+    def _measure(self, constraint_w: float, constraint_h: float, path: list, pdf):
+        """
+        趟 1：测量尺寸
+
+        进入方向（背离根）：确定 FIXED / FILL 的尺寸，把约束传给子元素
+        退出方向（朝向根）：确定 CONTENT 的尺寸（内容 + padding，再对约束夹紧）
+        """
+        if any(o is self for o in path):
+            chain = " > ".join([o.name for o in path] + [self.name])
+            raise LayoutCycleError(
+                f"结构循环依赖：元素成为自己的祖先\n  路径：{chain}"
+            )
+        
+        self._constraint_w = constraint_w
+        self._constraint_h = constraint_h
+        
+        # ---- 结构性冲突：CONTENT 父的直接 FILL 子 ----
+        # 父的尺寸由内容决定，而该子元素的尺寸又要填满父的内容区，两者互为前提。
+        # 这是结构性矛盾，与约束的数值无关，因此在进入方向即可判定。
+        if self._size_x == SizeX.CONTENT:
+            bad = [c for c in self.children if c._size_x == SizeX.FILL]
+            if bad:
+                raise LayoutError_CONTENT_FILL(self, bad, "X")
+        if self._size_y == SizeY.CONTENT:
+            bad = [c for c in self.children if c._size_y == SizeY.FILL]
+            if bad:
+                raise LayoutError_CONTENT_FILL(self, bad, "Y")
+        
+        # ---- 进入方向：定 FIXED 与 FILL ----
+        # 定死值优先：代码里写死的尺寸不另行计算，也不被裁剪（装不下是溢出问题）
+        if self._size_x == SizeX.FIXED:
+            self._laid_out_w = self._width
+        elif self._size_x == SizeX.FILL:
+            self._laid_out_w = max(constraint_w, 0.0)
+        # SizeX == CONTENT：此轮不定，留给退出方向
+        
+        if self._size_y == SizeY.FIXED:
+            self._laid_out_h = self._height
+        elif self._size_y == SizeY.FILL:
+            self._laid_out_h = max(constraint_h, 0.0)
+        
+        # ---- 推算子元素的约束 ----
+        if self._size_x == SizeX.CONTENT:
+            # CONTENT 的 padding 是"容器内留白"，在退出方向加到尺寸上。
+            # 若此处先扣 padding，就等于要求"父尺寸必须先定"，循环立刻回来。
+            child_cw = max(constraint_w, 0.0)
+        else:
+            child_cw = max(self._laid_out_w - self.padding.left - self.padding.right, 0.0)
+        
+        if self._size_y == SizeY.CONTENT:
+            child_ch = max(constraint_h, 0.0)
+        else:
+            child_ch = max(self._laid_out_h - self.padding.top - self.padding.bottom, 0.0)
+        
+        path = path + [self]
+        for child in self.children:
+            child._measure(child_cw, child_ch, path, pdf)
+        
+        # ---- 退出方向：定 CONTENT ----
+        if self._size_x == SizeX.CONTENT:
+            desired_w = self._source_w(pdf)
+            self._laid_out_w = min(desired_w, max(constraint_w, 0.0)) \
+                if constraint_w > 0 else desired_w
+            self._content_overflows = desired_w > self._laid_out_w + 1e-9
+        
+        if self._size_y == SizeY.CONTENT:
+            desired_h = self._source_h(pdf)
+            self._laid_out_h = min(desired_h, max(constraint_h, 0.0)) \
+                if constraint_h > 0 else desired_h
+            self._content_overflows = desired_h > self._laid_out_h + 1e-9
+    
+    def _content_rect_local(self):
+        """内容区（相对自身的局部坐标）"""
+        return (self.padding.left, self.padding.top,
+                max(self._laid_out_w - self.padding.left - self.padding.right, 0.0),
+                max(self._laid_out_h - self.padding.top - self.padding.bottom, 0.0))
+    
+    def _place(self):
+        """
+        趟 2：计算绝对位置
+
+        趟 1 已把全树尺寸定完，因此本趟不再需要传参 —— 可用空间直接向父容器
+        取它的内容区（纯查询，不触发任何计算）。本趟只读对齐轴。
+        """
+        if self.parent is None:
+            # 根节点：外框原点 = 声明的 (x, y)
+            ax, ay = self._x, self._y
+            avail_x, avail_y = ax, ay
+            avail_w, avail_h = self._laid_out_w, self._laid_out_h
+        else:
+            # 父容器内容区（纯查询）
+            avail_x, avail_y, avail_w, avail_h = self.parent.get_content_area()
+            
+            if self.align_x == AlignX.CENTER:
+                ax = avail_x + (avail_w - self._laid_out_w) / 2
+            elif self.align_x == AlignX.RIGHT:
+                ax = avail_x + avail_w - self._laid_out_w
+            elif self.align_x == AlignX.LEFT:
+                ax = avail_x
+            else:  # NONE
+                ax = avail_x + self._x
+            
+            if self.align_y == AlignY.FLOW:
+                prev_flow = self.get_previous_flow_sibling()
+                ay = avail_y if prev_flow is None \
+                    else prev_flow._laid_out_y + prev_flow._laid_out_h
+            elif self.align_y == AlignY.VCENTER:
+                ay = avail_y + (avail_h - self._laid_out_h) / 2
+            elif self.align_y == AlignY.BOTTOM:
+                ay = avail_y + avail_h - self._laid_out_h
+            elif self.align_y == AlignY.TOP:
+                ay = avail_y
+            else:  # NONE
+                ay = avail_y + self._y
+        
+        self._laid_out_x = ax
+        self._laid_out_y = ay
+        
+        # FLOW 溢出裁剪：属于"溢出策略"，不属于尺寸计算，故放在本趟
+        self._flow_clipped = False
+        if self.align_y == AlignY.FLOW and self.parent is not None:
+            bottom = avail_y + avail_h
+            if ay + self._laid_out_h > bottom:
+                self._flow_clipped = True
+                self._laid_out_h = max(bottom - ay, 0.0)
         
         for child in self.children:
-            child.invalidate_geom_cache_subtree()
-    
-    # ------------------------------------------------------------------------
-    # 6.3 wrap_content 相关方法
-    # ------------------------------------------------------------------------
-    
-    def _calculate_wrap_height(self) -> float:
-        """内部方法：计算 wrap_content 高度"""
-        if self._is_wrapping:
-            return self._height
-        
-        if self._height > 0:
-            self._cached_wrap_height = self._height
-            self._wrap_cache_valid = True
-            return self._height
-        
-        self._is_wrapping = True
-        
-        try:
-            total_height = 0.0
-            flow_children = self.get_flow_children()
-            
-            if not flow_children:
-                total_height = self.padding.top + self.padding.bottom
-            else:
-                for child in flow_children:
-                    if child._wrap_height:
-                        child_height = child._calculate_wrap_height()
-                    else:
-                        child_height = child.get_effective_height()
-                    total_height += child_height
-            
-            total_height += self.padding.top + self.padding.bottom
-            
-            if self.parent:
-                _, avail_y, _, avail_h = self.get_parent_available_area()
-                if total_height > avail_h:
-                    self._flow_clipped = True
-                    total_height = avail_h
-                else:
-                    self._flow_clipped = False
-            
-            self._height = total_height
-            self._height_set_by_wrap = True
-            self._cached_wrap_height = total_height
-            self._wrap_cache_valid = True
-            
-            return total_height
-        finally:
-            self._is_wrapping = False
-    
-    def _calculate_wrap_width(self) -> float:
-        """内部方法：计算 wrap_content 宽度"""
-        if self._is_wrapping:
-            return self._width
-        
-        if self._width > 0:
-            self._cached_wrap_width = self._width
-            self._wrap_cache_valid = True
-            return self._width
-        
-        self._is_wrapping = True
-        
-        try:
-            max_width = 0.0
-            for child in self.children:
-                if child._wrap_width:
-                    child_width = child._calculate_wrap_width()
-                else:
-                    child_width = child.get_effective_width()
-                if child_width > max_width:
-                    max_width = child_width
-            
-            total_width = max_width + self.padding.left + self.padding.right
-            
-            if self.parent:
-                _, _, avail_w, _ = self.get_parent_available_area()
-                if total_width > avail_w:
-                    total_width = avail_w
-            
-            self._width = total_width
-            self._width_set_by_wrap = True
-            self._cached_wrap_width = total_width
-            self._wrap_cache_valid = True
-            
-            return total_width
-        finally:
-            self._is_wrapping = False
-    
-    def wrap_content(self, force: bool = False) -> float:
-        """计算并设置 wrap_content 高度"""
-        if self._is_wrapping:
-            raise RuntimeError(f"检测到循环依赖: {self.name} 正在 wrap_content 计算中")
-        
-        if not force and self._wrap_cache_valid and self._height_set_by_wrap:
-            return self._cached_wrap_height
-        
-        if self._height > 0:
-            self._cached_wrap_height = self._height
-            self._wrap_cache_valid = True
-            return self._height
-        
-        result = self._calculate_wrap_height()
-        # 尺寸变化后，几何缓存失效
-        self.invalidate_geom_cache()
-        return result
-    
-    def wrap_content_width(self, force: bool = False) -> float:
-        """计算并设置 wrap_content 宽度"""
-        if self._is_wrapping:
-            raise RuntimeError(f"检测到循环依赖: {self.name} 正在 wrap_content 计算中")
-        
-        if not force and self._wrap_cache_valid and self._width_set_by_wrap:
-            return self._cached_wrap_width
-        
-        if self._width > 0:
-            self._cached_wrap_width = self._width
-            self._wrap_cache_valid = True
-            return self._width
-        
-        result = self._calculate_wrap_width()
-        self.invalidate_geom_cache()
-        return result
+            child._place()
     
     def invalidate_wrap_cache(self) -> None:
-        """使 wrap_content 缓存失效（向上传播）"""
-        self._wrap_cache_valid = False
-        self._height_set_by_wrap = False
-        self._width_set_by_wrap = False
-        
-        if self.parent and hasattr(self.parent, 'invalidate_wrap_cache'):
-            self.parent.invalidate_wrap_cache()
+        """
+        [兼容] 使布局缓存失效（向上传播）
+
+        批次 4.2 起与 invalidate_geom_cache() 等价 —— 两者都只是把
+        _layout_valid 置 False，尺寸与位置会在下次 layout() 时整体重算。
+        """
+        self.invalidate_geom_cache()
     
     def is_wrapped(self) -> bool:
-        return self._wrap_height or self._wrap_width
+        return self._size_x == SizeX.CONTENT or self._size_y == SizeY.CONTENT
     
     def is_height_wrapped(self) -> bool:
-        return self._wrap_height
+        return self._size_y == SizeY.CONTENT
     
     def is_width_wrapped(self) -> bool:
-        return self._wrap_width
+        return self._size_x == SizeX.CONTENT
     
     def get_wrap_status(self) -> Dict[str, Any]:
         return {
-            "wrap_width": self._wrap_width,
-            "wrap_height": self._wrap_height,
-            "cache_valid": self._wrap_cache_valid,
-            "height_set_by_wrap": self._height_set_by_wrap,
-            "width_set_by_wrap": self._width_set_by_wrap,
-            "cached_width": self._cached_wrap_width,
-            "cached_height": self._cached_wrap_height,
+            "size_x": self._size_x.value,
+            "size_y": self._size_y.value,
+            "layout_valid": self._layout_valid,
+            "laid_out_width": self._laid_out_w,
+            "laid_out_height": self._laid_out_h,
+            "content_overflows": self._content_overflows,
         }
-    
-    # ------------------------------------------------------------------------
     # 6.4 父子关系管理
     # ------------------------------------------------------------------------
     
@@ -759,180 +1049,80 @@ class LayoutObject:
         return [child for child in self.children if child.align_y == AlignY.FLOW]
     
     # ------------------------------------------------------------------------
-    # 6.5 布局计算（核心） - 已添加几何缓存
+    # 6.5 几何查询（批次 4.2：全部改为读取两趟遍历的结果）
+    # ------------------------------------------------------------------------
+    #
+    # 这些方法现在都是**纯读取**：若布局尚未算好，会触发一次 layout()，
+    # 然后返回结果。它们不再"边算边问父容器"，因此不存在自指。
     # ------------------------------------------------------------------------
     
+    def _ensure_layout(self):
+        """若布局未算好，从根节点跑一次两趟遍历"""
+        if self._layout_valid:
+            return
+        self._layout_root().layout()
+    
+    def _layout_root(self) -> 'LayoutObject':
+        """向上找到根节点（没有父元素的那个）"""
+        node = self
+        while node.parent is not None:
+            node = node.parent
+        return node
+    
     def get_parent_available_area(self) -> Tuple[float, float, float, float]:
-        """获取父元素的可用空间（绝对坐标）"""
+        """
+        [兼容] 父元素内容区的绝对矩形
+
+        批次 4.2 起，尺寸计算不再需要它（约束是 layout() 传下去的），
+        保留为纯查询接口。真正的规则是：**约束由父容器主动传给子元素**，
+        而不是子元素回头来问。
+        """
         if self.parent is None:
-            return (self._x, self._y, self._width, self._height)
-        
-        # 通过缓存的方法获取父元素的几何信息（内部已缓存）
-        parent_abs_x = self.parent.get_absolute_x()
-        parent_abs_y = self.parent.get_absolute_y()
-        parent_eff_w = self.parent.get_effective_width()
-        parent_eff_h = self.parent.get_effective_height()
-        
-        available_x = parent_abs_x + self.parent.padding.left
-        available_y = parent_abs_y + self.parent.padding.top
-        available_w = parent_eff_w - self.parent.padding.left - self.parent.padding.right
-        available_h = parent_eff_h - self.parent.padding.top - self.parent.padding.bottom
-        
-        return (available_x, available_y, available_w, available_h)
+            return (0.0, 0.0, self._width, self._height)
+        return self.parent.get_content_area()
     
     def get_absolute_x(self) -> float:
         """
-        获取对象的绝对 X 坐标（带缓存）
-        
-        对齐规则：
-            - CENTER: 在父元素可用空间中水平居中
-            - RIGHT: 靠父元素可用空间右边界
-            - LEFT: 靠父元素可用空间左边界
-            - NONE: 使用构造时的 _x 值
+        获取对象的绝对 X 坐标
+
+        由趟 2（_place）算出。对齐规则见 AlignX。
         """
-        # ---- 【新增】缓存命中检查 ----
-        if self._geom_cache_valid and self._cached_abs_x is not None:
-            return self._cached_abs_x
-        
-        # ---- 原逻辑 ----
+        self._ensure_layout()
         if self.parent is None:
-            result = self._x
-        else:
-            avail_x, _, avail_w, _ = self.get_parent_available_area()
-            effective_width = self.get_effective_width()
-            
-            if self.align_x == AlignX.CENTER:
-                result = avail_x + (avail_w - effective_width) / 2
-            elif self.align_x == AlignX.RIGHT:
-                result = avail_x + avail_w - effective_width
-            elif self.align_x == AlignX.LEFT:
-                result = avail_x
-            else:  # NONE
-                result = avail_x + self._x
-        
-        # ---- 【新增】写入缓存 ----
-        self._cached_abs_x = result
-        # 注意：不在这里设置 _geom_cache_valid，由 get_effective_width 统一管理
-        return result
+            return self._x
+        return self._laid_out_x
     
     def get_absolute_y(self) -> float:
         """
-        获取对象的绝对 Y 坐标（带缓存）
-        
-        对齐规则：
-            - VCENTER: 在父元素可用空间中垂直居中
-            - BOTTOM: 靠父元素可用空间下边界
-            - TOP: 靠父元素可用空间上边界
-            - FLOW: 紧挨上一个 FLOW 子元素放置
-            - NONE: 使用构造时的 _y 值
+        获取对象的绝对 Y 坐标
+
+        由趟 2（_place）算出。对齐规则见 AlignY。
         """
-        # ---- 【新增】缓存命中检查 ----
-        if self._geom_cache_valid and self._cached_abs_y is not None:
-            return self._cached_abs_y
-        
-        # ---- 原逻辑 ----
+        self._ensure_layout()
         if self.parent is None:
-            result = self._y
-        else:
-            _, avail_y, _, avail_h = self.get_parent_available_area()
-            effective_height = self.get_effective_height()
-            
-            if self.align_y == AlignY.FLOW:
-                prev_flow = self.get_previous_flow_sibling()
-                if prev_flow is None:
-                    result = avail_y
-                else:
-                    prev_abs_y = prev_flow.get_absolute_y()
-                    prev_eff_h = prev_flow.get_effective_height()
-                    result = prev_abs_y + prev_eff_h
-            elif self.align_y == AlignY.VCENTER:
-                result = avail_y + (avail_h - effective_height) / 2
-            elif self.align_y == AlignY.BOTTOM:
-                result = avail_y + avail_h - effective_height
-            elif self.align_y == AlignY.TOP:
-                result = avail_y
-            else:  # NONE
-                result = avail_y + self._y
-        
-        # ---- 【新增】写入缓存 ----
-        self._cached_abs_y = result
-        return result
+            return self._y
+        return self._laid_out_y
     
     def get_effective_width(self) -> float:
-        """计算对象的有效宽度（带缓存）"""
-        # ---- 【新增】缓存命中检查 ----
-        if self._geom_cache_valid and self._cached_eff_w is not None:
-            return self._cached_eff_w
-        
-        # ---- 原逻辑 ----
-        # wrap_content 支持
-        if self._wrap_width:
-            if self._wrap_cache_valid and self._width_set_by_wrap:
-                result = self._cached_wrap_width
-            else:
-                result = self._calculate_wrap_width()
-        elif self.parent is None:
-            result = self._width
-        else:
-            _, _, avail_w, _ = self.get_parent_available_area()
-            if self._width <= 0:
-                result = avail_w
-            else:
-                result = min(self._width, avail_w)
-        
-        # ---- 【新增】写入缓存 ----
-        self._cached_eff_w = result
-        return result
+        """
+        获取对象的有效宽度
+
+        由趟 1（_measure）算出。取值规则见 SizeX：
+            FIXED   -> 代码里写死的 width，不另行计算、不被裁剪
+            FILL    -> 父内容区宽
+            CONTENT -> 内容固有宽（子元素最大宽 + 左右 padding），再对约束夹紧
+        """
+        self._ensure_layout()
+        return self._laid_out_w
     
     def get_effective_height(self) -> float:
-        """计算对象的有效高度（带缓存）"""
-        # ---- 【新增】缓存命中检查 ----
-        if self._geom_cache_valid and self._cached_eff_h is not None:
-            return self._cached_eff_h
-        
-        # ---- 原逻辑 ----
-        # wrap_content 支持
-        if self._wrap_height:
-            if self._wrap_cache_valid and self._height_set_by_wrap:
-                result = self._cached_wrap_height
-            else:
-                result = self._calculate_wrap_height()
-        elif self.parent is None:
-            result = self._height
-        else:
-            _, avail_y, _, avail_h = self.get_parent_available_area()
-            
-            base_height = self._height if self._height > 0 else avail_h
-            constrained_height = min(base_height, avail_h)
-            
-            # FLOW 模式额外检查
-            if self.align_y == AlignY.FLOW:
-                prev_flow = self.get_previous_flow_sibling()
-                
-                if prev_flow is None:
-                    top_y = avail_y
-                else:
-                    prev_abs_y = prev_flow.get_absolute_y()
-                    prev_eff_h = prev_flow.get_effective_height()
-                    top_y = prev_abs_y + prev_eff_h
-                
-                remaining_height = (avail_y + avail_h) - top_y
-                
-                if remaining_height <= 0:
-                    self._flow_clipped = True
-                    result = 0.0
-                else:
-                    final_height = min(constrained_height, remaining_height)
-                    self._flow_clipped = final_height < self._height if self._height > 0 else False
-                    result = final_height
-            else:
-                result = constrained_height
-        
-        # ---- 【新增】写入缓存并标记缓存有效 ----
-        self._cached_eff_h = result
-        # 四个缓存都已写入，标记缓存有效
-        self._geom_cache_valid = True
-        return result
+        """
+        获取对象的有效高度
+
+        由趟 1（_measure）算出。取值规则见 SizeY。
+        """
+        self._ensure_layout()
+        return self._laid_out_h
     
     def get_content_area(self) -> Tuple[float, float, float, float]:
         """获取当前对象的内容区域（绝对坐标）"""
@@ -965,13 +1155,15 @@ class LayoutObject:
             },
             "flow_clipped": getattr(self, '_flow_clipped', False),
             "layer": self._layer,
-            "wrap": {
-                "width": self._wrap_width,
-                "height": self._wrap_height,
-                "height_set_by_wrap": self._height_set_by_wrap,
-                "width_set_by_wrap": self._width_set_by_wrap
+            "size_mode": {
+                "x": self._size_x.value,
+                "y": self._size_y.value,
             },
-            "geom_cache_valid": self._geom_cache_valid,
+            "layout_valid": self._layout_valid,
+            "constraint": {
+                "w": self._constraint_w, "h": self._constraint_h
+            },
+            "content_overflows": self._content_overflows,
         }
     
     # ------------------------------------------------------------------------
@@ -1092,9 +1284,9 @@ class LayoutObject:
 
     def _get_display_name(self) -> str:
         name = self.name
-        if self._wrap_height:
+        if self.wrap_height:
             name += " [H↕]"
-        if self._wrap_width:
+        if self.wrap_width:
             name += " [W↔]"
         return name
 
@@ -1108,9 +1300,9 @@ class LayoutObject:
     
     def __repr__(self) -> str:
         wrap_marker = ""
-        if self._wrap_height:
+        if self.wrap_height:
             wrap_marker += ", wrap_h"
-        if self._wrap_width:
+        if self.wrap_width:
             wrap_marker += ", wrap_w"
         return f"LayoutObject(name='{self.name}', layer={self._layer}, size=({self._width}x{self._height}){wrap_marker})"
 
@@ -1278,50 +1470,35 @@ class TextObject(LayoutObject):
             return (0.0, 0.0)
         return (self._cached_width, self._cached_height)
     
+    def _source_h(self, pdf=None) -> float:
+        """
+        文本的内容固有高度（不含对父约束的夹紧）
+
+        批次 4.2 起由 _measure 的退出方向调用，取代旧的 _calculate_wrap_height。
+        注意：这里**不**做任何对父可用空间的裁剪 —— 裁剪发生在测量退出方向（夹紧）
+        与定位阶段（FLOW 溢出裁剪）。旧实现在这里就地裁剪，正是 7.19 的成因之一。
+
+        行数目前仍是估算（真实测量属批次 5）。pdf 参数在此保留，
+        批次 5 会用 pdf.multi_cell(dry_run=True) 做精确测量。
+        """
+        if self.children:
+            # 有子元素时按容器处理
+            return super()._source_h(pdf)
+        
+        line_height = self._line_height or (self.font_size * 0.6)
+        text_height = self.font_size * 0.6
+        if self.multi_line and self._text:
+            approx_lines = max(1, len(self._text) // 20 + 1)
+            text_height = approx_lines * line_height
+        return text_height + self.padding.top + self.padding.bottom
+    
     def _calculate_wrap_height(self) -> float:
-        if self._is_wrapping:
-            return self._height
-        
-        if self._height > 0:
-            self._cached_wrap_height = self._height
-            self._wrap_cache_valid = True
-            return self._height
-        
-        self._is_wrapping = True
-        
-        try:
-            if self.children:
-                total_height = 0.0
-                for child in self.get_flow_children():
-                    if child._wrap_height:
-                        child_height = child._calculate_wrap_height()
-                    else:
-                        child_height = child.get_effective_height()
-                    total_height += child_height
-                total_height += self.padding.top + self.padding.bottom
-            else:
-                text_height = self.font_size * 0.6
-                if self.multi_line and self._text:
-                    approx_lines = max(1, len(self._text) // 20 + 1)
-                    text_height = approx_lines * (self._line_height or self.font_size * 0.6)
-                total_height = text_height + self.padding.top + self.padding.bottom
-            
-            if self.parent:
-                _, avail_y, _, avail_h = self.get_parent_available_area()
-                if total_height > avail_h:
-                    self._flow_clipped = True
-                    total_height = avail_h
-                else:
-                    self._flow_clipped = False
-            
-            self._height = total_height
-            self._height_set_by_wrap = True
-            self._cached_wrap_height = total_height
-            self._wrap_cache_valid = True
-            
-            return total_height
-        finally:
-            self._is_wrapping = False
+        """
+        [兼容] 旧接口，委托给 _source_h()
+
+        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
+        """
+        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> float:
@@ -1611,56 +1788,59 @@ class ImageObject(LayoutObject):
         return (self._cached_image_width, self._cached_image_height,
                 self._cached_render_width, self._cached_render_height)
     
-    def _calculate_wrap_height(self) -> float:
-        if self._is_wrapping:
-            return self._height
+    def _source_h(self, pdf=None) -> float:
+        """
+        图片的内容固有高度（不含对父约束的夹紧）
+
+        无子元素时按图片宽高比推算；有子元素时按容器处理。
+        注意：这里**不**再内部构造临时 FPDF 实例（那是缺陷 7.6）。
+        批次 4.2 起优先使用外部传入的 pdf；未传时用 Pillow 直接读图片头部，
+        两者都不可用时退回"高度 = 宽度"的保守估算。
+        """
+        if self.children:
+            return super()._source_h(pdf)
         
-        if self._height > 0:
-            self._cached_wrap_height = self._height
-            self._wrap_cache_valid = True
-            return self._height
+        pad = self.padding.top + self.padding.bottom
+        if not self._image_path or not os.path.exists(self._image_path):
+            return pad
         
-        self._is_wrapping = True
+        ratio = self._image_aspect_ratio(pdf)
+        if ratio is None:
+            # 无法取得宽高比：保守退回"高 = 宽"
+            return (self._width if self._width > 0 else 0.0) + pad
         
+        if self._width > 0 and ratio > 0:
+            return self._width / ratio + pad
+        return pad
+    
+    def _image_aspect_ratio(self, pdf=None):
+        """
+        取图片宽高比 (w/h)。优先用外部 pdf，其次用 Pillow，都不可用则返回 None。
+        """
+        if pdf is not None and self._image_path and os.path.exists(self._image_path):
+            try:
+                info = pdf.image_info(self._image_path)
+                if info.get('h'):
+                    return info['w'] / info['h']
+            except Exception:
+                pass
         try:
-            if self.children:
-                total_height = 0.0
-                for child in self.get_flow_children():
-                    if child._wrap_height:
-                        child_height = child._calculate_wrap_height()
-                    else:
-                        child_height = child.get_effective_height()
-                    total_height += child_height
-                total_height += self.padding.top + self.padding.bottom
-            else:
-                if self._width > 0 and self._image_path and os.path.exists(self._image_path):
-                    try:
-                        from fpdf import FPDF
-                        pdf = FPDF()
-                        info = pdf.image_info(self._image_path)
-                        aspect_ratio = info['w'] / info['h']
-                        total_height = self._width / aspect_ratio + self.padding.top + self.padding.bottom
-                    except:
-                        total_height = self._width + self.padding.top + self.padding.bottom
-                else:
-                    total_height = self.padding.top + self.padding.bottom
-            
-            if self.parent:
-                _, avail_y, _, avail_h = self.get_parent_available_area()
-                if total_height > avail_h:
-                    self._flow_clipped = True
-                    total_height = avail_h
-                else:
-                    self._flow_clipped = False
-            
-            self._height = total_height
-            self._height_set_by_wrap = True
-            self._cached_wrap_height = total_height
-            self._wrap_cache_valid = True
-            
-            return total_height
-        finally:
-            self._is_wrapping = False
+            from PIL import Image
+            with Image.open(self._image_path) as im:
+                w, h = im.size
+                if h:
+                    return w / h
+        except Exception:
+            pass
+        return None
+    
+    def _calculate_wrap_height(self) -> float:
+        """
+        [兼容] 旧接口，委托给 _source_h()
+
+        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
+        """
+        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> Tuple[float, float]:
@@ -1819,45 +1999,14 @@ class RectangleObject(LayoutObject):
         )
     
     def _calculate_wrap_height(self) -> float:
-        if self._is_wrapping:
-            return self._height
-        
-        if self._height > 0:
-            self._cached_wrap_height = self._height
-            self._wrap_cache_valid = True
-            return self._height
-        
-        self._is_wrapping = True
-        
-        try:
-            if self.children:
-                total_height = 0.0
-                for child in self.get_flow_children():
-                    if child._wrap_height:
-                        child_height = child._calculate_wrap_height()
-                    else:
-                        child_height = child.get_effective_height()
-                    total_height += child_height
-                total_height += self.padding.top + self.padding.bottom
-            else:
-                total_height = self.padding.top + self.padding.bottom
-            
-            if self.parent:
-                _, avail_y, _, avail_h = self.get_parent_available_area()
-                if total_height > avail_h:
-                    self._flow_clipped = True
-                    total_height = avail_h
-                else:
-                    self._flow_clipped = False
-            
-            self._height = total_height
-            self._height_set_by_wrap = True
-            self._cached_wrap_height = total_height
-            self._wrap_cache_valid = True
-            
-            return total_height
-        finally:
-            self._is_wrapping = False
+        """
+        [兼容] 旧接口，委托给 _source_h()
+
+        矩形的内容固有高度就是"子元素高之和 + 上下 padding"，
+        与基类默认实现一致，故无需覆盖 _source_h。
+        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
+        """
+        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> Tuple[float, float]:
@@ -2108,9 +2257,16 @@ def create_band(
                 layer=layer,
             )
         else:
-            # 已构造对象：保留其自身宽度，只接管位置与高度
+            # 已构造对象：保留其自身宽度，只接管位置、高度与尺寸方式
             obj = cell
             obj._height = band_height
+            # 关键：格子宽度是**被创建者显式定死的**，必须声明为 FIXED。
+            # 否则若构造时 width=0（先建后设宽，如 split_column_advanced），
+            # 尺寸方式会被推成 FILL，把这里定死的宽度覆盖掉。
+            if obj._width > 0:
+                obj._size_x = SizeX.FIXED
+            if band_height > 0:
+                obj._size_y = SizeY.FIXED
 
         obj.align_x = AlignX.NONE
         obj.align_y = AlignY.NONE
@@ -2177,10 +2333,14 @@ def split_column_advanced(
         raise ValueError(f"Parent '{parent.name}' has no available space")
 
     # ---- 计算左右栏宽度 ----
+    # 直接在构造之后设定宽度，因此必须同步声明尺寸方式为 FIXED ——
+    # 这些宽度是调用方显式定死的，不该被 FILL 覆盖（见 create_band 里的同类处理）。
     total_ratio = sum(ratio)
     total_width = content_w - gap
     left_obj._width = total_width * (ratio[0] / total_ratio)
     right_obj._width = total_width * (ratio[1] / total_ratio)
+    left_obj._size_x = SizeX.FIXED
+    right_obj._size_x = SizeX.FIXED
 
     # ---- 交给 create_band 排放 ----
     # 格局：带容器挂到 parent 下，左右对象作为"已构造格子"并排
@@ -2874,5 +3034,188 @@ if __name__ == "__main__":
     assert len(_tb_root.children) == 2, f"TBRoot 应有 2 个块，实际 {len(_tb_root.children)}"
     assert len(_tb3_root.children) == 3, f"TBRoot3 应有 3 个块，实际 {len(_tb3_root.children)}"
     print("    ✅ 挂载唯一性通过")
+    
+    # 8) 四轴设计：尺寸枚举与对齐枚举分离（批次 4.1）
+    print("  --- 四轴：SizeX / SizeY ---")
+    # 8.1 四个枚举的成员集合。对齐枚举**不新增成员**（wrap 不属于对齐轴）。
+    assert [m.name for m in SizeX] == ["FILL", "FIXED", "CONTENT"]
+    assert [m.name for m in SizeY] == ["FILL", "FIXED", "CONTENT"]
+    assert [m.name for m in AlignX] == ["LEFT", "CENTER", "RIGHT", "NONE"], \
+        "对齐轴不应新增成员 —— wrap 属于尺寸轴"
+    assert [m.name for m in AlignY] == ["TOP", "VCENTER", "BOTTOM", "NONE", "FLOW"], \
+        "对齐轴不应新增成员 —— wrap 属于尺寸轴"
+    print("    ✅ 枚举成员集合通过（对齐轴未污染）")
+    # 8.2 旧写法 -> 新枚举的推断映射（保持旧行为）
+    _map_cases = [
+        (dict(width=0,  wrap_width=False),  "size_x", "FILL"),
+        (dict(width=50, wrap_width=False),  "size_x", "FIXED"),
+        (dict(width=50, wrap_width=True),   "size_x", "CONTENT"),
+        (dict(width=0,  wrap_width=True),   "size_x", "CONTENT"),
+        (dict(height=0,  wrap_height=False), "size_y", "FILL"),
+        (dict(height=30, wrap_height=False), "size_y", "FIXED"),
+        (dict(height=30, wrap_height=True),  "size_y", "CONTENT"),
+        (dict(height=0,  wrap_height=True),  "size_y", "CONTENT"),
+    ]
+    for _i, (_kw, _attr, _exp) in enumerate(_map_cases):
+        _o = LayoutObject(name=f"AXIS_MAP_{_i}", **_kw)
+        assert getattr(_o, _attr).name == _exp, \
+            f"{_kw} -> {_attr} 应为 {_exp}，实际 {getattr(_o, _attr).name}"
+    print("    ✅ 旧写法→新枚举 推断映射通过（8 例）")
+    # 8.3 显式 size_* 优先于 wrap_*
+    _o = LayoutObject(name="AXIS_EXPLICIT", width=50, wrap_width=True, size_x=SizeX.FILL)
+    assert _o.size_x == SizeX.FILL, "显式 size_x 应优先于 wrap_width"
+    # 8.4 wrap_* 是派生属性，读写往返一致
+    _o = LayoutObject(name="AXIS_RT", width=0, height=0)
+    assert _o.wrap_width is False and _o.wrap_height is False
+    _o.wrap_width = True
+    assert _o.size_x == SizeX.CONTENT and _o.wrap_width is True
+    _o.wrap_width = False
+    assert _o.size_x == SizeX.FILL and _o.wrap_width is False, \
+        "关闭 wrap 后应按声明宽度退回 FILL/FIXED"
+    _o2 = LayoutObject(name="AXIS_RT2", width=40, height=20)
+    _o2.wrap_height = True
+    assert _o2.size_y == SizeY.CONTENT
+    _o2.wrap_height = False
+    assert _o2.size_y == SizeY.FIXED, "声明高 > 0 时应退回 FIXED"
+    print("    ✅ wrap_* 派生属性往返通过")
+    # 8.5 size_* setter 触发布局失效
+    _o = LayoutObject(name="AXIS_INVAL", width=10, height=10)
+    _o.get_effective_height()          # 先跑一次布局
+    assert _o._layout_valid is True
+    _o.size_y = SizeY.CONTENT
+    assert _o._layout_valid is False, "改 size_y 应使布局失效"
+    print("    ✅ size_* setter 失效通过")
+    # 8.6 类型校验
+    try:
+        LayoutObject(name="AXIS_BAD", size_y=SizeX.FILL)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("size_y 传入 SizeX 应抛 TypeError")
+    print("    ✅ 尺寸轴类型校验通过")
+    # 8.7 LayoutCycleError 是可捕获的专门类型
+    assert issubclass(LayoutCycleError, RuntimeError)
+    print("    ✅ LayoutCycleError 类型通过")
+    
+    # 9) 两趟遍历（批次 4.2）
+    print("  --- 两趟遍历 ---")
+    # 9.1 FIXED 不被父约束裁剪（"定死的尺寸不动"）
+    #     旧实现会 min(_width, avail_w)，把定死值改小；新实现不裁剪，装不下就是溢出。
+    _fx_root = LayoutObject(name="FX_Root", width=100, height=100)
+    _fx = LayoutObject(name="FX_Child", width=150, height=999,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _fx_root.add_child(_fx)
+    _fx_root.layout()
+    assert _fx.get_effective_width() == 150, \
+        f"FIXED 宽度不应被父可用宽 100 裁剪，实际 {_fx.get_effective_width()}"
+    assert _fx.get_effective_height() == 999, \
+        f"FIXED 高度不应被父可用高裁剪，实际 {_fx.get_effective_height()}"
+    print("    ✅ FIXED 不被父约束裁剪通过")
+    # 9.2 FILL 撑满父内容区
+    _fl_root = LayoutObject(name="FL_Root", width=100, height=100,
+                            padding=Padding.all(10))
+    _fl = LayoutObject(name="FL_Child", width=0, height=0,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _fl_root.add_child(_fl)
+    _fl_root.layout()
+    assert _fl.get_effective_width() == 80 and _fl.get_effective_height() == 80, \
+        f"FILL 应为父内容区 80x80，实际 {_fl.get_effective_width()}x{_fl.get_effective_height()}"
+    print("    ✅ FILL 撑满父内容区通过")
+    # 9.3 CONTENT 包围内容（这一批的核心能力，旧实现塌缩为 padding）
+    _ct_root = LayoutObject(name="CT_Root", width=200, height=300)
+    _ct = LayoutObject(name="CT_Box", width=0, height=0, size_y=SizeY.CONTENT,
+                       padding=Padding.all(5), align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _ct_root.add_child(_ct)
+    for _i, _h in enumerate((10, 20, 15)):
+        _ct.add_child(LayoutObject(name=f"CT_C{_i}", width=0, height=_h,
+                                   align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _ct_root.layout()
+    assert _ct.get_effective_height() == 55, \
+        f"CONTENT 高应为 (10+20+15) + padding(5+5) = 55，实际 {_ct.get_effective_height()}"
+    print("    ✅ CONTENT 包围内容通过（55 = 45 内容 + 10 padding）")
+    # 9.4 包围高与父高无关（这是 7.19 的根治验收）
+    _heights = []
+    for _ph in (100, 300, 800):
+        _r = LayoutObject(name=f"CT_Root_{_ph}", width=200, height=_ph)
+        _b = LayoutObject(name=f"CT_Box_{_ph}", width=0, height=0, size_y=SizeY.CONTENT,
+                          padding=Padding.all(5), align_x=AlignX.NONE, align_y=AlignY.NONE)
+        _r.add_child(_b)
+        for _i, _h in enumerate((10, 20, 15)):
+            _b.add_child(LayoutObject(name=f"CT_{_ph}_C{_i}", width=0, height=_h,
+                                      align_x=AlignX.NONE, align_y=AlignY.NONE))
+        _r.layout()
+        _heights.append(_b.get_effective_height())
+    assert len(set(_heights)) == 1, \
+        f"包围高应与父高无关，实际随父高变化：{_heights}"
+    print(f"    ✅ 包围高与父高无关通过（父高 100/300/800 下均为 {_heights[0]}）")
+    # 9.5 CONTENT 对约束夹紧 + 溢出标记
+    _cl_root = LayoutObject(name="CL_Root", width=200, height=30)
+    _cl = LayoutObject(name="CL_Box", width=0, height=0, size_y=SizeY.CONTENT,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _cl_root.add_child(_cl)
+    _cl.add_child(LayoutObject(name="CL_C", width=0, height=100,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _cl_root.layout()
+    assert _cl.get_effective_height() == 30, \
+        f"CONTENT 应被约束夹紧到 30，实际 {_cl.get_effective_height()}"
+    assert _cl._content_overflows is True, "内容超出约束时应置 _content_overflows"
+    print("    ✅ CONTENT 夹紧与溢出标记通过")
+    # 9.6 结构性冲突：CONTENT 父 + 直接 FILL 子 → LayoutError_CONTENT_FILL
+    _cf_root = LayoutObject(name="CF_Root", width=200, height=200)
+    _cf = LayoutObject(name="CF_Box", width=0, height=0, size_y=SizeY.CONTENT,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _cf_root.add_child(_cf)
+    _cf.add_child(LayoutObject(name="CF_Bad", width=0, height=0, size_y=SizeY.FILL,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    try:
+        _cf_root.layout()
+    except LayoutError_CONTENT_FILL as _e:
+        assert "CF_Box" in str(_e) and "CF_Bad" in str(_e), "报错信息应含父与冲突子元素名"
+        assert "修法" in str(_e), "报错信息应给出修法"
+    else:
+        raise AssertionError("CONTENT 父 + 直接 FILL 子 应抛 LayoutError_CONTENT_FILL")
+    print("    ✅ 尺寸循环报错通过（含父/子元素名与修法）")
+    # 9.7 结构循环：元素成为自己的祖先
+    _cy_a = LayoutObject(name="CY_A", width=50, height=50)
+    _cy_b = LayoutObject(name="CY_B", width=50, height=50)
+    _cy_a.add_child(_cy_b)
+    _cy_b.children.append(_cy_a)      # 人为接成环
+    try:
+        _cy_a.layout()
+    except LayoutCycleError as _e:
+        assert "CY_A" in str(_e) and "CY_B" in str(_e), "报错信息应含整条路径"
+    else:
+        raise AssertionError("结构循环应抛 LayoutCycleError")
+    print("    ✅ 结构循环报错通过（含路径）")
+    # 9.8 失效传导：add_child / height / size_y 之后重算必须拿到新值
+    _iv_root = LayoutObject(name="IV_Root", width=200, height=300)
+    _iv = LayoutObject(name="IV_Box", width=0, height=0, size_y=SizeY.CONTENT,
+                       align_x=AlignX.NONE, align_y=AlignY.NONE)
+    _iv_root.add_child(_iv)
+    _iv.add_child(LayoutObject(name="IV_C0", width=0, height=10,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _iv_root.layout()
+    _h0 = _iv.get_effective_height()
+    _iv.add_child(LayoutObject(name="IV_C1", width=0, height=25,
+                               align_x=AlignX.NONE, align_y=AlignY.NONE))
+    _h1 = _iv.get_effective_height()
+    assert _h1 == _h0 + 25, f"加子元素后包围高应从 {_h0} 增到 {_h0+25}，实际 {_h1}"
+    _iv.children[0].height = 40
+    _h2 = _iv.get_effective_height()
+    assert _h2 == _h1 + 30, f"改子元素高后包围高应变为 {_h1+30}，实际 {_h2}"
+    _iv_root.remove_child(_iv)
+    print("    ✅ 失效传导通过（加子/改子元素后包围高正确重算）")
+    # 9.9 FLOW 溢出裁剪仍在（既有语义保留）
+    _fz_root = LayoutObject(name="FZ_Root", width=100, height=50)
+    _fz_root.add_child(LayoutObject(name="FZ_A", width=0, height=40,
+                                    align_x=AlignX.NONE, align_y=AlignY.FLOW))
+    _fz_b = LayoutObject(name="FZ_B", width=0, height=30, size_y=SizeY.FIXED,
+                         align_x=AlignX.NONE, align_y=AlignY.FLOW)
+    _fz_root.add_child(_fz_b)
+    _fz_root.layout()
+    assert _fz_b._flow_clipped is True, "超出父内容区的 FLOW 元素应被裁剪"
+    assert _fz_b.get_effective_height() == 10, \
+        f"应裁剪到剩余 10，实际 {_fz_b.get_effective_height()}"
+    print("    ✅ FLOW 溢出裁剪通过")
     
     print("\n✅ 回归契约断言全部通过")

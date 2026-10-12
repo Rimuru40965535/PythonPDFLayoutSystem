@@ -6,8 +6,9 @@
 > **已完成批次**：基础设施（`.gitignore` + 字体说明 + `.pyproj` 入口）、
 > 批次 0（修 7.1 / 7.15 / 7.17 / 7.18）、批次 1（抽 `create_spacer`，8.2）、
 > 批次 2（抽 `create_band`，修 7.3 / 7.4，8.1）、
-> 批次 3（`Style` 下沉 + `from_style` + `create_text_block`，8.3 / 8.4）。
-> 批次 4 承载"矩形包围内容"，前置分析见 8.11；批次 6（分页）暂缓。
+> 批次 3（`Style` 下沉 + `from_style` + `create_text_block`，8.3 / 8.4）、
+> **批次 4.1（四轴：新增 `SizeX` / `SizeY` / `LayoutCycleError`，无损）**。
+> 批次 4 其余步骤进行中；批次 6（分页）暂缓。
 >
 > ⚠️ **中层与顶层文件不在 `master` 上**（`ResumeTemplate.py` / `ResumeCore.py` 属功能分支）。
 > 因此有一部分改动**无法在 `master` 完成**，集中记录在 `SKILLS.md` 的
@@ -203,26 +204,87 @@ LayoutEngine.py
 
 ### 3.1 枚举、颜色、边距
 
-#### `class AlignX(Enum)`
-水平对齐。成员：`LEFT="left"`、`CENTER="center"`、`RIGHT="right"`、`NONE="none"`。
+#### 【四轴设计】批次 4 引入
 
-| 值 | `get_absolute_x()` 行为 |
+每个元素在两条轴上各有两种**独立**属性，共四轴：
+
+| 轴 | 尺寸（元素自身多大） | 位置（元素落在父内容区的哪里） |
+| --- | --- | --- |
+| 水平 | `SizeX` | `AlignX` |
+| 垂直 | `SizeY` | `AlignY` |
+
+**两轴严格分离**：尺寸枚举只决定"多大"，对齐枚举只决定"在哪"。
+因此 `CONTENT`（内容定尺寸）与 `FLOW`（流式接续定位）可以**同时**成立 ——
+一个高度由内容决定的元素，位置依然可以接在前一个 `FLOW` 兄弟下方。
+这正是批次 5「文本按实际行数定高」所需要的形态。
+
+> 旧实现把两轴混在一起：`wrap_width` / `wrap_height` 两个布尔量管尺寸，
+> 而 `get_effective_height()` 里又混进了 `align_y == FLOW` 的位置判断 —— 那正是 7.19 的温床。
+
+#### `class SizeX(Enum)` / `class SizeY(Enum)` —— 批次 4.1 新增
+
+两个枚举成员相同，各自管一条轴的尺寸：
+
+| 值 | 含义 |
+| --- | --- |
+| `FILL` | 撑满父元素内容区 |
+| `FIXED` | 使用代码中写死的 `width` / `height`，**不另行计算、不被裁剪** |
+| `CONTENT` | 由内容圈定（`SizeX` 取子元素最大宽 + 左右 padding；`SizeY` 取子元素高之和 + 上下 padding），再对传入约束夹紧 |
+
+**旧写法 → 新枚举的推断映射**（构造时自动完成，保持旧行为）：
+
+| 旧写法 | 新枚举 |
+| --- | --- |
+| `wrap_width=True` | `SizeX.CONTENT` |
+| `wrap_width=False` + `width > 0` | `SizeX.FIXED` |
+| `wrap_width=False` + `width <= 0` | `SizeX.FILL` |
+| `wrap_height=True` | `SizeY.CONTENT` |
+| `wrap_height=False` + `height > 0` | `SizeY.FIXED` |
+| `wrap_height=False` + `height <= 0` | `SizeY.FILL` |
+
+构造参数解析优先级：**显式 `size_x` / `size_y` > `wrap_*` 布尔量 > 由 `width` / `height` 推断**。
+显式给 `size_*` 的同时又给 `wrap_*`，会打印一条警告并以 `size_*` 为准。
+
+`wrap_width` / `wrap_height` 现已改为**派生 property**（读写 `size_x` / `size_y`），
+**不再是独立真相**。写 `False` 时按声明尺寸退回 `FIXED` / `FILL`。
+
+> ⚠️ **`width == 0` 不再等价于 `FILL`**（迁移后 `width` 是纯数值，`FILL` 是显式枚举值）。
+> 旧实现里 `_width == 0` 一个值承担了两种含义（"没给"和"要撑满"），
+> 这正是 7.21（`wrap_width` 不可用）的根源。
+
+#### `class LayoutCycleError(RuntimeError)` —— 批次 4.1 新增
+
+布局循环依赖错误的专门类型（旧代码用的是裸 `RuntimeError`，测试无法区分错误种类）。两种情形：
+
+1. **结构循环**：元素成为自己的祖先（对象树被接成了环）。
+2. **尺寸循环**：`SizeY`（或 `SizeX`）为 `CONTENT` 的父元素，**直接子元素**却是 `FILL` ——
+   父的尺寸由内容决定，而子元素的尺寸又要填满父的内容区，两者互为前提。
+
+情形 2 是**结构性**矛盾，与可用空间数值无关，因此在遍历的进入方向即可判定并报错。
+
+#### `class AlignX(Enum)`
+水平对齐（只决定位置）。成员：`LEFT="left"`、`CENTER="center"`、`RIGHT="right"`、`NONE="none"`。
+
+| 值 | 落点 |
 | --- | --- |
 | `LEFT` | 贴父内容区左边界 |
 | `CENTER` | 在父内容区水平居中 |
 | `RIGHT` | 贴父内容区右边界 |
-| `NONE` | `父内容区左边界 + _x` |
+| `NONE` | `父内容区左边界 + x` |
 
 #### `class AlignY(Enum)`
-垂直对齐。成员：`TOP="top"`、`VCENTER="vcenter"`、`BOTTOM="bottom"`、`NONE="none"`、`FLOW="flow"`。
+垂直对齐（只决定位置）。成员：`TOP="top"`、`VCENTER="vcenter"`、`BOTTOM="bottom"`、`NONE="none"`、`FLOW="flow"`。
 
-| 值 | `get_absolute_y()` 行为 |
+| 值 | 落点 |
 | --- | --- |
 | `TOP` | 贴父内容区上边界 |
 | `VCENTER` | 在父内容区垂直居中 |
 | `BOTTOM` | 贴父内容区下边界 |
-| `NONE` | `父内容区上边界 + _y` |
-| `FLOW` | 紧贴前一个 FLOW 兄弟的底边；无前驱则贴父内容区上边界 |
+| `NONE` | `父内容区上边界 + y` |
+| `FLOW` | 紧贴前一个 `FLOW` 兄弟的底边；无前驱则贴父内容区上边界 |
+
+> ✅ **批次 4.1 起，`AlignX` / `AlignY` 不新增成员** —— `wrap` 属于尺寸轴，不属于对齐轴。
+> 测试入口有断言固化这一点（防止后来又把它塞回对齐枚举）。
 
 #### `class Color`
 ```python
@@ -752,6 +814,98 @@ create_text_block(
 测试入口已把该现状固化为断言。
 
 `padding=None` 表示沿用 `style.padding`（与 `from_style` 一致）；给值则覆盖。
+
+### 3.4b 两趟遍历（批次 4.2，几何核心）
+
+**这是引擎尺寸与位置计算的唯一机制。** 旧实现（惰性求值 + 父子互相递归）已被整体替换。
+
+#### 为什么是两趟
+
+旧实现的尺寸计算是「子元素在测量阶段回头问父元素」，而父的尺寸正要靠子元素算出来 ——
+**自指**。于是 `wrap_height=True` 只能塌缩成 padding（缺陷 7.19）。
+
+新实现把两个量**分开传播**：
+
+| 趟 | 方向 | 传什么 | 定下什么 |
+| --- | --- | --- | --- |
+| **趟 1 `_measure`** | 进入（背离根） | `constraint`（父内容区尺寸） | `FIXED` / `FILL` 的尺寸 |
+| **趟 1 `_measure`** | 退出（朝向根） | `size`（已算出的尺寸） | `CONTENT` 的尺寸 |
+| **趟 2 `_place`** | 进入 | 只读 `AlignX` / `AlignY` | 绝对坐标 |
+
+**关键不变式**：尺寸阶段只把 `constraint` 往下传、只把 `size` 往回收；
+位置阶段只读已经定好的 `size`。子元素的约束是**作为参数拿到**的，不再回头问父容器 ——
+那条造成循环的回边根本不存在。
+
+#### 公开接口
+
+```python
+layout(pdf=None, force=False) -> 'LayoutObject'
+```
+
+从自身开始跑两趟。根节点没有父容器，其约束就是自己声明的尺寸。
+`pdf` 可选：纯几何的 `CONTENT`（矩形、嵌套容器）不需要它；
+文本 / 图片的 `CONTENT` 需要它才能精确测量，不传时退回估算。
+
+`get_effective_width/height()` 与 `get_absolute_x/y()` 现在是**纯读取**：
+若布局尚未算好会触发一次 `layout()`，然后返回结果。它们不再边算边问，因此不存在自指。
+
+#### 轴约束的传递规则
+
+| 父的 `Size` | 传给子元素的约束 |
+| --- | --- |
+| `FIXED` | `父尺寸 − 父 padding` |
+| `FILL` | `父尺寸 − 父 padding` |
+| **`CONTENT`** | **父的 constraint 原样下传** |
+
+`CONTENT` 那一行是消除循环的关键：padding 是「容器内留白」，
+若先扣 padding 再把余量给子元素，就要求"父尺寸必须先定"，循环立刻回来。
+原样下传则子元素的约束与本父的最终尺寸**无关**。
+
+#### 内容固有尺寸的钩子
+
+`_source_w(pdf)` / `_source_h(pdf)` —— 子类覆盖它来表达"我的内容有多大"：
+
+| 类 | 覆盖情况 |
+| --- | --- |
+| `LayoutObject` | 子元素尺寸之和 / 最大值 + padding |
+| `TextObject` | 叶子时按字号与估算行数；有子元素时退回基类 |
+| `ImageObject` | 叶子时按图片宽高比（优先用外部 `pdf`，其次 Pillow） |
+
+**批次 5 只需改这两个方法的文本实现**（换成真实行数测量），其余不动。
+
+#### 两条报错
+
+```python
+class LayoutCycleError(RuntimeError)          # 基类
+class LayoutError_CONTENT_FILL(LayoutCycleError)   # CONTENT 父 + 直接 FILL 子
+```
+
+| 错误 | 触发时机 | 信息 |
+| --- | --- | --- |
+| **结构循环** | 进入时发现元素已在祖先路径中 | 完整路径（`A > B > A`） |
+| **CONTENT/FILL 冲突** | 进入 `CONTENT` 元素时扫描直接子元素 | 父名 + 尺寸方式、冲突子元素名、**两条修法**、路径 |
+
+两者都是**结构性**矛盾，与约束的数值大小无关，因此在进入方向即可判定。
+
+> 为什么不给 `FILL` 子 + `CONTENT` 父定义一条"隐式语义"（如安卓把 `match_parent` 退化成
+> `wrap_content`）？因为那只是用一个隐式规则掩盖循环，会让"为什么这个元素尺寸不对"
+> 变得无从追查。显式报错既定位了问题，又把决策权留给调用方。
+
+#### 行为变化（相对旧实现）
+
+| 变化 | 说明 |
+| --- | --- |
+| **`FIXED` 不再被父约束裁剪** | 旧实现 `min(_width, avail_w)`；新实现按「定死的尺寸不动」原则不裁剪。装不下是**溢出**问题 |
+| **FLOW 溢出裁剪移到趟 2** | 它属于"溢出策略"，不属于尺寸计算。旧实现把它混在尺寸函数里，是 7.19 的温床 |
+| **`width` / `height` 成为公开尺寸声明** | 赋正值会把尺寸方式同步为 `FIXED`，赋 0 退回 `FILL`。**直接写 `_width` / `_height` 会绕过尺寸方式解析**（见下） |
+| `get_parent_available_area()` 退化为纯查询 | 尺寸计算不再需要它；保留为兼容入口 |
+| `wrap_content()` / `wrap_content_width()` | **已删除**。语义由 `layout()` 完全取代 |
+| `_calculate_wrap_height()` | 已从布局计算中移除；子类保留同名兼容方法，委托给 `_source_h()` |
+
+> ⚠️ **迁移注意**：`obj._height = N` 这种"先构造、后设尺寸"的旧写法会**失效** ——
+> 构造时若 `height=0`，尺寸方式被推成 `FILL`，之后直接写 `_height` 不会改回 `FIXED`，
+> `FILL` 会覆盖它。请改用 `obj.height = N`（公开属性会同步尺寸方式）。
+> 批次 4.2 已把 `ResumeTemplate.py` 里 4 处这类写法改为公开属性。
 
 ### 3.5 图层与注册表
 
@@ -1442,7 +1596,7 @@ Resume(
 - **注意**：这与 7.17（重复挂载）是**两个独立缺陷**，恰好都在同一段循环里，但成因与影响量不同
   （7.17 多占一整块内容的高度约 18mm，7.18 多占 5mm 间距）。
 
-### 7.19 `wrap_height=True` 使高度塌缩为 padding（父子高度自指）— 待批次 4 修
+### 7.19 `wrap_height=True` 使高度塌缩为 padding（父子高度自指）— ✅ 批次 4.2 已修
 
 - **位置**：`LayoutEngine.py` 的 `get_parent_available_area()`（约 676-692 行）
   与 `get_effective_height()`（约 798-846 行）的交互
@@ -1481,7 +1635,7 @@ Resume(
   而不是直接父；或者对子元素在父高待求时不做父高裁剪。
   两种方向都需要先明确 `wrap_content()` 的方向性（自底向上 vs 自顶向下），见 8.11。
 
-### 7.20 `invalidate_wrap_cache` 后 `_height` 不复位，wrap 结果永久卡死 — 待批次 4 修
+### 7.20 `invalidate_wrap_cache` 后 `_height` 不复位，wrap 结果永久卡死 — ✅ 批次 4.2 已修
 
 - **位置**：`invalidate_wrap_cache()`（约 572-579 行）与
   `_calculate_wrap_height()` 开头的 `if self._height > 0: return self._height`（约 459-462 行）
@@ -1497,10 +1651,19 @@ Resume(
 - **根因**：`invalidate_wrap_cache()` 清的是 `_wrap_cache_valid` / `_height_set_by_wrap`，
   但**不动 `_height`**。而 `_calculate_wrap_height()` 开头就把 `_height > 0` 当作
   "用户显式指定的高度"直接返回。第一次写进 `_height` 的 wrap 结果因此永久生效。
-  目前只能手工把 `_height` 归零才能重新计算。
+  当时只能手工把 `_height` 归零才能重新计算。
+
+- **修复（批次 4.2）**：整个惰性缓存机制被两趟遍历取代。
+  尺寸不再"算一次写进 `_height` 再复用"，而是每次 `layout()` 从根整体重算。
+  失效只剩一个布尔标记 `_layout_valid`，`invalidate_geom_cache()` 与
+  `invalidate_wrap_cache()` 现在等价（后者保留为兼容入口）。
+  `_wrap_cache_valid` / `_height_set_by_wrap` / `_cached_wrap_height` / `_is_wrapping`
+  等字段已全部删除。
+- **验收**：测试入口 9.8 断言 —— 加子元素后包围高从 `h` 增到 `h+25`；
+  再改某子元素高度后变为 `h+55`；每步都拿到新值。
 - **影响**：直接打击"矩形包围内容"的核心用法 —— 动态增删内容时矩形必须跟着变。
 - **与 7.19 的关系**：7.19 决定"第一次算就算不对"，7.20 决定"算错之后再也算不回来"。
-  两者叠加使 `wrap_content` 实际上不可用，必须同批修复（批次 4）。
+  两者叠加使 `wrap_content` 实际上不可用，因此同批修复。
 
 ### 7.21 `wrap_width` 完全不可用 — 待批次 4b 修
 

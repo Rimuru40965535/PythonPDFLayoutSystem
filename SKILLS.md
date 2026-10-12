@@ -50,3 +50,45 @@
 - 缓存失效不需要调用方操心：任何尺寸/位置/对齐的改动都自动触发失效，重算拿得到新值。
 - 引擎自检覆盖上述能力：LayoutEngine.py 自己的测试入口能断言这些行为，不依赖 ResumeCore.py。
 
+
+## 只在功能分支处理的事项
+
+底层（`master` 上的 `LayoutEngine.py` 及其文档）已经稳定，但**中层与顶层文件不在 `master` 上**
+（`ResumeTemplate.py`、`ResumeCore.py` 属于功能分支）。因此有一类改动**无法在 `master` 完成**，
+必须等签出功能分支后再做。此处集中记录，以免遗忘。
+
+记录格式：来源批次 → 事项 → 为什么不能在 master 做。
+
+### 来自批次 3（Style 下沉）
+
+- **`ResumeTemplate.py` 删除本地的 `class Style`**（约 48–115 行），改为
+  `from LayoutEngine import Style`。方案 A：单一来源，不留别名。
+    原因：该文件不在 `master` 上。
+- **`ResumeCore.py` 的导入块**（约 65–78 行）把 `Style` 改从 `LayoutEngine` 取，
+  不再经 `ResumeTemplate` 转手。
+- **`ResumeTemplate.py` 中约 25 处 `TextObject(...)` 手抄参数的调用**
+  改用 `TextObject.from_style(...)`；`ImageObject(...)` 同理。
+    原因：调用点在功能分支。
+- **`ResumeTemplate.py` 中两处硬编码 `height=50`** 改为经 `create_text_block` 的
+  显式 `height` 参数传入。**迁移时必须显式传 50**，不能依赖新默认值 `0`，
+  否则产物会变（`height=0` 的语义是"取父可用高"，见技术文档 3.5）。
+- **`ResumeCore.py` 的技能/证书/荣誉三段**（约 200 行）用 `create_text_block` 收敛，
+  并顺带处理其中 `TextObject(parent=root)` 父指针错挂、`align_y` 不一致等既有问题。
+- **`ResumeCore.py` 的 `Generate()` print 与 `main()` print 的差异**：
+  `Generate` 用 `print(f"   >>>✅ ...")`（带缩进与颜文字），`main` 用 `print(f"  生成成功: ...")`。
+  合并时统一为一处。
+
+### 来自批次 4（几何属性与包围内容）
+
+- **上层对 `_height` / `_x` / `_width` 的直接改写**（如 `ResumeCore.py` 的
+  `content_obj._height = ...`、`ResumeTemplate.py` 直接改 `_x/_width/align_*`）
+  改为走新的 `set_size` / `set_position` / `set_align` 接口。
+    原因：这些写点全在中层/顶层。
+
+### 通用
+
+- **`Resources/` 的图标与照片**：`ResumeCore.py` / `ResumeTemplate.py` 引用的
+  11 个图片文件尚未入库。它们只在中层/顶层使用，与底层无关。
+- **`.pyproj` 的编译项**：目前只 `Include` 了 `LayoutEngine.py`。
+  功能分支加入 `ResumeTemplate.py` / `ResumeCore.py` 时需一并补上。
+

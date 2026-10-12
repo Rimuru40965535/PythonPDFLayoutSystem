@@ -251,7 +251,53 @@ social_media.png  contact_address.png  website.png
   4b（修 `wrap_width`）；包围自动换行的长文本依赖批次 5 的真实行数测量。
 - 技术文档新增 8.11 节完整记录该分析。
 
+#### **批次 3：`Style` 下沉与内容构件**
 
+- **`Style` 移入 `LayoutEngine.py`**（放在 `Padding` 之后，与 `Color`/`Padding`
+  同属底层纯数据构件）。它原先住在 `ResumeTemplate.py`，属分层违规 ——
+  样式与"简历"无关，而"样式 → 渲染参数"的翻译本来就是引擎职责。
+  **迁移是纯搬运**：字段名、顺序、默认值逐项一致，测试入口有字段快照断言固化这一点。
+  连 `padding` 的可变默认参数（缺陷 7.10）也**原样保留**，以维持"输出不变"的验收前提，
+  修正归入批次 4。
+- **新增 `TextObject.from_style` / `ImageObject.from_style`**：把
+  `font_name / font_size / bold+italic → font_style / color → text_color /
+  fill_color → color / padding` 这套翻译集中一处，
+  避免调用点反复手抄 7 个参数。`**overrides` 优先级高于 `style`；`style=None` 用全默认值。
+  `RectangleObject.from_style` **刻意不做**（只映射一个字段，负收益）。
+- **新增 `create_text_block`**：`height` 成为**显式参数**，引擎里不再有硬编码 `50`
+  （缺陷 7.8 的成因消除）。
+  注意 **`height=0` 的语义是"取父可用高"，不是"按内容自动撑高"** ——
+  后者要等批次 5 的真实行数测量。
+
+**关于 `Style` 同名冲突**
+
+`master` 的 `LayoutEngine.py` 与功能分支的 `ResumeTemplate.py` 各有一个 `Style`。
+它们不会在同一工作树里被同时导入（`ResumeTemplate.py` 不在 `master` 上），
+因此不是运行时冲突，而是合并时的语义问题。**按方案 A 处理**：
+`ResumeTemplate.py` 将来删掉本地 `Style`，改为 `from LayoutEngine import Style`，
+单一来源、不留别名。中层顶层的迁移**留到功能分支再处理**。
+
+**新增：`SKILLS.md` 的「只在功能分支处理的事项」**
+
+有一类改动**无法在 `master` 完成**（目标文件不在 `master` 上）。新增一节集中记录，
+格式为「来源批次 → 事项 → 为什么不能在 master 做」。当前已记录：
+
+- 来自批次 3：删本地 `Style`、改导入、约 25 处调用换 `from_style`、
+  两处 `height=50` 改为显式传参（**必须传 50**）、`ResumeCore` 技能三段收敛。
+- 来自批次 4：上层对 `_height` / `_x` / `_width` 的直接改写改为走新接口。
+- 通用：`Resources/` 的图标照片入库、`.pyproj` 补编译项。
+
+**测试**
+
+- 引擎测试入口新增 13 项断言：`Style` 字段快照、`get_font_style` 四种组合、
+  两个 `from_style` 的字段映射、`overrides` 优先级、`style=None`、
+  链式调用、`create_text_block` 的 `height=0` / 显式 `height` / 参数透传 /
+  `padding=None` 沿用样式 / 挂载唯一性。
+- 排查中发现并固化了一条引擎既有语义：**同一流式父容器里，一个 `height=0` 的块
+  会占满全部可用高，把后随的 `FLOW` 兄弟挤成 0 高**（并置 `_flow_clipped`）。
+  这不是 `create_text_block` 的问题，但用 `height=0` 时必须意识到。
+- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**
+  （批次 3 是"只增不改"，没有修改任何既有函数体，因此这是它唯一需要的验收手段）。
 
 ---
 

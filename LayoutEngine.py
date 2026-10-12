@@ -908,11 +908,17 @@ class LayoutObject:
     def render_debug(self, pdf, is_fill: bool = False, has_border: bool = True,
                  show_name: bool = True, show_bounds: bool = True,
                  name_offset_y: float = 2, bounds_offset_y: float = 6):
-        """调试渲染：绘制矩形边框、填充颜色、显示对象名称和尺寸"""
+        """
+        调试渲染：绘制矩形边框、填充颜色、显示对象名称和尺寸
+
+        Returns:
+            float | None: 最后渲染到的 y 坐标（语义与 render() 一致）。
+                pdf 为 None、或有效尺寸非正时返回 None。
+        """
         print(f"  >>> 正在渲染PDF文件。现在渲染LayoutObject节点：{self.name}")
 
         if pdf is None:
-            return
+            return None
     
         if len(pdf.pages) == 0:
             pdf.add_page()
@@ -923,8 +929,9 @@ class LayoutObject:
         eff_h = self.get_effective_height()
     
         if eff_w <= 0 or eff_h <= 0:
-            return
-    
+            return None
+
+        last_y = abs_y
         auto_page_break = pdf.auto_page_break
         pdf.set_auto_page_break(auto=False)
     
@@ -983,12 +990,16 @@ class LayoutObject:
                         pdf.cell(eff_w - 4, 3, display_name, align='C')
         
             for child in self.children:
-                child.render_debug(pdf, is_fill, has_border, show_name, show_bounds,
+                child_y = child.render_debug(pdf, is_fill, has_border, show_name, show_bounds,
                                  name_offset_y, bounds_offset_y)
+                if child_y is not None:
+                    last_y = child_y
     
         finally:
             pdf.set_auto_page_break(auto=auto_page_break)
-            print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
+        
+        print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
+        return last_y
 
     def _get_display_name(self) -> str:
         name = self.name
@@ -1226,11 +1237,16 @@ class TextObject(LayoutObject):
     def render_debug(self, pdf, is_fill: bool = False, has_border: bool = True,
                  show_name: bool = True, show_bounds: bool = True,
                  name_offset_y: float = 2, bounds_offset_y: float = 6):
-        """调试渲染，名称后追加 ':text'"""
+        """调试渲染，名称后追加 ':text'
+
+        Returns:
+            float | None: 最后渲染到的 y 坐标（语义与 TextObject.render() 一致）。
+                pdf 为 None 时返回 None。
+        """
         print(f"  >>> 正在渲染PDF文件。现在渲染TextObject节点：{self.name}")
 
         if pdf is None:
-            return
+            return None
     
         super().render_debug(pdf, is_fill, has_border, False, show_bounds,
                             name_offset_y, bounds_offset_y)
@@ -1290,11 +1306,15 @@ class TextObject(LayoutObject):
                             display_name = display_name[:10] + "..:text"
                         pdf.cell(eff_w - 4, 3, display_name, align='C')
 
+        last_y = self.get_absolute_y()
         for child in self.children:
-            child.render_debug(pdf, is_fill, has_border, show_name, show_bounds,
+            child_y = child.render_debug(pdf, is_fill, has_border, show_name, show_bounds,
                                  name_offset_y, bounds_offset_y)
+            if child_y is not None:
+                last_y = child_y
         
         print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
+        return last_y
 
 
 class ImageObject(LayoutObject):
@@ -1502,20 +1522,27 @@ class ImageObject(LayoutObject):
     def render_debug(self, pdf, is_fill: bool = False, has_border: bool = True,
                  show_name: bool = True, show_bounds: bool = True,
                  name_offset_y: float = 2, bounds_offset_y: float = 6):
-        """调试渲染，名称后追加 ':image'"""
+        """调试渲染，名称后追加 ':image'
+
+        Returns:
+            Tuple[float, float] | None: 与 ImageObject.render() 一致，返回
+                (渲染宽, 渲染高)。pdf 为 None 时返回 None。
+        """
         print(f"  >>> 正在渲染PDF文件。现在渲染ImageObject节点：{self.name}")
         
         if pdf is None:
-            return
+            return None
     
         super().render_debug(pdf, is_fill, has_border, False, show_bounds,
                         name_offset_y, bounds_offset_y)
     
+        # 尺寸在此处取好：返回值需要它，且不能只在 if show_name 分支内赋值
+        eff_w = self.get_effective_width()
+        eff_h = self.get_effective_height()
+
         if show_name:
             abs_x = self.get_absolute_x()
             abs_y = self.get_absolute_y()
-            eff_w = self.get_effective_width()
-            eff_h = self.get_effective_height()
         
             if eff_w > 0 and eff_h > 6:
                 pdf.set_text_color(0, 0, 0)
@@ -1571,6 +1598,8 @@ class ImageObject(LayoutObject):
                                  name_offset_y, bounds_offset_y)
                 
         print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
+        # 与 ImageObject.render() 一致：返回渲染尺寸，不受子元素影响
+        return (eff_w, eff_h)
 
 
 class RectangleObject(LayoutObject):
@@ -1674,20 +1703,27 @@ class RectangleObject(LayoutObject):
     def render_debug(self, pdf, is_fill: bool = False, has_border: bool = True,
                  show_name: bool = True, show_bounds: bool = True,
                  name_offset_y: float = 2, bounds_offset_y: float = 6):
-        """调试渲染，名称后追加 ':rect'"""
+        """调试渲染，名称后追加 ':rect'
+
+        Returns:
+            Tuple[float, float] | None: 与 RectangleObject.render() 一致，返回
+                (有效宽, 有效高)。pdf 为 None 时返回 None。
+        """
         print(f"  >>> 正在渲染PDF文件。现在渲染RectangleObject节点：{self.name}")
 
         if pdf is None:
-            return
+            return None
     
         super().render_debug(pdf, is_fill, has_border, False, show_bounds,
                         name_offset_y, bounds_offset_y)
     
+        # 尺寸在此处取好：返回值需要它，且不能只在 if show_name 分支内赋值
+        eff_w = self.get_effective_width()
+        eff_h = self.get_effective_height()
+
         if show_name:
             abs_x = self.get_absolute_x()
             abs_y = self.get_absolute_y()
-            eff_w = self.get_effective_width()
-            eff_h = self.get_effective_height()
         
             if eff_w > 0 and eff_h > 6:
                 pdf.set_text_color(0, 0, 0)
@@ -1743,11 +1779,232 @@ class RectangleObject(LayoutObject):
                                  name_offset_y, bounds_offset_y)
                 
         print(f"  >>> 正在渲染PDF文件。节点渲染完成：{self.name}")
+        # 与 RectangleObject.render() 一致：返回自身的有效尺寸
+        return (eff_w, eff_h)
 
 
 # ============================================================================
-# 10. 分栏功能
+# 10. 分栏 / 横向带
 # ============================================================================
+
+def create_band(
+    parent: LayoutObject,
+    cells: List[Union[float, LayoutObject]],
+    gap: float = 0,
+    padding: Optional[Union[Padding, float]] = None,
+    height: float = 0,
+    names: Optional[List[str]] = None,
+    colors: Optional[List[Color]] = None,
+    layer: int = 0,
+    container_name: Optional[str] = None,
+) -> LayoutObject:
+    """
+    横向带构件 —— 把若干个"格子"并排放在一个流式行里
+
+    这是本引擎横向布局的基础构件。`create_columns` 与 `split_column_advanced`
+    都是它的包装。
+
+    cells 的两种元素形式：
+        - float  -> 视为比例权重，在带内新建一个空 LayoutObject 作为格子
+        - LayoutObject -> 直接复用该对象作为格子
+
+    宽度分配（严格按比例，不做任何"剩余空间均分"）：
+        可用宽 = 父内容区宽 - gap * (n - 1)
+        比例权重 cell -> 可用宽 * (w / sum(权重))
+        已构造对象   -> 保留其自身 _width，由 gap 与前面的格子决定 x
+
+    坐标系：
+        带容器放在父内容区原点，尺寸 = (父内容区宽, height)。
+        格子 x 依次累加，相邻格子之间留 gap；格子 height 统一为 height。
+
+    Args:
+        parent: 父容器。带容器会通过 add_child 挂载到它下面
+        cells: 格子列表，元素为比例权重 (float) 或已构造对象 (LayoutObject)
+        gap: 相邻格子之间的横向间距 (mm)
+        padding: 带容器自身的内边距，默认 Padding()
+        height: 格子与带容器的高度 (mm)。0 表示取父内容区高
+        names: 新建格子的名字，长度须等于 cells 长度
+        colors: 新建格子的颜色，长度须等于 cells 长度，默认 Gray
+        layer: 图层索引
+        container_name: 带容器的名字，默认 "{parent.name}_band"
+
+    Returns:
+        LayoutObject: **新建的带容器**（注意：不是传入的 parent）
+
+    Raises:
+        ValueError: cells 为空；高度或可用宽度非正；names/colors 长度不匹配
+
+    Example:
+        >>> # 左栏固定 6mm 图标，右栏占满剩余
+        >>> create_band(cell, [BandCell...])          # 见 split_column_advanced
+        >>> # 三栏按 2:1:2 比例
+        >>> create_band(row, [2.0, 1.0, 2.0], gap=0, height=10)
+    """
+    if not cells:
+        raise ValueError("create_band: cells 不能为空")
+
+    n = len(cells)
+
+    if names is not None and len(names) != n:
+        raise ValueError(f"create_band: names 长度必须等于 cells 长度 ({n})")
+    if colors is not None and len(colors) != n:
+        raise ValueError(f"create_band: colors 长度必须等于 cells 长度 ({n})")
+
+    cell_names = names if names is not None else [f"{parent.name}_band_{i}" for i in range(n)]
+    cell_colors = colors if colors is not None else [Gray] * n
+
+    if padding is None:
+        band_padding = Padding()
+    elif isinstance(padding, (int, float)):
+        band_padding = Padding.all(float(padding))
+    else:
+        band_padding = padding
+
+    _, _, content_w, content_h = parent.get_content_area()
+
+    if content_w <= 0:
+        raise ValueError(f"create_band: 父容器 '{parent.name}' 没有可用宽度")
+
+    band_height = height if height > 0 else content_h
+    if band_height <= 0:
+        raise ValueError(
+            f"create_band: 高度必须为正。height 传入了 {height}，"
+            f"而父容器 '{parent.name}' 的内容区高为 {content_h}"
+        )
+
+    total_gap = gap * (n - 1)
+    usable_width = content_w - total_gap
+    if usable_width <= 0:
+        raise ValueError(
+            f"create_band: {n} 个格子之间的间距合计 {total_gap} "
+            f"已占满父容器 '{parent.name}' 的可用宽 {content_w}"
+        )
+
+    # ---- 按顺序横向排放格子 ----
+    band = LayoutObject(
+        name=container_name if container_name is not None else f"{parent.name}_band",
+        x=0,
+        y=0,
+        width=content_w,
+        height=band_height,
+        color=White,
+        parent=parent,
+        padding=band_padding,
+        align_x=AlignX.NONE,
+        align_y=AlignY.NONE,
+        layer=layer,
+    )
+    parent.add_child(band)
+
+    # 比例权重总和（仅对 float 形式的格子有意义）
+    weight_sum = sum(c for c in cells if isinstance(c, (int, float)))
+
+    cursor = 0.0
+    for i, cell in enumerate(cells):
+        if isinstance(cell, (int, float)):
+            if weight_sum <= 0:
+                raise ValueError("create_band: 比例权重之和必须大于 0")
+            obj = LayoutObject(
+                name=cell_names[i],
+                x=0,
+                y=0,
+                width=usable_width * (float(cell) / weight_sum),
+                height=band_height,
+                color=cell_colors[i],
+                parent=None,
+                padding=Padding(),
+                align_x=AlignX.NONE,
+                align_y=AlignY.NONE,
+                layer=layer,
+            )
+        else:
+            # 已构造对象：保留其自身宽度，只接管位置与高度
+            obj = cell
+            obj._height = band_height
+
+        obj.align_x = AlignX.NONE
+        obj.align_y = AlignY.NONE
+        obj._x = cursor
+        obj._y = 0
+        obj.invalidate_geom_cache()
+
+        band.add_child(obj)
+        cursor += obj._width + gap
+
+    return band
+
+
+def split_column_advanced(
+    parent: LayoutObject,
+    left_obj: LayoutObject,
+    right_obj: LayoutObject,
+    ratio: list = None,
+    gap: float = 0,
+    padding: Padding = None,
+    layer: int = 0,
+) -> LayoutObject:
+    """
+    进阶分栏函数 - 支持传入已构造好的左右对象
+
+    与 create_columns 的区别：
+        - 传入的是已构造好的对象，而不是类
+        - 支持左右对象不同类型 (LayoutObject / RectangleObject / 任意子类)
+        - 左右对象直接挂载到分栏容器下，无需额外包装
+
+    本函数是 create_band 的包装：左栏宽度 = 可用宽 * ratio[0]/sum(ratio)，
+    右栏保留自身宽度。
+
+    Args:
+        parent: 父容器 (LayoutObject)
+        left_obj: 已构造好的左栏对象
+        right_obj: 已构造好的右栏对象
+        ratio: 左右比例列表，如 [1.0, 2.5]，默认 [1.0, 2.5]
+        gap: 栏间距 (mm)，默认 0
+        padding: 分栏容器的内边距，默认 Padding.all(0)
+        layer: 图层索引
+
+    Returns:
+        LayoutObject: 传入的 parent 对象 (支持链式调用)
+
+    Example:
+        >>> left = RectangleObject(name="Left", color=Blue)
+        >>> right = LayoutObject(name="Right")
+        >>> split_column_advanced(root, left, right, ratio=[1.0, 2.5])
+    """
+    if ratio is None:
+        ratio = [1.0, 2.5]
+
+    if len(ratio) != 2:
+        raise ValueError(f"ratio must have exactly 2 elements, got {len(ratio)}")
+
+    if padding is None:
+        padding = Padding.all(0)
+
+    # ---- 获取父容器的内容区域 ----
+    _, _, content_w, content_h = parent.get_content_area()
+
+    if content_w <= 0 or content_h <= 0:
+        raise ValueError(f"Parent '{parent.name}' has no available space")
+
+    # ---- 计算左右栏宽度 ----
+    total_ratio = sum(ratio)
+    total_width = content_w - gap
+    left_obj._width = total_width * (ratio[0] / total_ratio)
+    right_obj._width = total_width * (ratio[1] / total_ratio)
+
+    # ---- 交给 create_band 排放 ----
+    # 格局：带容器挂到 parent 下，左右对象作为"已构造格子"并排
+    create_band(
+        parent=parent,
+        cells=[left_obj, right_obj],
+        gap=gap,
+        padding=padding,
+        height=content_h,
+        layer=layer,
+        container_name=f"{parent.name}_split_container",
+    )
+
+    return parent
 
 def create_columns(
     parent: LayoutObject,
@@ -1760,7 +2017,35 @@ def create_columns(
     colors: Optional[List[Color]] = None,
     layer: int = 0,
 ) -> LayoutObject:
-    """在父对象中创建分栏"""
+    """
+    在父对象中创建分栏
+
+    宽度分配语义（与 create_band 的"严格按比例"不同，此处刻意保留）：
+        - column_widths 给定：总和超出可用宽则等比缩小；
+          不足则把剩余空间**按栏数均分**追加到每栏；相等则原样使用
+        - column_ratios 给定：按比例分配
+        - 都不给：等宽
+
+    实现上是两趟：先算出各栏宽度（沿用上述语义），再交给 create_band 排放。
+    create_band 只做"严格按比例"，所以剩余量均分这一步必须留在本函数里。
+
+    注意：各栏由 create_band 创建，因此格子名为 names 指定值或 "Column_{i}"，
+    而**返回的是新建的带容器**（名为 "{parent.name}_band"），不再是 parent。
+
+    Args:
+        parent: 父容器
+        num_columns: 栏数
+        column_widths: 各栏宽度，与 column_ratios 互斥
+        column_ratios: 各栏比例，与 column_widths 互斥
+        gap: 栏间距 (mm)
+        padding: 各栏内边距
+        names: 各栏名字
+        colors: 各栏颜色，默认 Gray
+        layer: 图层索引
+
+    Returns:
+        LayoutObject: 新建的带容器
+    """
     if num_columns < 1:
         raise ValueError(f"num_columns must be >= 1, got {num_columns}")
     
@@ -1785,6 +2070,7 @@ def create_columns(
     if usable_width <= 0:
         raise ValueError(f"Not enough space for {num_columns} columns")
     
+    # ---- 第一趟：算出各栏宽度（本函数独有语义） ----
     if column_widths is not None:
         total_width = sum(column_widths)
         if total_width > usable_width:
@@ -1818,33 +2104,35 @@ def create_columns(
         col_padding = Padding.all(float(padding))
     else:
         col_padding = padding
-    
-    parent.children = []
-    
-    _, content_y, _, _ = parent_content
-    cumulative_width = 0
-    
-    for i in range(num_columns):
-        col_x = cumulative_width + gap * i
-        col_w = widths[i]
-        
-        col = LayoutObject(
+
+    # ---- 第二趟：构造各栏并交给 create_band 排放 ----
+    # 注意：此处刻意**不再**执行 `parent.children = []`。
+    # 那会静默丢弃父元素既有子元素，且绕过 remove_child 使父指针悬空（缺陷 7.4）。
+    cols = [
+        LayoutObject(
             name=col_names[i],
-            x=col_x,
+            x=0,
             y=0,
-            width=col_w,
+            width=widths[i],
             height=content_h,
             color=col_colors[i],
-            parent=parent,
+            parent=None,
             padding=col_padding,
             align_x=AlignX.NONE,
             align_y=AlignY.NONE,
             layer=layer,
         )
-        parent.add_child(col)
-        cumulative_width += col_w
-    
-    return parent
+        for i in range(num_columns)
+    ]
+
+    return create_band(
+        parent=parent,
+        cells=cols,
+        gap=gap,
+        padding=Padding(),
+        height=content_h,
+        layer=layer,
+    )
 
 
 def create_columns_balanced(
@@ -1854,7 +2142,7 @@ def create_columns_balanced(
     padding: Optional[Union[Padding, float]] = None,
     layer: int = 0,
 ) -> LayoutObject:
-    """创建等宽分栏"""
+    """创建等宽分栏（create_columns 的等宽包装，返回新建的带容器）"""
     return create_columns(
         parent=parent,
         num_columns=num_columns,
@@ -2013,8 +2301,11 @@ if __name__ == "__main__":
         layer=5
     )
     
-    col0 = container.get_child("Column_0")
-    col1 = container.get_child("Column_1")
+    # 注意：create_columns 现在会先建一个带容器，各栏挂在带容器之下，
+    # 因此 Column_0 不再是 container 的直接子元素。取栏要用 find_by_name（深度优先），
+    # 不能用 get_child（只看直接子元素）。这与 split_column_advanced 的既有格局一致。
+    col0 = container.find_by_name("Column_0")
+    col1 = container.find_by_name("Column_1")
     
     if col0:
         col0_text = TextObject(
@@ -2065,24 +2356,46 @@ if __name__ == "__main__":
     assert root.get_true_height() is None, "get_true_height() 仍是未实现的占位，应返回 None"
     print("  ✅ get_true_height() 占位契约通过（返回 None）")
     
-    # 2) render() 的返回值契约不统一（LayoutObject/TextObject 返回 float，
-    #    ImageObject/RectangleObject 返回 tuple）。此处只锁定 LayoutObject.render 的行为。
-    #    注意：本测试的 Root 最后一个子节点是 Container，最终向上冒泡的即为 LayoutObject.render 的值。
-    assert isinstance(render_ret, float), \
-        f"LayoutObject.render() 应返回 float（最后渲染到的 y），实际返回 {type(render_ret).__name__}"
-    print(f"  ✅ LayoutObject.render() 返回 float 契约通过（{render_ret:.2f}）")
+    # 2) 渲染返回值契约。render() 与 render_debug() 现在返回同类值：
+    #      LayoutObject / TextObject -> 数值 y（最后渲染到的位置）
+    #      ImageObject / RectangleObject -> (宽, 高) 二元组
+    #    这里接受这两种形态，但拒绝 None —— 那说明渲染根本没返回值（缺陷 7.11 的一半）。
+    #    注意 render_debug 曾在四个实现里都没有 return，于是一律返回 None；
+    #    方案 A 已修，两者现在一致。
+    def _render_ret_ok(v):
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            return True
+        return (isinstance(v, tuple) and len(v) == 2
+                and all(isinstance(x, (int, float)) for x in v))
+
+    assert _render_ret_ok(render_ret), \
+        (f"渲染应返回值（数值 y 或 (宽, 高) 二元组），实际返回 "
+         f"{type(render_ret).__name__}: {render_ret!r}")
+    print(f"  ✅ 渲染返回值契约通过（{render_ret!r}）")
     
-    # 3) create_columns 当前会清空父元素既有子元素（LayoutEngine.py:1822），
-    #    属于已知缺陷（技术文档 7.4）。此处固化现状，防止在无意识的情况下改变行为；
-    #    批次 2 修复该缺陷时，本断言应同步改为"既有子元素被保留"。
+    # 3) create_columns 曾会清空父元素既有子元素（旧实现里的 `parent.children = []`），
+    #    属已知缺陷 7.4（同时绕过 remove_child，使被丢弃子元素的父指针悬空）。
+    #    批次 2 已修复：现在走 create_band -> add_child，既有子元素被保留。
     _probe_parent = LayoutObject(name="ProbeParent", width=100, height=50)
     _kept = TextObject(name="ProbeKept", text="x", font_size=10)
     _probe_parent.add_child(_kept)
     assert _probe_parent.children == [_kept], "add_child 后应保留子元素"
     create_columns(parent=_probe_parent, num_columns=2, gap=0)
-    assert _kept not in _probe_parent.children, \
-        "已知缺陷 7.4 现状：create_columns 会丢弃父元素既有子元素"
-    print("  ✅ create_columns 清空父元素的现状已固化（技术文档 7.4）")
+    assert _kept in _probe_parent.children, \
+        "缺陷 7.4 已修：create_columns 不应丢弃父元素既有子元素"
+    assert _kept.parent is _probe_parent, "被保留的子元素父指针不应悬空"
+    # 父元素下应有两个子元素：既有子元素 + create_columns 新建的带容器
+    # （各栏挂在带容器之下，不直接是父元素的子元素）
+    assert len(_probe_parent.children) == 2, \
+        f"父元素应有既有子元素 + 带容器共 2 个，实际 {len(_probe_parent.children)}"
+    _probe_band = _probe_parent.children[1]
+    assert _probe_band.name == "ProbeParent_band", \
+        f"带容器应有默认名 ProbeParent_band，实际 {_probe_band.name}"
+    assert [c.name for c in _probe_band.children] == ["Column_0", "Column_1"], \
+        "两栏应挂在带容器之下"
+    print("  ✅ create_columns 保留父元素既有子元素（缺陷 7.4 已修）")
     
     # 4) create_spacer 构件契约（批次 1）
     #    留白对象是流式布局里的纯占位元素，必须满足：
@@ -2110,5 +2423,90 @@ if __name__ == "__main__":
     assert _sp_free.parent is None, "不传 parent 时留白应保持游离"
     assert _sp_free.get_effective_height() == 3, "游离留白的有效高度应等于 height"
     print("  ✅ create_spacer 构件契约通过")
+    
+    # 5) create_band 构件契约（批次 2）
+    #    横向带是引擎的横向布局基础构件，create_columns / split_column_advanced 都是它的包装。
+    #    注意 BandRoot 有 Padding.all(10)，所以父内容区宽 = 120 - 20 = 100，高 = 100 - 20 = 80。
+    print("  --- create_band ---")
+    _bd_root = LayoutObject(name="BandRoot", width=120, height=100,
+                            padding=Padding.all(10))
+    assert _bd_root.get_content_area()[2] == 100, "前提：BandRoot 内容区宽应为 100"
+    assert _bd_root.get_content_area()[3] == 80, "前提：BandRoot 内容区高应为 80"
+    # 5.1 比例分宽：可用宽 = 100，比例 2:1:2 -> 40/20/40
+    _bd = create_band(_bd_root, [2.0, 1.0, 2.0], gap=0, height=30)
+    assert _bd.parent is _bd_root and _bd in _bd_root.children, \
+        "create_band 应把带容器挂到 parent 下"
+    assert _bd._width == 100, f"带容器宽应等于父内容区宽 100，实际 {_bd._width}"
+    _bw = [c._width for c in _bd.children]
+    assert _bw == [40.0, 20.0, 40.0], f"2:1:2 应得 [40,20,40]，实际 {_bw}"
+    assert [c._x for c in _bd.children] == [0.0, 40.0, 60.0], \
+        f"gap=0 时 x 应依次累加，实际 {[c._x for c in _bd.children]}"
+    assert all(c._height == 30 for c in _bd.children), "格子高度应等于 height"
+    print(f"    ✅ 比例分宽通过（{_bw}）")
+    # 5.2 gap 累加 x：可用宽 = 100 - 2*(3-1) = 96，比例 1:1:1 -> 32 每格
+    _bd2 = create_band(_bd_root, [1.0, 1.0, 1.0], gap=2, height=30,
+                       container_name="BandGap")
+    _unit = (100 - 2 * 2) / 3
+    _bw2 = [round(c._width, 6) for c in _bd2.children]
+    assert _bw2 == [round(_unit, 6)] * 3, f"1:1:1 应均分 {_unit}，实际 {_bw2}"
+    _bx2 = [round(c._x, 6) for c in _bd2.children]
+    _exp_x2 = [0.0, round(_unit + 2, 6), round(_unit * 2 + 4, 6)]
+    assert _bx2 == _exp_x2, f"gap=2 时 x 应为 {_exp_x2}，实际 {_bx2}"
+    print(f"    ✅ gap 累加 x 通过（每格 {_unit}，x={_bx2}）")
+    # 5.3 height=0 取父内容区高（80，不是构造高 100）
+    _bd3 = create_band(_bd_root, [1.0, 1.0], gap=0, height=0,
+                       container_name="BandAutoH")
+    assert _bd3._height == 80, f"height=0 应取父内容区高 80，实际 {_bd3._height}"
+    assert all(c._height == 80 for c in _bd3.children), "格子高度应随 height=0 取父内容区高"
+    print("    ✅ height=0 取父内容区高通过")
+    # 5.4 传入已构造对象：保留其自身宽度，只接管位置与高度
+    _pre_l = RectangleObject(name="PreLeft", width=25, height=999, color=Red)
+    _pre_r = LayoutObject(name="PreRight", width=0, height=999)
+    _bd4 = create_band(_bd_root, [_pre_l, _pre_r], gap=5, height=40,
+                       container_name="BandPrebuilt")
+    assert _bd4.children == [_pre_l, _pre_r], "传入的对象应被直接复用，不新建"
+    assert _pre_l._width == 25, "已构造对象的宽度应被保留，而非按比例重算"
+    assert (_pre_l._x, _pre_r._x) == (0.0, 30.0), \
+        f"已构造对象的 x 应为 0 与 25+5=30，实际 {(_pre_l._x, _pre_r._x)}"
+    assert _pre_l._height == 40 and _pre_r._height == 40, "已构造对象的高度应被 height 接管"
+    print("    ✅ 复用已构造对象通过")
+    # 5.5 错误路径
+    for _bad, _desc in (
+        (lambda: create_band(_bd_root, [], height=10), "cells 为空"),
+        (lambda: create_band(_bd_root, [1.0, 1.0], gap=999, height=10), "间距占满可用宽"),
+        (lambda: create_band(_bd_root, [1.0], height=10, names=["a", "b"]), "names 长度不匹配"),
+        (lambda: create_band(_bd_root, [1.0], height=10, colors=[Red, Blue]), "colors 长度不匹配"),
+    ):
+        try:
+            _bad()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"create_band 应对「{_desc}」抛 ValueError")
+    print("    ✅ 错误路径通过（4 项）")
+    # 5.6 create_columns / split_column_advanced 都返回新建的带容器（不再是 parent）
+    _cc_root = LayoutObject(name="CCRoot", width=100, height=80)
+    _cc_ret = create_columns(parent=_cc_root, num_columns=2, gap=0)
+    assert _cc_ret is not _cc_root, "create_columns 现在返回新建的带容器，而非 parent"
+    assert _cc_ret.parent is _cc_root, "返回的带容器应挂在 parent 下"
+    assert [c.name for c in _cc_ret.children] == ["Column_0", "Column_1"], \
+        "各栏名字应保持 Column_{i} 约定"
+    print("    ✅ 包装函数返回带容器通过")
+    # 5.7 split_column_advanced：左栏按比例，右栏保留自身宽度；返回 parent 以兼容旧调用
+    _sc_root = LayoutObject(name="SCRoot", width=140, height=60)
+    _sc_l = RectangleObject(name="SCLeft", width=1, height=1)
+    _sc_r = LayoutObject(name="SCRight", width=1, height=1)
+    _sc_ret = split_column_advanced(_sc_root, _sc_l, _sc_r, ratio=[1.0, 2.5], gap=0)
+    assert _sc_ret is _sc_root, "split_column_advanced 应返回 parent（链式调用兼容）"
+    _sc_container = _sc_root.find_by_name("SCRoot_split_container")
+    assert _sc_container is not None, "应创建 {parent}_split_container"
+    assert _sc_container.children == [_sc_l, _sc_r], "左右对象应挂到分栏容器下"
+    assert round(_sc_l._width, 6) == round(140 * (1.0 / 3.5), 6), \
+        f"左栏宽应为 140*1/3.5，实际 {_sc_l._width}"
+    assert round(_sc_r._width, 6) == round(140 * (2.5 / 3.5), 6), \
+        f"右栏宽应为 140*2.5/3.5，实际 {_sc_r._width}"
+    assert _sc_l.parent is _sc_container and _sc_r.parent is _sc_container, \
+        "左右对象的父指针应指向分栏容器"
+    print("    ✅ split_column_advanced 包装通过")
     
     print("\n✅ 回归契约断言全部通过")

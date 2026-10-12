@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>fc92c775-b8e5-433d-9726-e9f1b53f2f3e</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>PythonPDFLayoutSystem.py</StartupFile>
+    <StartupFile>LayoutEngine.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -21,7 +21,8 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="PythonPDFLayoutSystem.py" />
+    <!-- 底层：排版引擎。入口与启动文件均指向它（此前指向已删除的 PythonPDFLayoutSystem.py）。 -->
+    <Compile Include="LayoutEngine.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

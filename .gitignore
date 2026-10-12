@@ -362,4 +362,18 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 
-# Actual Layout Generate Source File 
+# Actual Layout Generate Source File
+
+# ---- 排版系统的生成物与本地资源 ----
+
+# 测试/示例生成的 PDF。可由各文件的测试入口重新生成，不入库。
+*.pdf
+
+# 简历生成输出目录（见 ResumeCore.Generate 的 output_dir 默认值）。
+# 注意：该规则只匹配任意层级的 output 目录。
+output/
+
+# 霞鹜文楷字体（LXGW WenKai）。体积约 117 MB，属本地资源，不入库。
+# 字体是免费开源的，获取方式见 README 的「资源获取」一节。
+# 只忽略字体本身；未来补充的图标/照片等小体积素材应正常入库。
+Resources/*.ttf

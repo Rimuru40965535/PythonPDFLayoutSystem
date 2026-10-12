@@ -492,6 +492,46 @@ set_padding(padding=None)          # float 会转成 Padding.all
 > 逐字节一致在这里有一个特别的意义：新功能（收窄）**只在 `SizeX.CONTENT` 时生效**，
 > 既有结构没有任何一处使用它，因此基线必须完全不动。
 
+#### **批次 4.4：删除 `wrap_*` 兼容面（批次 4 收尾）**
+
+**彻底移除 `wrap_width` / `wrap_height`** —— 构造参数、兼容 property、
+`_calculate_wrap_height` 委托垫片全部删除。它们只是
+`SizeX.CONTENT` / `SizeY.CONTENT` 的旧写法，长期并存会让"谁是真相"含糊。
+
+迁移写法：
+
+```
+wrap_width=True   ->  size_x=SizeX.CONTENT
+wrap_height=True  ->  size_y=SizeY.CONTENT
+```
+
+**顺带清掉三处旧机制残留**：
+
+- 模块文档字符串里"wrap_content 支持 / 几何缓存"等过时描述，改写为四轴与两趟遍历的说明；
+- `_get_display_name` / `__repr__` 里的 `wrap_*` 读取改为读 `_size_x` / `_size_y`
+  （标记从 `[H↕]` / `[W↔]` 语义不变，`__repr__` 的标记改为 `content_h` / `content_w`）；
+- `ImageObject` 内部临时 `new FPDF()` 的残留（**缺陷 7.6**）——
+  4.2 已改为 `_source_h(pdf)` + `_image_aspect_ratio(pdf)`：优先用外部传入的 `pdf`，
+  其次用 Pillow 读图片头部，都不行才保守估算。
+
+**顺带修掉缺陷 7.10 的引擎侧**：`Style.padding` 的可变默认参数
+（`Padding.all(0)` 会让所有 `Style` 实例共享同一个 `Padding`）
+改为 `padding=None` → 构造时新建。对外行为不变，但实例之间不再互相污染。
+
+**测试**
+
+- 三个入口退出码 0 —— 值得注意的是**中层/顶层仍在工作**，
+  因为它们本来就没有使用 `wrap_*`（我先前担心 `ResumeTemplate.py` 大量依赖它，实测是 0 处）；
+- **规范化比对：三个产物全部逐字节一致**；
+- 新增 5 项断言：声明值→尺寸方式推断（4 例）、显式 `size_*` 生效、
+  **`wrap_*` 兼容面已彻底移除**（属性不存在 + 四个类的构造签名都不含该形参）、
+  `size_*` setter 生效、**`Style.padding` 可变默认已修**（两个实例的 padding 必须是不同对象）。
+
+> **批次 4 至此全部完成。** 底层现在具备：四轴尺寸/对齐、两趟遍历、
+> 自动失效、收缩包裹、包围内容、显式循环报错。
+> 剩下的批次 5（真实行数测量）只需替换 `_source_w` / `_source_h` 的文本实现 ——
+> 钩子已就位，接口不变。
+
 ---
 
 ## 分支策略

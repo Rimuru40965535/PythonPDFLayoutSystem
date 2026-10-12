@@ -1,27 +1,37 @@
 """
 ================================================================================
-PDF 排版引擎 - 完整实现 (缓存优化版)
+PDF 排版引擎
 ================================================================================
 功能概述：
     1. 基于矩形区域的布局管理
     2. 支持父子层级、内边距 (padding)
-    3. 支持水平/垂直对齐 (居中、靠左、靠右、靠上、靠下)
-    4. 支持流式布局 (紧挨上一个子元素放置)
-    5. 支持分栏布局 (等宽、指定宽度、按比例)
-    6. 自动尺寸约束（子元素不超出父元素内容区域）
-    7. 流式布局自动截断（超出父元素可用空间的子元素会被裁剪）
-    8. 内容渲染：文本、图像、矩形
-    9. 图层管理：按图层索引组织和渲染对象
-    10. 调试渲染模式（显示边框、名称、尺寸）
-    11. 对象注册表（按名称查找）
-    12. wrap_content 支持（高度由内容决定）
-    13. 几何缓存（消除递归渲染的指数级复杂度）
+    3. 【四轴设计】尺寸与位置分离：
+         SizeX / SizeY 决定"元素多大"（FILL / FIXED / CONTENT）
+         AlignX / AlignY 决定"元素在哪"（含流式 FLOW）
+    4. 【两趟遍历】先测量尺寸，再计算位置：
+         趟 1 进入方向传约束、定 FILL/FIXED；退出方向收尺寸、定 CONTENT
+         趟 2 只读对齐轴，算出绝对坐标
+    5. 支持分栏 / 横向带布局（create_band / create_columns）
+    6. 内容渲染：文本、图像、矩形
+    7. 图层管理：按图层索引组织和渲染对象
+    8. 调试渲染模式（显示边框、名称、尺寸）
+    9. 对象注册表（按名称查找）
 
-修复记录：
-    - 修复 wrap_content 循环依赖问题
-    - 拆分公共逻辑到 _calculate_wrap_height()
-    - 添加缓存失效机制
-    - 添加几何缓存（_geom_cache），将渲染从 O(4^d) 降到 O(n)
+设计要点：
+    - **约束向下传、尺寸向上收**：子元素的可用空间是作为参数拿到的，
+      不再回头问父容器。这消除了旧实现里"父子互相递归"造成的循环依赖。
+    - **CONTENT 与 FLOW 可以共存**：尺寸由内容决定的元素，位置依然可以
+      接在前一个 FLOW 兄弟下方。这是两轴分离带来的能力。
+    - **定死的尺寸不动**：FIXED 不因父容器装不下而被裁剪，装不下是溢出问题。
+    - **循环依赖显式报错**：结构成环时抛 LayoutCycleError（含完整路径），
+      而不是静默返回 0。
+
+变更记录（批次 4）：
+    - 4.1  新增 SizeX / SizeY 尺寸枚举与 LayoutCycleError
+    - 4.2  以两趟遍历取代惰性 wrap 缓存，修 7.19 / 7.20
+    - 4.3  几何属性改 property，改动自动触发失效
+    - 4b   新增内容固有宽度路径（_source_w），修 7.21
+    - 4.4  删除 wrap_width / wrap_height 兼容面，尺寸方式只由 size_* 表达
 
 ================================================================================
 """
@@ -254,9 +264,9 @@ class Style:
         fit_mode: 图片适配模式 (str) — 仅 ImageObject 使用
 
     注意：
-        padding 的默认值是 Padding.all(0) 这一**可变对象**（缺陷 7.10）。
-        这是从模板层原样搬运过来的既有行为，本批次刻意不做修正，
-        以免破坏"纯搬运、输出不变"的验收前提。修正归入批次 4 的可变默认值审计。
+        `padding` 的默认值曾是 `Padding.all(0)` 这一**可变对象**（缺陷 7.10），
+        会导致所有 Style 实例共享同一个 Padding。批次 4.4 已改为
+        `field(default_factory=...)` 语义 —— 每次构造都新建。
     """
 
     def __init__(
@@ -268,7 +278,7 @@ class Style:
         color: Color = Black,
         fill_color: Color = White,
         image_path: str = "",
-        padding: Padding = Padding.all(0),
+        padding: Optional[Padding] = None,
         fit_mode="cover"
     ):
         """
@@ -282,7 +292,7 @@ class Style:
             color: 文字颜色
             fill_color: 填充颜色
             image_path: 图片路径 (仅用于 ImageObject)
-            padding: 内边距
+            padding: 内边距。None 表示新建 Padding.all(0)（**每次新建**，不共享）
             fit_mode: 图片适配模式 (仅用于 ImageObject)
         """
         self.font_name = font_name
@@ -292,7 +302,7 @@ class Style:
         self.color = color
         self.fill_color = fill_color
         self.image_path = image_path
-        self.padding = padding
+        self.padding = Padding.all(0) if padding is None else padding
         self.fit_mode = fit_mode
 
     def get_font_style(self) -> str:
@@ -496,8 +506,6 @@ class LayoutObject:
                  align_x: AlignX = AlignX.NONE,
                  align_y: AlignY = AlignY.NONE,
                  layer: int = 0,
-                 wrap_width: bool = False,
-                 wrap_height: bool = False,
                  size_x: Optional[SizeX] = None,
                  size_y: Optional[SizeY] = None):
         # 基本属性
@@ -532,20 +540,19 @@ class LayoutObject:
         layer_manager.add_object(self, layer)
         
         # ---- 尺寸轴（四轴设计，批次 4） ----
-        # 解析优先级：显式 size_* 参数 > wrap_* 布尔量 > width/height 推断
-        # 推断规则保持与旧行为一致：定死值 -> FIXED；未定死(<=0) -> FILL
+        # 推断规则：显式 size_* 优先；未给则「声明值 > 0 -> FIXED，否则 FILL」
+        # 注意：批次 4.4 起 `wrap_width` / `wrap_height` 两个布尔参数**已删除**，
+        #       它们只是 SizeX.CONTENT / SizeY.CONTENT 的旧写法，并存只会让"谁是真相"含糊。
         self._size_x = self._resolve_size(
             explicit=size_x,
-            wrap_flag=wrap_width,
             declared=width,
-            fill=SizeX.FILL, fixed=SizeX.FIXED, content=SizeX.CONTENT,
+            fill=SizeX.FILL, fixed=SizeX.FIXED,
             axis="X", name=name,
         )
         self._size_y = self._resolve_size(
             explicit=size_y,
-            wrap_flag=wrap_height,
             declared=height,
-            fill=SizeY.FILL, fixed=SizeY.FIXED, content=SizeY.CONTENT,
+            fill=SizeY.FILL, fixed=SizeY.FIXED,
             axis="Y", name=name,
         )
         
@@ -573,31 +580,29 @@ class LayoutObject:
     # ------------------------------------------------------------------------
     
     @staticmethod
-    def _resolve_size(explicit, wrap_flag, declared, fill, fixed, content,
+    def _resolve_size(explicit, declared, fill, fixed,
                       axis: str, name: str):
         """
-        解析尺寸方式：显式枚举 > wrap 布尔量 > 声明值推断
+        解析尺寸方式：显式枚举优先，否则由声明值推断
 
-        推断规则刻意保持与旧行为一致：
-            声明值 > 0  -> FIXED（定死的尺寸）
-            声明值 <= 0 -> FILL （撑满父内容区）
+        推断规则：
+            未给 size_* 且 声明值 > 0  -> FIXED（定死的尺寸）
+            未给 size_* 且 声明值 <= 0 -> FILL （撑满父内容区）
+
+        想表达"由内容决定"必须显式给 `size_x` / `size_y`（批次 4.4 起
+        不再有 `wrap_*` 布尔参数作为简写）。
         """
-        if explicit is not None:
-            # 必须按轴分别校验：SizeX 与 SizeY 是不同枚举，
-            # 但 isinstance(x, (SizeX, SizeY)) 对两者都成立，不能用来分轴。
-            expected = SizeX if axis == "X" else SizeY
-            if not isinstance(explicit, expected):
-                raise TypeError(
-                    f"size_{axis.lower()} 必须是 Size{axis} 枚举，"
-                    f"收到 {type(explicit).__name__}"
-                )
-            if wrap_flag:
-                print(f"  >>>⚠ {name}: 同时给出了 size_{axis.lower()} 与 wrap_*，"
-                      f"以 size_{axis.lower()} 为准")
-            return explicit
-        if wrap_flag:
-            return content
-        return fixed if declared > 0 else fill
+        if explicit is None:
+            return fixed if declared > 0 else fill
+        # 必须按轴分别校验：SizeX 与 SizeY 是不同枚举，
+        # 但 isinstance(x, (SizeX, SizeY)) 对两者都成立，不能用来分轴。
+        expected = SizeX if axis == "X" else SizeY
+        if not isinstance(explicit, expected):
+            raise TypeError(
+                f"size_{axis.lower()} 必须是 Size{axis} 枚举，"
+                f"收到 {type(explicit).__name__}"
+            )
+        return explicit
     
     @property
     def width(self) -> float:
@@ -760,38 +765,12 @@ class LayoutObject:
             self._size_y = value
             self.invalidate_geom_cache()
     
-    @property
-    def wrap_width(self) -> bool:
-        """
-        [兼容] 宽度是否由内容决定
-
-        派生自 size_x，**不是独立真相**。请优先使用 size_x = SizeX.CONTENT。
-        """
-        return self._size_x == SizeX.CONTENT
-    
-    @wrap_width.setter
-    def wrap_width(self, value: bool) -> None:
-        # 关闭 wrap 时退回 FIXED/FILL，按声明宽度推断，与构造时的规则一致
-        if value:
-            self.size_x = SizeX.CONTENT
-        else:
-            self.size_x = SizeX.FIXED if self._width > 0 else SizeX.FILL
-    
-    @property
-    def wrap_height(self) -> bool:
-        """
-        [兼容] 高度是否由内容决定
-
-        派生自 size_y，**不是独立真相**。请优先使用 size_y = SizeY.CONTENT。
-        """
-        return self._size_y == SizeY.CONTENT
-    
-    @wrap_height.setter
-    def wrap_height(self, value: bool) -> None:
-        if value:
-            self.size_y = SizeY.CONTENT
-        else:
-            self.size_y = SizeY.FIXED if self._height > 0 else SizeY.FILL
+    # 批次 4.4 起 `wrap_width` / `wrap_height` 两个兼容属性已**删除**。
+    # 它们只是 SizeX.CONTENT / SizeY.CONTENT 的旧写法，长期并存会让
+    # "谁是真相"含糊 —— 而真相只有 `_size_x` / `_size_y`。
+    # 迁移写法：wrap_width=True  -> size_x=SizeX.CONTENT
+    #           wrap_height=True -> size_y=SizeY.CONTENT
+    # 属性的读写入口请改用 `size_x` / `size_y`（都是 property，赋值会触发失效）。
     
     # ------------------------------------------------------------------------
     # 6.1 图层属性
@@ -1428,9 +1407,9 @@ class LayoutObject:
 
     def _get_display_name(self) -> str:
         name = self.name
-        if self.wrap_height:
+        if self._size_y == SizeY.CONTENT:
             name += " [H↕]"
-        if self.wrap_width:
+        if self._size_x == SizeX.CONTENT:
             name += " [W↔]"
         return name
 
@@ -1443,12 +1422,13 @@ class LayoutObject:
         return info
     
     def __repr__(self) -> str:
-        wrap_marker = ""
-        if self.wrap_height:
-            wrap_marker += ", wrap_h"
-        if self.wrap_width:
-            wrap_marker += ", wrap_w"
-        return f"LayoutObject(name='{self.name}', layer={self._layer}, size=({self._width}x{self._height}){wrap_marker})"
+        size_marker = ""
+        if self._size_y == SizeY.CONTENT:
+            size_marker += ", content_h"
+        if self._size_x == SizeX.CONTENT:
+            size_marker += ", content_w"
+        return (f"LayoutObject(name='{self.name}', layer={self._layer}, "
+                f"size=({self._width}x{self._height}){size_marker})")
 
     def get_true_height(self):
         None
@@ -1481,8 +1461,6 @@ class TextObject(LayoutObject):
         multi_line: bool = False,
         line_height: Optional[float] = None,
         layer: int = 0,
-        wrap_width: bool = False,
-        wrap_height: bool = False,
         size_x: Optional[SizeX] = None,
         size_y: Optional[SizeY] = None,
     ):
@@ -1490,7 +1468,6 @@ class TextObject(LayoutObject):
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height,
             size_x=size_x, size_y=size_y,
         )
         
@@ -1531,7 +1508,7 @@ class TextObject(LayoutObject):
             Style.fit_mode    -> 忽略（仅 ImageObject 使用）
 
         其余参数（align_x / align_y / multi_line / line_height / width / height /
-        parent / layer / wrap_width / wrap_height 等）通过 overrides 传入。
+        parent / layer / size_x / size_y 等）通过 overrides 传入。
 
         Args:
             name: 对象名称
@@ -1660,7 +1637,7 @@ class TextObject(LayoutObject):
         """
         文本的内容固有高度（不含对父约束的夹紧）
 
-        批次 4.2 起由 _measure 的退出方向调用，取代旧的 _calculate_wrap_height。
+        批次 4.2 起由 _measure 的退出方向调用，取代表格外的旧 wrap 高度计算。
         注意：这里**不**做任何对父可用空间的裁剪 —— 裁剪发生在测量退出方向（夹紧）
         与定位阶段（FLOW 溢出裁剪）。旧实现在这里就地裁剪，正是 7.19 的成因之一。
 
@@ -1678,13 +1655,6 @@ class TextObject(LayoutObject):
             text_height = approx_lines * line_height
         return text_height + self.padding.top + self.padding.bottom
     
-    def _calculate_wrap_height(self) -> float:
-        """
-        [兼容] 旧接口，委托给 _source_h()
-
-        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
-        """
-        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> float:
@@ -1842,8 +1812,6 @@ class ImageObject(LayoutObject):
         align_x: AlignX = AlignX.NONE,
         align_y: AlignY = AlignY.NONE,
         layer: int = 0,
-        wrap_width: bool = False,
-        wrap_height: bool = False,
         size_x: Optional[SizeX] = None,
         size_y: Optional[SizeY] = None,
     ):
@@ -1851,7 +1819,6 @@ class ImageObject(LayoutObject):
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height,
             size_x=size_x, size_y=size_y,
         )
         
@@ -2023,13 +1990,6 @@ class ImageObject(LayoutObject):
             pass
         return None
     
-    def _calculate_wrap_height(self) -> float:
-        """
-        [兼容] 旧接口，委托给 _source_h()
-
-        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
-        """
-        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> Tuple[float, float]:
@@ -2177,8 +2137,6 @@ class RectangleObject(LayoutObject):
         align_x: AlignX = AlignX.NONE,
         align_y: AlignY = AlignY.NONE,
         layer: int = 0,
-        wrap_width: bool = False,
-        wrap_height: bool = False,
         size_x: Optional[SizeX] = None,
         size_y: Optional[SizeY] = None,
     ):
@@ -2186,19 +2144,9 @@ class RectangleObject(LayoutObject):
             name=name, x=x, y=y, width=width, height=height,
             color=color, parent=parent, padding=padding,
             align_x=align_x, align_y=align_y, layer=layer,
-            wrap_width=wrap_width, wrap_height=wrap_height,
             size_x=size_x, size_y=size_y,
         )
     
-    def _calculate_wrap_height(self) -> float:
-        """
-        [兼容] 旧接口，委托给 _source_h()
-
-        矩形的内容固有高度就是"子元素高之和 + 上下 padding"，
-        与基类默认实现一致，故无需覆盖 _source_h。
-        批次 4.2 起不再参与布局计算，保留只为外部旧调用不报错。
-        """
-        return self._source_h()
     
     @timer
     def render(self, pdf, is_fill: bool = False) -> Tuple[float, float]:
@@ -3238,39 +3186,48 @@ if __name__ == "__main__":
     assert [m.name for m in AlignY] == ["TOP", "VCENTER", "BOTTOM", "NONE", "FLOW"], \
         "对齐轴不应新增成员 —— wrap 属于尺寸轴"
     print("    ✅ 枚举成员集合通过（对齐轴未污染）")
-    # 8.2 旧写法 -> 新枚举的推断映射（保持旧行为）
+    # 8.2 声明值 -> 尺寸方式的推断（批次 4.4 起不再有 wrap_* 简写）
     _map_cases = [
-        (dict(width=0,  wrap_width=False),  "size_x", "FILL"),
-        (dict(width=50, wrap_width=False),  "size_x", "FIXED"),
-        (dict(width=50, wrap_width=True),   "size_x", "CONTENT"),
-        (dict(width=0,  wrap_width=True),   "size_x", "CONTENT"),
-        (dict(height=0,  wrap_height=False), "size_y", "FILL"),
-        (dict(height=30, wrap_height=False), "size_y", "FIXED"),
-        (dict(height=30, wrap_height=True),  "size_y", "CONTENT"),
-        (dict(height=0,  wrap_height=True),  "size_y", "CONTENT"),
+        (dict(width=0),  "size_x", "FILL"),
+        (dict(width=50), "size_x", "FIXED"),
+        (dict(height=0),  "size_y", "FILL"),
+        (dict(height=30), "size_y", "FIXED"),
     ]
     for _i, (_kw, _attr, _exp) in enumerate(_map_cases):
         _o = LayoutObject(name=f"AXIS_MAP_{_i}", **_kw)
         assert getattr(_o, _attr).name == _exp, \
             f"{_kw} -> {_attr} 应为 {_exp}，实际 {getattr(_o, _attr).name}"
-    print("    ✅ 旧写法→新枚举 推断映射通过（8 例）")
-    # 8.3 显式 size_* 优先于 wrap_*
-    _o = LayoutObject(name="AXIS_EXPLICIT", width=50, wrap_width=True, size_x=SizeX.FILL)
-    assert _o.size_x == SizeX.FILL, "显式 size_x 应优先于 wrap_width"
-    # 8.4 wrap_* 是派生属性，读写往返一致
-    _o = LayoutObject(name="AXIS_RT", width=0, height=0)
-    assert _o.wrap_width is False and _o.wrap_height is False
-    _o.wrap_width = True
-    assert _o.size_x == SizeX.CONTENT and _o.wrap_width is True
-    _o.wrap_width = False
-    assert _o.size_x == SizeX.FILL and _o.wrap_width is False, \
-        "关闭 wrap 后应按声明宽度退回 FILL/FIXED"
-    _o2 = LayoutObject(name="AXIS_RT2", width=40, height=20)
-    _o2.wrap_height = True
+    print("    ✅ 声明值→尺寸方式 推断映射通过（4 例）")
+    # 8.3 显式 size_* 直接生效
+    _o = LayoutObject(name="AXIS_EXPLICIT", width=50, size_x=SizeX.CONTENT)
+    assert _o.size_x == SizeX.CONTENT, "显式 size_x 应直接生效（不因 width=50 变 FIXED）"
+    _o2 = LayoutObject(name="AXIS_EXPLICIT2", size_y=SizeY.CONTENT)
     assert _o2.size_y == SizeY.CONTENT
-    _o2.wrap_height = False
-    assert _o2.size_y == SizeY.FIXED, "声明高 > 0 时应退回 FIXED"
-    print("    ✅ wrap_* 派生属性往返通过")
+    print("    ✅ 显式 size_* 生效通过")
+    # 8.4 wrap_width / wrap_height 兼容属性已删除（批次 4.4）
+    _o = LayoutObject(name="AXIS_NOCOMPAT", width=0, height=0)
+    assert not hasattr(_o, "wrap_width"), "wrap_width 兼容属性应已删除"
+    assert not hasattr(_o, "wrap_height"), "wrap_height 兼容属性应已删除"
+    import inspect as _inspect
+    for _cls in (LayoutObject, TextObject, ImageObject, RectangleObject):
+        _params = _inspect.signature(_cls.__init__).parameters
+        assert "wrap_width" not in _params and "wrap_height" not in _params, \
+            f"{_cls.__name__}.__init__ 不应再有 wrap_* 形参"
+    print("    ✅ wrap_width / wrap_height 兼容面已彻底移除通过")
+    # 8.5 size_* setter 触发失效（内容定尺寸只能靠它设置）
+    _o = LayoutObject(name="AXIS_SET", width=0, height=0)
+    assert _o.size_y == SizeY.FILL
+    _o.size_y = SizeY.CONTENT
+    assert _o.size_y == SizeY.CONTENT and _o._layout_valid is False
+    print("    ✅ size_* setter 生效通过")
+    # 8.6 缺陷 7.10：Style.padding 不再是可变默认参数（每个实例独立）
+    _sa, _sb = Style(), Style()
+    assert _sa.padding is not _sb.padding, \
+        "Style 的 padding 默认值曾共享同一个 Padding 对象（缺陷 7.10），现已改为每次新建"
+    _sa.padding.left = 99
+    assert _sb.padding.left == 0, "改一个 Style 的 padding 不应影响另一个"
+    assert Style().padding.left == 0, "后续新建的 Style 也不应受影响"
+    print("    ✅ Style.padding 可变默认已修通过（缺陷 7.10）")
     # 8.5 size_* setter 触发布局失效
     _o = LayoutObject(name="AXIS_INVAL", width=10, height=10)
     _o.get_effective_height()          # 先跑一次布局

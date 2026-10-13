@@ -49,6 +49,19 @@ import time
 from functools import wraps
 
 
+# pt -> mm 换算系数。
+#
+# 引擎的长度单位是 mm，而字号与 fpdf 的文本度量用 pt。**必须显式换算**的地方：
+#     pdf.cell(w, h) / pdf.set_xy() 等 API 的坐标与尺寸都是**用户空间单位（mm）**，
+#     把 pt 数值直接传进去会被放大 1/0.3528 ≈ 2.8346 倍。
+#
+# 历史上 TextObject.render 把 own_h = 字号 × line_height_ratio（pt 数值）直接传给
+# pdf.cell 的 h，导致格子高虚高 2.8346 倍；又因 fpdf 把文字垂直居中于格子，
+# 文字基线被推到格子中央 —— 22pt 的文字落进 26.4mm 的格子，基线相对盒顶下移
+# 15.5mm，甚至跑出 14.5mm 高的节标题盒子。详见 TECHNICAL.md 3.4d。
+PT_TO_MM = 25.4 / 72.0          # 0.352778
+
+
 # ============================================================================
 # 计时器装饰器
 # ============================================================================
@@ -2179,7 +2192,28 @@ class TextObject(LayoutObject):
         cx = abs_x + self.padding.left
         cy = abs_y + self.padding.top
         inner_w = max(eff_w - self.padding.left - self.padding.right, 0.0)
-        
+        inner_h = max(eff_h - self.padding.top - self.padding.bottom, 0.0)
+
+        # ---- 盒内纵向对齐（align_y）----
+        # _place() 用 align_y 决定"盒子摆在哪"；这里用它决定"文字在盒内摆在哪"。
+        # 两者是同一套语义的两半：盒子定好后，盒内剩余空间按同一条规则分配。
+        #
+        # 此前 render() 完全不读 align_y，文字一律贴在内容区顶边，
+        # 于是 VCENTER / BOTTOM 对文字落点毫无作用（FLOW / TOP / NONE 本就该顶对齐）。
+        text_h_mm = m.total_height * PT_TO_MM
+        if self.name.startswith('Land_'):
+            print(f'[PROBE] {self.name} align_y={self.align_y.value} '
+                  f'text_h_mm={text_h_mm:.3f} inner_h={inner_h:.3f} eff_h={eff_h:.3f} '
+                  f'total_height={m.total_height:.3f} lines={m.line_count}')
+        dy_align = 0.0
+        if text_h_mm < inner_h:
+            if self.align_y == AlignY.VCENTER:
+                dy_align = (inner_h - text_h_mm) / 2
+            elif self.align_y == AlignY.BOTTOM:
+                dy_align = inner_h - text_h_mm
+            # TOP / NONE / FLOW：不偏移（顶对齐）
+        # 文字比盒子高时不加偏移，保持"顶对齐 + 向下溢出"的既有行为。
+
         for li, line in enumerate(m.lines):
             if not line:
                 continue
@@ -2198,12 +2232,18 @@ class TextObject(LayoutObject):
             for (ri, txt, px, _w) in line:
                 r = self._runs[ri]
                 # 基线对齐：本行底边对齐，故片段顶边 = 行顶 + (行高 − 自身行高)
-                own_h = r.font_size * self.line_height_ratio
-                py = cy + line_top + (line_h - own_h)
+                #
+                # 单位说明：line_top / line_h 来自 measure_text，是 **pt** 数值；
+                # 片段自身的行高也用同一 pt 数值 —— 两者相减得到的行内偏移自洽，
+                # 因此 **这一项不需要换算**。
+                own_h_pt = r.font_size * self.line_height_ratio
+                py = cy + dy_align + line_top + (line_h - own_h_pt)
+                # 但 pdf.cell 的 h 是用户空间单位（mm），**必须换算**（见文件头 PT_TO_MM）。
+                own_h_mm = own_h_pt * PT_TO_MM
                 pdf.set_text_color(r.color.r, r.color.g, r.color.b)
                 with font_context(pdf, r.font_name, r.get_font_style(), r.font_size):
                     pdf.set_xy(cx + dx + px, py)
-                    pdf.cell(_w, own_h, txt)
+                    pdf.cell(_w, own_h_mm, txt)
         
         drawn_height = m.total_height
 
@@ -4178,5 +4218,126 @@ if __name__ == "__main__":
     assert _mb.line_count >= 1, "变体缺失时仍应测量成功"
     assert "变体未注册" in _buf3.getvalue(), "变体缺失时应有明确提示（不静默降级）"
     print("    ✅ 字体变体缺失优雅降级通过")
-    
+
+    # 13. 文本落点与盒内对齐（D7 两处缺陷的固化断言）
+    #     背景：render() 曾把 own_h（字号×line_height_ratio，pt 数值）直接当 mm
+    #     传给 pdf.cell，格子高虚高 2.8346 倍；又因 fpdf 把文字垂直居中于格子，
+    #     基线落到格子中央 —— 22pt 的文字基线相对盒顶下移 15.5mm，直接跑出盒子。
+    #     同时 render() 从不读 align_y，VCENTER / BOTTOM 形同虚设。
+    #     这里对"文字画到哪"做直接观测：包住 pdf.set_xy 记录落点。
+    print("\n【13. 文本落点与盒内对齐】")
+
+    # 前面若干断言可能已经 output() 过，那会终结文档；这里换一个全新的 pdf
+    _lp_pdf = FPDF()
+    _lp_pdf.add_page()
+    try:
+        _lp_pdf.add_font("LXGW", '', ".\\Resources\\LXGWWenkai-Regular.ttf")
+        _lp_pdf.add_font("LXGW", 'B', ".\\Resources\\LXGWWenkai-Bold.ttf")
+    except Exception:
+        pass
+
+    _lp_box_h = 30.0
+    _lp_fs = 12          # 单行 12pt 文字实高约 5.08mm << 30mm 盒高，能体现三种对齐的差异
+    # 用 ASCII：这条断言不该依赖中文字体是否可用（无字体时 helvetica 画不了 CJK）
+    _lp_text = "Sample"
+    _lp_root = LayoutObject(name="Land_root", width=360, height=200,
+                            padding=Padding.all(0))
+    _lp_boxes = {}
+    for _i, (_name, _al) in enumerate((("Land_top", AlignY.TOP),
+                                       ("Land_vc", AlignY.VCENTER),
+                                       ("Land_bt", AlignY.BOTTOM))):
+        _lp = TextObject(
+            name=_name, text=_lp_text, font_name=font_name, font_size=_lp_fs,
+            width=100, height=_lp_box_h,
+            size_x=SizeX.FIXED, size_y=SizeY.FIXED,
+            # align_x=NONE 时位置 = avail_x + self._x，故用 x 横向错开；
+            # 若用 AlignX.LEFT，三个盒子都会落在 avail_x 上而完全重叠。
+            x=_i * 120.0, y=0.0,
+            padding=Padding.all(0), align_x=AlignX.NONE, align_y=_al,
+        )
+        _lp_root.add_child(_lp)
+        _lp_boxes[_name] = _lp
+
+    _lp_root.layout(pdf=_lp_pdf, force=True)
+
+    # 计算"文字实高"与"盒顶"（与 render 内的口径一致）
+    _lp_text_h = {}
+    _lp_top = {}
+    for _name, _o in _lp_boxes.items():
+        _m = measure_text(_lp_pdf, _o._runs,
+                          available_width=_o.get_effective_width(),
+                          line_height_ratio=_o.line_height_ratio)
+        _lp_text_h[_name] = _m.total_height * PT_TO_MM
+        _lp_top[_name] = _o.get_absolute_y()
+
+    # 包住 set_xy，抓取 render 实际传入的落点
+    _lp_calls = []
+    _orig_set_xy = _lp_pdf.set_xy
+
+    def _spy_set_xy(x, y):
+        _lp_calls.append((x, y))
+        return _orig_set_xy(x, y)
+
+    for _name, _o in _lp_boxes.items():
+        print(f'[LP] {_name} eff=({_o.get_effective_width():.2f},'
+              f'{_o.get_effective_height():.2f}) abs=({_o.get_absolute_x():.2f},'
+              f'{_o.get_absolute_y():.2f}) runs={len(_o._runs)} text={_o.get_text()!r}')
+    print(f'[LP] root measured_with_pdf={_lp_root._measured_with_pdf} '
+          f'valid={_lp_root._layout_valid}')
+    _lp_actual = {}
+    _lp_buf = _io.StringIO()
+    _lp_pdf.set_xy = _spy_set_xy
+    try:
+        with _ctx.redirect_stdout(_lp_buf):
+            _lp_root.render(_lp_pdf, is_fill=False)
+    finally:
+        _lp_pdf.set_xy = _orig_set_xy     # 无论如何都要还原，避免污染后续断言
+
+    # 三个盒子 x 依次为 0 / 120 / 240，按 x 归位
+    for _name, _o in _lp_boxes.items():
+        _target_x = _o.get_absolute_x()
+        _cand = [y for (x, y) in _lp_calls if abs(x - _target_x) < 1e-6]
+        assert _cand, f"{_name} 未观测到文字绘制落点"
+        _lp_actual[_name] = min(_cand)
+
+    # ⚠️ 三个盒子的 align_y 不同，**盒子自身的位置就不同**（TOP=0 / VCENTER=85 /
+    #    BOTTOM=170）。因此要比的是"文字相对各自盒顶的偏移"，不能比绝对 y。
+    _lp_off = {n: _lp_actual[n] - _lp_top[n] for n in _lp_boxes}
+
+    # 断言 1：三种对齐的落点偏移必须两两不同 —— 旧实现下它们完全相同（都不读 align_y）
+    assert len(set(round(v, 6) for v in _lp_off.values())) == 3, \
+        f"三种对齐方式必须有不同落点偏移，实际 {_lp_off}（旧实现会三者相同）"
+    # 断言 2：顺序必须是 TOP < VCENTER < BOTTOM
+    assert _lp_off["Land_top"] < _lp_off["Land_vc"] < _lp_off["Land_bt"], \
+        f"落点偏移顺序应为 TOP < VCENTER < BOTTOM，实际 {_lp_off}"
+    # 断言 3：TOP 与 VCENTER 的间距应约等于 (盒内高 − 文字实高)/2
+    _lp_inner = _lp_box_h
+    _expect_gap = (_lp_inner - _lp_text_h["Land_top"]) / 2
+    _gap = _lp_off["Land_vc"] - _lp_off["Land_top"]
+    assert abs(_gap - _expect_gap) < 0.05, \
+        f"TOP→VCENTER 间距应为 (盒高−文字实高)/2 = {_expect_gap:.3f}，实际 {_gap:.3f}"
+    # 断言 4：VCENTER → BOTTOM 的间距应与上式相同（居中 -> 贴底）
+    _gap2 = _lp_off["Land_bt"] - _lp_off["Land_vc"]
+    assert abs(_gap2 - _expect_gap) < 0.05, \
+        f"VCENTER→BOTTOM 间距应为 {_expect_gap:.3f}，实际 {_gap2:.3f}"
+    # 断言 5：落点必须落在盒内，且量级合理。
+    #         这是 D7 的核心回归点 —— 旧实现把 own_h（pt 数值）当 mm 传给
+    #         pdf.cell，格子高虚高 2.8346 倍，落点偏移会达到 15mm 量级。
+    #         落点 = 盒顶 + dy_align + 半个字格 + 下降部，
+    #         故合理上界是 文字实高 + 1.5 倍字格高。
+    _lp_own_mm = _lp_fs * 1.2 * PT_TO_MM
+    _lp_dy_max = max(0.0, _lp_box_h - _lp_text_h["Land_top"])   # BOTTOM 的 dy_align
+    _lp_bound = _lp_dy_max + _lp_text_h["Land_top"] + _lp_own_mm * 1.5
+    for _name in _lp_boxes:
+        _off = _lp_off[_name]
+        assert _off >= 0.0, f"{_name} 落点不应在盒顶之上，实际 {_off:.3f}"
+        assert _off <= _lp_bound, \
+            (f"{_name} 落点偏移 {_off:.2f}mm 超出合理上界 {_lp_bound:.2f}mm"
+             f"（盒高 {_lp_box_h:.1f} / 文字实高 {_lp_text_h[_name]:.2f} / "
+             f"字格高 {_lp_own_mm:.2f}），疑似格子高单位未换算")
+    print(f"    ✅ 盒内对齐通过（TOP/VCENTER/BOTTOM 偏移 "
+          f"{ {k: round(v, 2) for k, v in _lp_off.items()} }，"
+          f"文字实高 {_lp_text_h['Land_top']:.2f}mm）")
+    print(f"    ✅ 文字落在盒内通过（最大偏移 {max(_lp_off.values()):.2f}mm）")
+
     print("\n✅ 回归契约断言全部通过")

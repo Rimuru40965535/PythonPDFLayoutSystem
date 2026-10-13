@@ -366,6 +366,19 @@ class Theme:
     # （12pt × 1.2 = 5.08mm），否则中层会明确报错。
     contact_icon_width: float = 4.0
     contact_icon_gap: float = 2.0
+    # 图标左缩进。**必须 > 0**：`add_para` 的 indent 为 0 时图标会精确贴在
+    # 蓝底左栏的边界上（实测 x = 10.00 = 蓝底 abs_x），目视就是"顶到边了"。
+    # 取 3.0 与姓名行（`add_info` 的 row_inset=3.0）左对齐。
+    contact_left_indent: float = 3.0
+    # 联系方式之间的留白（mm）。决定行间距 = 行高 + 本值。
+    # 12pt 文本行高 5.08mm，故 3.0 → 行间距 8.08mm。
+    # ⚠️ 这是**顶层**的疏密选择，没有改中层 `Spacing.between_contacts` 的默认值
+    #    （那个是中层的通用默认，保持 5.0 不动）。
+    contact_gap: float = 3.0
+
+    # ---- 技能/证书/荣誉的左缩进 ----
+    # 标题行与正文行必须用**同一个值**，否则标题比正文更靠右、参差不齐。
+    skills_left_indent: float = 3.0
 
     # ---- 版面标签文案（逐简历可被数据类覆盖）----
     summary_title: str = "个人总结"
@@ -396,6 +409,19 @@ class Theme:
     ICON_ADDRESS: str = field(default=r".\Resources\contact_address.png", init=False)
     ICON_WEBSITE: str = field(default=r".\Resources\website.png", init=False)
 
+    def skills_body_padding(self) -> Padding:
+        """
+        技能正文的文本块内边距 = 左缩进 + 上下沿用 `body_inner_padding`。
+
+        ⚠️ 不能直接把 `body_inner_padding` 传下去：那样正文左缩进为 0，
+        而标题行有缩进，两者左边缘会差一个缩进值。
+        """
+        base = self.body_inner_padding
+        if base is None:
+            base = Padding.all(2)       # 与中层默认一致
+        return Padding(left=self.skills_left_indent,
+                       right=base.right, top=base.top, bottom=base.bottom)
+
     def __post_init__(self):
         # 样式默认值从 STYLES 取 —— 这样中层的样式改动会自动跟过来
         if self.section_title_style is None:
@@ -407,7 +433,10 @@ class Theme:
         if self.summary_style is None:
             self.summary_style = STYLES["summary_text"]
         if self.skills_title_style is None:
-            self.skills_title_style = STYLES["skillsawards_title"]
+            # **加粗**：中层 `STYLES["skillsawards_title"]` 的 bold=False，
+            # 但 14pt 非粗体做块标题偏弱（用户反馈"取消粗体后观感变差"）。
+            # 这是**顶层**的呈现决定，用 replace 派生，不改中层的共享 STYLES。
+            self.skills_title_style = STYLES["skillsawards_title"].replace(bold=True)
         if self.skills_text_style is None:
             self.skills_text_style = STYLES["skillsawards_text"]
         if self.name_icon_style is None:
@@ -487,14 +516,14 @@ def _fill_left_column(column: LayoutObject, resume: Resume,
             text=value,
             icon=icon_path,
             icon_width=theme.contact_icon_width,
-            indent=0.0,
+            indent=theme.contact_left_indent,
             gap=theme.contact_icon_gap,
             style=theme.contact_text_style,
             layer=1,
         )
         # N 条之间只应有 N-1 个留白
         if i < len(contacts) - 1:
-            _spacer(column, f"Lead_Left_Contact_{i}", spacing.between_contacts)
+            _spacer(column, f"Lead_Left_Contact_{i}", theme.contact_gap)
 
     if contacts:
         _spacer(column, "Lead_Left_Contacts_Skills", spacing.contacts_skills)
@@ -517,12 +546,13 @@ def _fill_skills_awards(column: LayoutObject, resume: Resume,
 
     blocks = resume.skills_awards.blocks(theme)
     for i, (block_name, block_title, items) in enumerate(blocks):
+        # 标题行：左缩进与正文行**同一值**，否则标题比正文更靠右、参差不齐
         column.add_text_row(
             name=f"{column.name}_{block_name}_title",
             text=block_title,
             style=theme.skills_title_style,
             height=skills_row_height(theme.skills_title_style),
-            row_padding=Padding.left(2),
+            row_padding=Padding.left(theme.skills_left_indent),
             text_padding=Padding.all(0),
             align_x=AlignX.LEFT, align_y=AlignY.VCENTER, layer=1,
         )
@@ -531,7 +561,9 @@ def _fill_skills_awards(column: LayoutObject, resume: Resume,
             description="\n".join(items),
             style=theme.skills_text_style,
             height=None,                       # ← 由内容结算
-            inner_padding=theme.body_inner_padding,
+            # 左缩进做进文本块内边距，与标题行对齐；
+            # 上下内边距沿用 body_inner_padding（None = 中层默认 2mm）
+            inner_padding=theme.skills_body_padding(),
             layer=1,
         )
         if i < len(blocks) - 1:
@@ -934,12 +966,26 @@ def _selftest() -> int:
     check(f"行高 = 文本行高（{row_h9:.3f} vs {line_h9:.3f}）",
           abs(row_h9 - line_h9) < 0.01,
           "行高被图标撑起" if abs(row_h9 - line_h9) >= 0.01 else "")
-    # 相邻两条的间距必须 = 行高 + between_contacts
+    # 相邻两条的间距必须 = 行高 + theme.contact_gap
     if len(paras9) >= 2:
         pitch9 = paras9[1].get_absolute_y() - paras9[0].get_absolute_y()
-        want9 = line_h9 + Spacing().between_contacts
-        check(f"行间距 = 行高 + between_contacts（{pitch9:.3f} vs {want9:.3f}）",
+        want9 = line_h9 + th9.contact_gap
+        check(f"行间距 = 行高 + contact_gap（{pitch9:.3f} vs {want9:.3f}）",
               abs(pitch9 - want9) < 0.01)
+    # 图标左缩进必须 > 0，否则图标贴在蓝底左栏边界上（用户目视发现过）
+    if paras9:
+        icon_x9 = min(
+            (g.get_layout_info()["effective"]["x"]
+             for c in paras9[0].children for g in c.children
+             if type(g).__name__ == "ImageObject"),
+            default=None)
+        lc_x9 = lc9.get_layout_info()["effective"]["x"]
+        if icon_x9 is None:
+            check("能在段落里找到图标对象", False)
+        else:
+            check(f"图标有左缩进（{icon_x9 - lc_x9:.2f}mm > 0）",
+                  icon_x9 - lc_x9 > 0.5,
+                  "图标贴在蓝底边界上" if icon_x9 - lc_x9 <= 0.5 else "")
     # 图标必须锚定在**首行中心**（不是整块中心）
     if paras9:
         p0 = paras9[0]
@@ -955,6 +1001,42 @@ def _selftest() -> int:
                   abs(ic_c - line_h9 / 2) < 0.001)
         else:
             check("能在段落里找到图标对象", False)
+
+    # ---- V10 左栏左边缘对齐 + 技能标题加粗 ----
+    # 起因（用户目视发现）：技能标题是 2mm、正文 0mm、联系方式 0mm（贴蓝底），
+    # 三者参差不齐；且技能标题非粗体，观感偏弱。
+    print("\n【V10】左栏左边缘对齐 + 技能标题加粗")
+    th10 = Theme()
+    check("技能标题为粗体", th10.skills_title_style.bold is True,
+          f"bold={th10.skills_title_style.bold}")
+    check("技能标题字号未被改动（14pt）",
+          th10.skills_title_style.font_size == STYLES["skillsawards_title"].font_size,
+          f"{th10.skills_title_style.font_size} vs "
+          f"{STYLES['skillsawards_title'].font_size}")
+    check("中层的 skillsawards_title 未被污染（仍非粗体）",
+          STYLES["skillsawards_title"].bold is False,
+          "顶层 replace 应派生新对象，不能改共享 STYLES")
+    # 技能标题与正文的左边缘必须一致
+    root10 = quiet(build_layout, _sample("甲"), th10, Spacing())
+    lc10 = root10.find_by_name("Root_left_column")
+    base_x10 = lc10.get_layout_info()["effective"]["x"]
+
+    def text_x10(o):
+        xs = []
+        if type(o).__name__ == "TextObject":
+            xs.append(o.get_layout_info()["effective"]["x"] + o.padding.left)
+        for c in o.children:
+            xs += text_x10(c)
+        return xs
+
+    t_x = text_x10(lc10.find_by_name(f"{lc10.name}_skills_title_content"))
+    b_x = text_x10(lc10.find_by_name(f"{lc10.name}_skills_details"))
+    if t_x and b_x:
+        off_t, off_b = min(t_x) - base_x10, min(b_x) - base_x10
+        check(f"技能标题与正文左边缘一致（{off_t:.2f} vs {off_b:.2f}）",
+              abs(off_t - off_b) < 0.01 and off_t > 0.5)
+    else:
+        check("能找到技能标题与正文的文字对象", False)
 
     # ---- V5 不溢出 ----
     # ⚠️ 两层检查都要做：

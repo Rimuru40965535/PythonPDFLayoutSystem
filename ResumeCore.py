@@ -51,6 +51,7 @@
 ================================================================================
 """
 
+import copy
 import os
 import dataclasses
 from dataclasses import dataclass, field
@@ -332,10 +333,10 @@ class Resume:
 
 
 # ============================================================================
+# ============================================================================
 # 2. 版式配置（跨简历稳定的呈现信息）
 # ============================================================================
 
-@dataclass
 @dataclass
 class ValidationReport:
     """
@@ -1461,6 +1462,48 @@ def _selftest() -> int:
     else:
         check("能找到技能标题与正文的文字对象", False)
 
+    # ---- V11 多版本管理：素材共享 + 装配隔离 ----
+    # 起因：旧仓库的 `BlankResumeTemplateWithTestData.py` / `Resume_MultiVersion_main.py`
+    # 要的就是"一份基础信息 → 投多个岗位"。核心风险是**素材被装配过程污染** ——
+    # 一旦污染，第二个版本就会悄悄变形，而且很难查。
+    print("\n【V11】多版本：素材共享 + 装配隔离")
+    _v11_sec = Section(title="测试节")
+    _v11_sec.add_detail(Details(key="A"))
+    _v11_sec.add_detail(Details(key="B"))
+    _book = ResumeBook(profile=Profiles(name="测试"),
+                       output_dir=os.path.join(out_root, "v11"))
+    _book.add_section(_v11_sec)
+    # 同名节默认必须报错（静默覆盖会让"池里到底是哪一份"不可知）
+    try:
+        _book.add_section(Section(title="测试节"))
+        check("同名节默认报错", False, "没有报错")
+    except ValueError:
+        check("同名节默认报错（要覆盖须显式 replace=True）", True)
+    # 引用不存在的节必须被体检抓到
+    _bad_book = ResumeBook(profile=Profiles(name="X"))
+    _bad_book.add_version(ResumeVersion(name="bad", sections=["不存在"]))
+    check("引用不存在的节会被体检抓到", len(_bad_book.validate()) == 1,
+          str(_bad_book.validate()))
+    _book.add_version(ResumeVersion(name="v1", job="J1",
+                                    sections=["测试节"], summary="s1"))
+    _book.add_version(ResumeVersion(name="v2", job="J2",
+                                    sections=["测试节"], summary="s2"))
+    check("装配前体检通过", _book.validate() == [], str(_book.validate()))
+
+    # 关键：装配结果是**深拷贝**，改它不影响素材池，也不影响另一个版本
+    _r1 = _book.build("v1")
+    _r2 = _book.build("v2")
+    check("装配结果不是素材本身（深拷贝）",
+          _r1.sections[0] is not _book.find_section("测试节"))
+    _before = len(_book.find_section("测试节").details)
+    _r1.sections[0].details.pop()
+    _after = len(_book.find_section("测试节").details)
+    check(f"改装配结果不污染素材池（{_before} -> {_after}）", _before == _after)
+    check("另一个版本不受影响", len(_r2.sections[0].details) == _before)
+    check("不同版本文件名不冲突",
+          _r1.get_file_name() != _r2.get_file_name(),
+          f"{_r1.get_file_name()} vs {_r2.get_file_name()}")
+
     # ---- V5 不溢出 ----
     # ⚠️ 两层检查都要做：
     #   ① 页面边界 —— 元素绝对框不得越出纸面
@@ -1548,5 +1591,240 @@ def _selftest() -> int:
     return 0 if ok else 1
 
 
+# ============================================================================
+# 6. 多版本管理（一份基础信息 → 投多个岗位）
+# ============================================================================
+
+@dataclass
+class ResumeVersion:
+    """
+    一个**投递版本**：同一份基础信息（`Profiles` / `SkillsAwards`）下，
+    挑选哪些节、配哪一档留白。
+
+    存在意义：投不同公司时，改动很小（挑几节、换留白、改标题），
+    但直接复制整份 `Resume` 会导致"改一处要改 N 处"。
+    这里把差异压缩到"选节 + 留白"两件事上，基础信息与节素材都**共享**。
+
+    用法（详见 `demo_multi_version.py`）：
+
+        v = ResumeVersion(name="腾讯", company="腾讯科技", job="后端开发工程师",
+                          sections=["教育背景", "项目经历"],
+                          summary="…")
+    """
+    name: str = ""                                  # 版本名（仅用于日志）
+    company: str = ""
+    job: str = ""
+    sections: List[str] = field(default_factory=list)   # 节的标题，按序取用
+    summary: str = ""
+    spacing: Optional[Spacing] = None               # None = 用 ResumeBook 的默认
+    theme: Optional[Theme] = None                   # None = 用 ResumeBook 的默认
+    extra_sections: List[Section] = field(default_factory=list)  # 本版本独有的节
+
+    def describe(self) -> str:
+        return (f"{self.name or self.job or '未命名'}："
+                f"{len(self.sections)} 节 + {len(self.extra_sections)} 独有节"
+                f"（{self.company or '未指定公司'} / {self.job or '未指定职位'}）")
+
+
+@dataclass
+class ResumeBook:
+    """
+    简历素材库 + 多版本装配台。**这是"批量生成"的落地形式。**
+
+    三件事：
+
+        1. `profile` / `skills_awards`  —— 基础信息，所有版本共享
+        2. `section_pool`               —— 节素材池，按 `Section.title` 取用
+        3. `versions`                   —— 各投递版本（选节 + 留白）
+
+    装配时**深拷贝**选中的节，所以多个版本之间互不干扰
+    —— 一个版本里删掉一条详情，不会影响另一个版本。
+
+    用法：
+
+        book = ResumeBook(profile=me, skills_awards=sa, spacing=Spacing())
+        book.add_section(edu)            # 放进素材池
+        book.add_version(ResumeVersion(name="腾讯", sections=["教育背景"], ...))
+        report = book.render_all(output_dir="output")
+        book.summarize(report)           # 一行一版地打印结果
+
+    只渲染某几个版本：
+
+        book.render_all(only=["腾讯", "华为"])
+        book.enabled = ["腾讯"]          # 或在 book 上设白名单
+    """
+
+    profile: Profiles = field(default_factory=Profiles)
+    skills_awards: SkillsAwards = field(default_factory=SkillsAwards)
+    section_pool: List[Section] = field(default_factory=list)
+    versions: List[ResumeVersion] = field(default_factory=list)
+    spacing: Spacing = field(default_factory=Spacing)
+    theme: Theme = field(default_factory=Theme)
+    output_dir: str = "./output"
+    enabled: Optional[List[str]] = None      # None = 全部；否则只渲染列出的版本名
+
+    # ---- 素材 ----
+
+    def add_section(self, section: Section, *, replace: bool = False) -> 'ResumeBook':
+        """
+        把一节放进素材池（按 `title` 索引），返回 self 以便链式调用。
+
+        Args:
+            replace: 已存在同名节时是否覆盖。默认 False 会**报错** ——
+                     静默覆盖会让"素材池里到底是哪一份"变得不可知。
+        """
+        title = section.title
+        if not title:
+            raise ValueError("ResumeBook.add_section: 节的 title 不能为空（用作取用键）")
+        existing = self.find_section(title)
+        if existing is not None and not replace:
+            raise ValueError(
+                f"ResumeBook.add_section: 素材池里已有标题为 {title!r} 的节。"
+                f"要覆盖请传 replace=True")
+        if existing is not None:
+            self.section_pool[self.section_pool.index(existing)] = section
+        else:
+            self.section_pool.append(section)
+        return self
+
+    def find_section(self, title: str) -> Optional[Section]:
+        """按标题取素材池里的节（没有则 None）"""
+        for sec in self.section_pool:
+            if sec.title == title:
+                return sec
+        return None
+
+    def add_version(self, version: ResumeVersion) -> 'ResumeBook':
+        self.versions.append(version)
+        return self
+
+    # ---- 装配 ----
+
+    def build(self, version: Union[ResumeVersion, str]) -> Resume:
+        """
+        把一个版本装配成 `Resume`（**深拷贝**节，版本之间互不干扰）。
+
+        Args:
+            version: `ResumeVersion` 对象，或版本名（在 `versions` 里查）
+        """
+        if isinstance(version, str):
+            found = self.find_version(version)
+            if found is None:
+                raise KeyError(f"ResumeBook.build: 找不到名为 {version!r} 的版本")
+            version = found
+
+        sections: List[Section] = []
+        for title in version.sections:
+            sec = self.find_section(title)
+            if sec is None:
+                raise KeyError(
+                    f"ResumeBook.build: 版本 {version.name!r} 引用了素材池里没有的节 "
+                    f"{title!r}；池中现有：{[x.title for x in self.section_pool]}")
+            sections.append(copy.deepcopy(sec))
+        for sec in version.extra_sections:
+            sections.append(copy.deepcopy(sec))
+
+        return Resume(
+            intend_company=version.company,
+            intend_job=version.job,
+            profile=copy.deepcopy(self.profile),
+            skills_awards=copy.deepcopy(self.skills_awards),
+            sections=sections,
+            summary=version.summary,
+        )
+
+    def find_version(self, name: str) -> Optional[ResumeVersion]:
+        for v in self.versions:
+            if v.name == name:
+                return v
+        return None
+
+    def active_versions(self, only: Optional[Sequence[str]] = None
+                        ) -> List[ResumeVersion]:
+        """要渲染哪些版本：`only` 优先，其次 `self.enabled`，都没有则全部"""
+        names = list(only) if only else self.enabled
+        if not names:
+            return list(self.versions)
+        return [v for v in self.versions if v.name in names]
+
+    # ---- 渲染 ----
+
+    def render_all(self, output_dir: Optional[str] = None, *,
+                   only: Optional[Sequence[str]] = None,
+                   creation_date: Optional[datetime] = None,
+                   debug: int = 0) -> List[tuple]:
+        """
+        渲染选中的全部版本。
+
+        Returns:
+            `[(版本, Resume, 产物路径), ...]`
+        """
+        out = output_dir if output_dir is not None else self.output_dir
+        result: List[tuple] = []
+        for v in self.active_versions(only):
+            resume = self.build(v)
+            kw = {}
+            if v.spacing is not None:
+                kw["spacing"] = v.spacing
+            if v.theme is not None:
+                kw["theme"] = v.theme
+            path = render(resume, out, creation_date=creation_date,
+                          debug=debug, **kw)
+            result.append((v, resume, path))
+        return result
+
+    def validate(self) -> List[str]:
+        """
+        装配前检查：所有版本引用的节是否都在素材池里。
+
+        返回问题清单（空 = 没问题）。这就是"投递前先体检"，
+        避免渲染到一半才发现某个版本引用了不存在的节。
+        """
+        pool = {sec.title for sec in self.section_pool}
+        problems: List[str] = []
+        seen: Dict[str, int] = {}
+        for v in self.versions:
+            if not v.name:
+                problems.append("有一个版本没有 name")
+            seen[v.name] = seen.get(v.name, 0) + 1
+            missing = [t for t in v.sections if t not in pool]
+            if missing:
+                problems.append(
+                    f"版本 {v.name!r} 引用了素材池里没有的节：{missing}")
+            if not v.sections and not v.extra_sections:
+                problems.append(f"版本 {v.name!r} 一节都没有")
+        for name, n in seen.items():
+            if n > 1:
+                problems.append(f"版本名 {name!r} 重复出现 {n} 次（会互相覆盖产物文件名）")
+        return problems
+
+    def summarize(self, rendered: Optional[Sequence[tuple]] = None) -> None:
+        """打印素材池与渲染结果（一行一版）"""
+        print(f"  素材池：{len(self.section_pool)} 节 "
+              f"{[s.title for s in self.section_pool]}")
+        print(f"  版本数：{len(self.versions)}")
+        if rendered is None:
+            return
+        for v, resume, path in rendered:
+            size = os.path.getsize(path) if path and os.path.exists(path) else 0
+            print(f"    ✅ {v.describe():<52} {size:>7} 字节  {path}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "profile": self.profile.to_dict(),
+            "skills_awards": self.skills_awards.to_dict(),
+            "section_pool": [s.to_dict() for s in self.section_pool],
+            "versions": [dataclasses.asdict(v) if not isinstance(v, ResumeVersion)
+                         else {
+                             "name": v.name, "company": v.company, "job": v.job,
+                             "sections": list(v.sections), "summary": v.summary,
+                             "has_spacing": v.spacing is not None,
+                             "has_theme": v.theme is not None,
+                             "extra_sections": [s.to_dict() for s in v.extra_sections],
+                         } for v in self.versions],
+        }
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -112,7 +112,7 @@ Resources/*
 > 完整素材清单（文件名 + 使用方）见 `TECHNICAL.md` 的「资源清单」。
 
 > ⚠️ **中层本身不依赖任何图标文件**：`ResumeTemplate.py` 里 5 处图片引用**全在
-> `__main__` 测试入口内**；`add_profile` / `add_section_title` 只接收
+> `__main__` 测试入口内**；`add_info` / `add_photo` / `add_section_heading` 只接收
 > `icon_style` 与 `image_path` 参数，`STYLES` 里的 `image_path` 都是空串。
 > 也就是说素材是**顶层与测试**的事，不是中层的事。
 
@@ -131,16 +131,44 @@ Resources/*
 
 | 项 | 说明 |
 | --- | --- |
-| 方法风格 API | `generate_*` / `fill_*` 共 11 个符号**全部移除**，替换为挂在 `LayoutObject` 上的 10 个 `add_*` 方法 |
-| 结果句柄 | 7 个 dataclass 句柄（`BasicHandle` / `ProfileHandle` / … ），部件走属性访问，不再靠字符串查询 |
-| 列表入口 | `add_details_list(items)` —— 同一蓝图复用 N 次 |
-| 组合模板 | `add_section(section)` = 节标题 + N × 详情 |
+| 方法风格 API | `generate_*` / `fill_*` 共 11 个符号**全部移除**，替换为挂在 `LayoutObject` 上的 `add_*` 方法 |
+| 结果句柄 | dataclass 句柄（`SplitHandle` / `ProfileHandle` / `TitleHandle` / `DetailsHandle` / … ），部件走属性访问，不再靠字符串查询 |
+| 组合模板 | `add_section(section)` = 分节标题 + N × 详情 |
 | 文本行构件 | `add_text_row(...)` —— 技能/证书/荣誉三段从约 200 行收敛为一次循环 |
 | 三栏改用 `create_band` | 手算 `col_widths` + `cumulative_x` 的写法删除 |
-| 证件照与姓名撞名 | 照片节点前缀改 `photo_`，消除 `profile_photo_0_content` vs `profile_0_content` 覆盖 |
+| 证件照与姓名撞名 | 照片节点前缀改 `photo_`，消除 `photo_0_content` vs `name_0_content` 覆盖 |
 | 分隔线命名 | `section_title_{i}_divider` 含 index，消除同名解析不一致 |
-| 个人总结命名空间 | 独立为 `summary_{i}_*`，不再与节详情共用前缀 |
-| 个人信息行左缩进 | 从"行内容器内边距"改为"整条横带右移 + 同步收窄宽度"，消除原先 3mm 的右侧溢出 |
+| 个人信息行左缩进 | 从"横带右移 + 手动收窄"改为**行容器的内边距**，消除原先 23mm 的右侧溢出 |
+
+#### B·续：子模板重整（S1–S6，2026-10-13）—— ✅ 完成
+
+按"同一套模板 + 参数预设即可，不必分家"的原则重塑。**重塑期间版面零变化**
+（S0 基线 vs S6 现状：96 个节点结构/几何/属性全部一致）。
+
+| 步骤 | 内容 |
+| --- | --- |
+| S1 | **惰性共享测量实例** `measure_pdf()` + `wrapped_height()` / `wrapped_lines()` + `reset_measure_pdf()` |
+| S2 | `add_basic` → **`add_split`**（任意 N 栏、各栏颜色/内边距/缩进、`SplitHandle.cells`） |
+| S3 | `add_profile_photo` → **`add_photo`**；`add_profile` → **`add_info`**（`variant="name"/"contact"` 两个预设，同一套实现） |
+| S4 | `add_section_title` → **`add_section_heading`** |
+| S5 | `add_details` 拆为 **`add_detail`**（容器）+ **`add_detail_head`**（标题三栏）+ **`add_detail_body`**（描述），三者均可单独调用 |
+| S6 | 退役 `add_summary` / `add_details_list`；`ResumeCore` 调用点全部迁移。**旧名不留兼容层** |
+
+**S1 的硬性约束（务必遵守）**：
+
+> **模板内部不要新建 FPDF 实例做测量。** 实测（30 次测量）：
+> 复用同一实例 **23.56 ms**，每次新建 **30 559 ms**（注册字体 345 ms/次，
+> 净增内存 **2.5 GB**）。更致命的是未注册字体的实例**测不了中文** ——
+> `measure_text` 内部直接调 `pdf.get_string_width`，fpdf 对 CJK 抛
+> `FPDFUnicodeEncodingException`，而 `font_context` 的"优雅降级"只处理
+> *变体缺失*、不处理*编码不支持*，异常会一路冒泡。
+> 因此统一走 `measure_pdf()` 这个**惰性共享实例**（只建一次、从不 output）。
+
+**新增能力（S1–S6 之外的对外能力）**：`add_split` 的 N 栏与按栏配色、
+`add_info` 的 variant 预设、`add_detail_head` / `add_detail_body` 的独立可用性。
+
+**验收工具**：结构快照逐节点比对（见 F.1）。重命名会让节点名变化，
+因此快照同时记录**结构路径**（重命名不影响结构）——凭它做到"重塑但版面不变"。
 
 ### C. 顶层 · 领域层（`ResumeCore.py`）—— ✅ 2026-10-13 全部完成
 

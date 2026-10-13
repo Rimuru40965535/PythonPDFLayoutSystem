@@ -320,6 +320,58 @@ fpdf 又把文字**垂直居中**在格子里，于是基线落到格子中央�
 > 本分支已 rebase 到它之上 —— `master` 现在是本分支的祖先。
 > `SKILLS.md` 的 D7 专项已同步标为「已完成」。
 
+#### **14：30 中层子模板重整（S1–S6）：重塑命名 + 拆分职责**
+
+按"同一套模板 + 参数预设即可，不必分家"的原则重整中层。
+**重塑期间版面零变化** —— 每一步都用结构快照逐节点验收。
+
+| 步骤 | 内容 |
+| --- | --- |
+| S1 | 新增**惰性共享测量实例** `measure_pdf()` + `wrapped_height()` / `wrapped_lines()` |
+| S2 | `add_basic` → **`add_split`**（任意 N 栏、各栏颜色、各栏缩进、`SplitHandle`） |
+| S3 | `add_profile_photo` → **`add_photo`**；`add_profile` → **`add_info`**（一套模板，`variant="name"/"contact"` 两个预设） |
+| S4 | `add_section_title` → **`add_section_heading`** |
+| S5 | `add_details` 拆成 **`add_detail`**（容器）+ **`add_detail_head`**（标题三栏）+ **`add_detail_body`**（描述），三者都能单独调用 |
+| S6 | 退役 `add_summary` / `add_details_list`；`ResumeCore` 全部调用点迁移 |
+
+**新 API 一览（11 个方法，全部挂在节点上调用）**
+
+```python
+root.add_split(ratio=[1.0, 2.5], colors=[RimuruBlue, None])   # 任意 N 栏
+col.add_info(index=0, variant="name", text="张三", image_path=...)   # 姓名行
+col.add_info(index=1, text="138-0000-0000", image_path=...)          # 基础信息行
+col.add_photo(index=0, image_path="...")                             # 证件照
+col.add_section_heading(index=0, title="教育背景", image_path=...)   # 分节标题
+col.add_detail(index=0, key=..., during_time=..., tags=..., description=...)
+col.add_detail_head(prefix)  /  col.add_detail_body(prefix)          # 可单独使用
+col.add_section(section) / col.add_text_row(...) / col.add_spacer(...)
+```
+
+**S1 的关键发现：模板内部不能新建 PDF 测量实例**
+
+| 方式 | 30 次测量 | 备注 |
+| --- | --- | --- |
+| 复用同一实例 | **23.56 ms** | 采用此方案 |
+| 每次新建实例 | **30 559 ms** | 注册字体 345 ms/次，净增内存 **2.5 GB** |
+
+更致命的是**未注册字体的实例测不了中文**：`measure_text` 内部直接调
+`pdf.get_string_width`，fpdf 对 CJK 抛 `FPDFUnicodeEncodingException`，
+而引擎的"优雅降级"只处理*变体缺失*、不处理*编码不支持*，异常会一路冒泡。
+因此改为**惰性共享实例**（只建一次、从不 `output`），并提供
+`reset_measure_pdf()` 以免它变成隐藏状态。
+
+**验收方式：结构快照逐节点比对**
+
+重命名会让节点名变化，所以快照同时记录**结构路径**（重命名不影响结构）。
+每步之后与基线比对，要求"结构、几何、属性全部一致"：
+
+| 比对 | 结果 |
+| --- | --- |
+| S1/S2/S3/S5/S6 各自 vs 前一步 | 均 **96/96 完全一致** |
+| **S0 基线 vs S6 现状（跨全部步骤）** | **96/96 完全一致** |
+
+三个入口自检全部 exit=0，引擎自检（含批次 7 新增的第 13 节）也通过。
+
 ---
 
 ---

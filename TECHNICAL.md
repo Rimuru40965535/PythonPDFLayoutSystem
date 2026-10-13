@@ -985,11 +985,88 @@ TextRun(text="", font_name="helvetica", font_size=12,
 | `\*` `\`` `\<` | 转义，输出字面量 |
 
 **不支持的标记原样保留为文本**（不静默丢弃，写错时看得见）；**未闭合的标记也原样保留**。
-嵌套标记暂不支持（内层会被当普通文字）。
 
-#### `measure_text(pdf, runs, available_width, line_height_ratio=1.2) -> TextMetrics`
+**标记可以嵌套，样式会合成**（2026-10-13 修复，此前是单层非递归的）：
 
-用真实 pdf 测量：**摊平成可断行单元 → 贪心装行**。
+| 写法 | 结果 |
+| --- | --- |
+| `<c:CC0000>**都是重点**</c>` | 一段文字，`bold=True` **且** `color=#CC0000` |
+| `**<c:CC0000>都是重点</c>**` | 同上（两种嵌套顺序结果一致） |
+| `<c:CC0000>普通**粗**字</c>` | 三段都红，只有中段加粗 |
+| `**<c:CC0000>*三层*</c>**` | 同时 `bold` + `italic` + `color` |
+| `<c:CC0000><b>同时</b></c>` | 同上 |
+
+合成规则：**外层标记只覆盖它自己那一项，内层已解析出的其它样式全部保留**。
+
+> ⚠️ **实现细节（别改错）**：递归时必须传**外层未加本标记的 `base`**。
+> 否则内层每个片段都会提前继承本标记的样式，随后再叠加一次就重复了 ——
+> 症状是 `<c:CC0000>普通**粗**字</c>` 里的"普通"也会被染红。
+
+> ⚠️ **已知限制**：`**粗*斜***`（粗体结尾紧接斜体结尾）仍有歧义，得到
+> `'粗*斜'` + 孤立 `'*'`。原因是 `\*\*(.+?)\*\*` 与 `\*(.+?)\*` 在重叠定界符上
+> 无法用交替正则表达。**请改用 HTML 写法**，实测可靠：
+> `<b>粗<i>斜</i></b>` → `'粗'=B`、`'斜'=B|I`（星号外壳与 HTML 内层可混用）。
+
+> **修复前的实际危害**：给重点同时上"粗体 + 彩色"是最自然的写法，而它当时会
+> **静默输出字面的 `**`** 到 PDF 上 —— 不报错、不丢弃，只是印错了。
+
+#### `BreakPolicy` 断行禁则（2026-10-13 新增）
+
+**问题**：此前的断行是纯贪心装行，**没有任何中文排版禁则** —— 收尾标点会落到行首：
+
+```
+宽 60mm: '…还有括号（像这样'      宽 90mm: '…逗号、句号'
+         '）以及书名号《示例》。'  <==        '。还有括号…'   <==
+```
+
+```python
+@dataclass(frozen=True)
+class BreakPolicy:
+    no_line_start: str = NO_LINE_START   # 40 个收尾类标点：，。、；：？！）】》」』”’…
+    no_line_end:   str = NO_LINE_END     # 起始类标点：（【《「『〔｛〖〘〚“‘([{<
+    pair_brackets: bool = True           # 成对符号整体粘住
+    hang_punctuation: bool = True        # 标点悬挂
+    hang_ratio: float = 1.5              # 悬挂上限 = 字号 × 此值
+
+    @classmethod
+    def loose(cls) -> 'BreakPolicy': ...  # 一键退回旧行为
+```
+
+**实现方式（关键，别改成回溯）**：在**摊平成断行单元**这一层，把违反禁则的相邻单元
+**合并**成一个不可分单元。这样 `measure_text` 与 `render` 共用同一份 `lines`，
+"量出的行数"与"画出的行数"必然一致，不会出现量 3 行画 4 行。
+
+**只做禁则不够 —— 成对符号必须整体粘住**：`（` 禁行尾、`）` 禁行首，
+两者会被分别推来推去，实测「（」留在行尾、「）」被挤到下一行行首，**两个都违规**。
+
+**禁则的副作用与解法（标点悬挂）**：禁则会把收尾标点粘到前一个字上，
+满行时整个「能。」被推到下一行，末行只剩「。」—— **行数从 4 增到 5**。
+解法是**标点悬挂**：若拟折行单元的**尾部**是禁行首标点，则允许这部分标点略微
+悬挂出界（上限 = 字号 × `hang_ratio`），而不是把整个单元挤下去。
+`TextMetrics.line_hang` 记录每行的悬挂量；悬挂只影响绘制，**不计入** `total_height`。
+
+**实测效果**（16 个「文本 × 宽度」组合）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 断行发生变化的组合 | **9 / 16** |
+| 行首/行尾违规 | **0**（旧行为下每段都有 1 处） |
+| 悬挂带来的行数变化 | **只减不增**：6→5、5→4、4→3 行 |
+| 非末行剩余空白 | **0.03mm**（关闭悬挂时 5.33mm） |
+
+**入口**：`measure_text(policy=…)` / `TextObject(break_policy=…)`。
+`None` 表示用引擎默认 `DEFAULT_BREAK_POLICY`（启用禁则）。
+
+> **对当前简历产物影响为零**：右栏描述可用宽 123.71mm，现有 4 段文案都没折行，
+> 旧版在该宽度下本就没有违规。这是**预防性修正**，换更长文案才会立刻生效。
+
+> ⚠️ **更正一处过期文档**：`measure_text` 的 docstring 曾声称"复用 fpdf2 的
+> `multi_cell`、必须显式传 `align='L'` / `wrapmode`"。那是批次 5 之前的实现；
+> 现在不再调用 `multi_cell`，那两个 workaround 早已无意义。
+
+#### `measure_text(pdf, runs, available_width, line_height_ratio=1.2, policy=None) -> TextMetrics`
+
+用真实 pdf 测量：**摊平成可断行单元 → 贪心装行**（自写，不调用 fpdf 的 `multi_cell`）。
 
 | 切分规则 | 说明 |
 | --- | --- |
@@ -1162,7 +1239,7 @@ root.add_split(...)              # 而不是 generate_basic_subtemplate(root=...
 column.add_detail(...)           # 而不是 generate_section_details_template(root=...)
 ```
 
-**当前 13 个已挂载方法**：
+**当前 14 个已挂载方法**：
 
 | 分类 | 方法 |
 | --- | --- |
@@ -1170,7 +1247,8 @@ column.add_detail(...)           # 而不是 generate_section_details_template(r
 | 左栏 | `add_info` / `add_photo` / `add_highlight` |
 | 右栏 | `add_section_heading` / `add_section` / `add_detail` |
 | 详情部件 | `add_detail_head` / `add_detail_body` |
-| 通用 | `add_bullets` / `add_text_row` / `add_spacer` |
+| 分条目 | `add_bullets` / `add_bullet_list` |
+| 通用 | `add_text_row` / `add_spacer` |
 
 > **旧名已全部退役、不留兼容层**：`add_profile`、`add_profile_photo`、
 > `add_section_title`、`add_details`、`add_details_summary`、`add_summary`、
@@ -1212,7 +1290,30 @@ wrapped_lines(text, style, available_width, line_height_ratio=1.2, pdf=None) -> 
 > 旧版本在本层重复定义了一份 `class Style` 并遮蔽引擎版本，两边会悄悄漂移；
 > 现已删除。`ResumeTemplate.Style is LayoutEngine.Style` 由顶层测试入口断言守住。
 
-`STYLES` 键一览（19 个）：
+**`Style` 的字段分两类**（2026-10-13 起）：
+
+| 类别 | 字段 | 说明 |
+| --- | --- | --- |
+| 长什么样 | `font_name` / `font_size` / `bold` / `italic` / `color` / `fill_color` / `image_path` / `fit_mode` | 原有 |
+| **文字在框里怎么摆** | `align_x` / `align_y` / `line_height_ratio` / `break_policy` | **新增，默认全 None = "样式不表态"** |
+
+新增的四个字段由 `TextObject.from_style` 以**三态继承**使用：
+
+```
+显式实参  >  样式字段  >  构造默认值
+```
+
+因此"样式不表态"时行为与从前逐字节相同；而 `Style(align_y=…)` 这类设置在
+调用方不覆盖时会生效。想让某处单独生效又怕污染共用样式时，用 `Style.replace()`：
+
+```python
+mine = STYLES["detail_time_1"].replace(align_y=AlignY.VCENTER)   # 私有副本，原样式不动
+```
+
+> `Style` 是普通类（不是 dataclass），此前没有 `copy` / `replace`，
+> 就地改属性会污染 `STYLES` 里所有共用者 —— 这是本次补 `replace()` 的原因。
+
+`STYLES` 键一览（22 个）：
 
 | 键 | 用途 | 关键属性 |
 | --- | --- | --- |
@@ -1224,10 +1325,20 @@ wrapped_lines(text, style, available_width, line_height_ratio=1.2, pdf=None) -> 
 | `contact_text` | 联系方式（备用） | LXGW 10pt |
 | `skillsawards_title` / `skillsawards_text` | 技能/证书/荣誉 | LXGW 14pt / 10pt |
 | `section_title_text` | 节标题 | LXGW 22pt 粗体，深蓝 |
-| `detail_key_1` / `detail_time_1` / `detail_tags_1` | 详情三栏（默认） | 13pt 粗 / 7pt（`Padding.top(5)`）/ 8pt |
+| `detail_key_1` / `detail_time_1` / `detail_tags_1` | 详情三栏（默认） | 13pt 粗 / 7pt / 8pt |
 | `detail_key_2` / `detail_time_2` / `detail_tags_2` | 详情三栏（紧凑备选） | 12pt / 8pt / 8pt，**当前无调用方** |
 | `detail_description` | 详情描述 | LXGW 10pt |
 | `summary_text` | 个人总结正文 | LXGW 10pt |
+| `highlight_text` | 重点突出信息行 | LXGW 13pt 粗体白字，深蓝底 |
+| `bullet_text` / `bullet_mark` | 分条目正文 / 引导符 | LXGW 10pt / 10pt 蓝色 |
+
+> ⚠️ **`detail_time_1` 的 `Padding.top(5)` 不再被使用。**
+> `add_detail_head` 原先写 `padding=time_style.padding`，而时间格是 `SizeY.FILL`，
+> 引擎按 `inner_h = eff_h − padding` 算纵向居中量，于是那 5mm 顶内边距会把
+> 时间文字**整体下推 5mm**，破坏与左右两栏的基线对齐（实测三栏基线
+> 5.00 / 6.48 / 5.00，极差 1.48mm）。现改为 `Padding.all(0)` + `VCENTER`，
+> 三栏基线精确对齐（极差 0.000mm）。该 padding 仍留在样式里以免改动面扩大，
+> 但已无作用。
 
 ### 4.3 版式默认值
 
@@ -1461,11 +1572,86 @@ self
 | `add_summary` | `add_detail_body(prefix=...)` | **退役** |
 | `add_details_list` | 调用方自己的循环 + `add_detail` | **退役** |
 | — | `add_highlight` | **新增**：重点突出信息行 |
-| — | `add_bullets` | **新增**：通用分条目 |
+| — | `add_bullets` | **新增**：通用分条目（一次一条） |
+| — | `add_bullet_list` | **新增**：批量分条目（`add_bullets` 的循环封装） |
 
 节点名随之变化（`profile_{i}_*` → `info_{i}_*`、`section_details_{i}_brief*` 仍在
 但由 `add_detail_head` 产出、个人总结由 `summary_*` 改为
 `section_details_summary_0_*`）。**结构路径未变**，这也是重塑期验收的判据。
+
+### 4.8b 文字呈现配置 `TextConfig`（2026-10-13 新增）
+
+**它解决什么**：想知道"这段文字在框里怎么摆"（对齐 / 行距 / 断行禁则），
+此前**所有模板都把 `align_y` 硬编码**，调用点无口子可调。这正是
+"详情三栏的时间怎么调都不动"的直接原因。
+
+```python
+@dataclass(frozen=True)
+class TextConfig:
+    align_x: Optional[AlignX] = None
+    align_y: Optional[AlignY] = None            # ⭐ 最常用
+    line_height_ratio: Optional[float] = None
+    break_policy: Optional[BreakPolicy] = None
+
+    def apply(self, obj) -> None: ...           # 能力检测：只写对象确实有的属性
+```
+
+字段为 `None` = **不改动模板的默认**，因此不传 `text_cfg` 时行为与从前逐字节相同。
+
+**各模板的接入参数**（参数名是 `text_cfg=`，**不是** `text=` ——
+`add_info` / `add_highlight` / `add_text_row` 已有一个字符串参数叫 `text`）：
+
+| 模板 | 参数 |
+| --- | --- |
+| `add_info` / `add_photo` / `add_section_heading` | `text_cfg`（`add_photo` 无文字，不需要） |
+| `add_detail_body` / `add_highlight` / `add_bullets` / `add_text_row` | `text_cfg` |
+| `add_detail` / `add_detail_head` | `text_cfg` + **逐栏覆盖** `key_align` / `time_align` / `tags_align` |
+
+优先级：**逐栏配置 > 统一 `text_cfg` > 模板硬编码默认**。
+
+```python
+col.add_detail(..., text_cfg=TextConfig(align_y=AlignY.VCENTER),
+               time_align=TextConfig(align_y=AlignY.TOP))   # 只让时间贴顶
+col.add_bullet_list(items=[...], text_cfg=TextConfig(line_height_ratio=1.4))
+```
+
+**性质：只影响文字落点，不影响任何几何。** 对齐不参与 `measure`，
+所以盒子不会动 —— 这也是它安全的原因。实测（带高 10mm）：
+
+| 配置 | 三栏基线 | 几何 |
+| --- | --- | --- |
+| 默认 | 5.00 / 5.00 / 5.00 | 10.0 / 10.0 |
+| 全栏 `align_y=TOP` | 2.752 / 1.482 / 1.693（各按自身字号贴顶） | **不变** |
+| 只 `time_align=TOP` | 5.00 / **1.482** / 5.00 | **不变** |
+| `line_height_ratio=2.0` | 5.00 / 5.00 / 5.00 | **不变** |
+
+**承载体对齐一律不动**（`FLOW` / `NONE` 那几处）—— 那是布局语义，不是文字落点。
+
+> ⚠️ **`add_bullets` 的行高是"量出来的"**，所以 `line_height_ratio` 必须在
+> **量之前**定好（优先级 `text_cfg` > 样式 > 1.2）。曾经的缺陷是 `text_cfg`
+> 事后才 apply 到 `TextObject`：对象属性确实变了，行高却还是按 1.2 算的。
+> 教训：凡是模板自己量尺寸的地方，配置必须参与**测量**。
+
+### 4.8c 批量分条目 `add_bullet_list`（2026-10-13 新增）
+
+```python
+col.add_bullet_list(
+    items=[
+        "响应时间从 <c:CC0000>**320ms**</c> 降到 <c:0066CC>**95ms**</c>。",
+        "重构缓存层，QPS 提升 3 倍。",
+        {"text": "独立覆盖的条目", "bullet_value": "▪", "indent": 2.0},
+    ],
+    bullet_kind="text", bullet_value="·", gap=1.5,
+)
+```
+
+**内部就是对 `add_bullets` 的循环**，所以单条入口的一切能力在批量里同样有效；
+`add_bullets` 一行未改，两者可以混用。
+
+- `items` 每项：字符串 = 正文；dict = 本条的独立覆盖（键同 `add_bullets` 参数名，
+  外加 `text` 表示正文）
+- 条间留白只在**条目之间**插入（n 条 → n-1 个），末条之后不加
+- 返回 `BulletListHandle(node, rows)`，支持 `len()` / 迭代 / 下标
 
 ### 4.9 资源清单（`Resources/` 不入库）
 

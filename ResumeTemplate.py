@@ -2186,6 +2186,7 @@ def add_para(self: LayoutObject,
              icon: str = DEFAULT_PARA_ICON,
              icon_width: float = DEFAULT_PARA_ICON_WIDTH,
              icon_align: AlignY = AlignY.VCENTER,
+             icon_anchor: str = "first_line",
              indent: float = DEFAULT_PARA_ICON_INDENT,
              gap: float = DEFAULT_BULLET_GAP,
              left_pad: Optional[Padding] = None,
@@ -2236,7 +2237,17 @@ def add_para(self: LayoutObject,
         text: 正文（支持 \\n 与内联 Markdown：`**粗**`、`<c:RRGGBB>色</c>` 等）
         icon: 图标路径。**必填项，但给了一个缺省值** `DEFAULT_PARA_ICON`
         icon_width: 图标边长 = 左栏宽度 (mm)。图标按正方形处理
-        icon_align: 图标在左栏内的竖直对齐（TOP / VCENTER / BOTTOM）
+        icon_anchor: **图标锚在哪里**，默认 `"first_line"`：
+                     `"first_line"` —— 图标**中心对齐正文首行的中心**（推荐）。
+                                       由模板自动算左栏上内边距
+                                       `首行高/2 − 图标高/2`，因此换字号/行高系数/图标
+                                       尺寸都不会错位。此时 `icon_align` 被忽略。
+                     `"cell"` —— 图标在**整个左栏**（满高）里按 `icon_align` 摆。
+                                 单行时两者等价；多行时图标会跟着整块文本的中心下沉，
+                                 于是**与首行错开**（实测 2 行偏 +2.37mm、3 行 +4.48mm）。
+                                 需要"贴着整块居中"时用这个。
+        icon_align: `icon_anchor="cell"` 时，图标在左栏内的竖直对齐
+                    （TOP / VCENTER / BOTTOM）
         indent: 整行左缩进 (mm)，用行容器的内边距表达
         gap: 左栏与右栏之间的距离 (mm)
         left_pad: 左栏内边距。None 表示 `Padding(top=DEFAULT_PARA_ICON_PAD_TOP)`
@@ -2266,6 +2277,9 @@ def add_para(self: LayoutObject,
     padding = Padding.all(0) if padding is None else padding
     if left_pad is None:
         left_pad = Padding(top=DEFAULT_PARA_ICON_PAD_TOP)
+    if icon_anchor not in ("first_line", "cell"):
+        raise ValueError(
+            f"add_para: icon_anchor 只能是 'first_line' 或 'cell'，收到 {icon_anchor!r}")
 
     # ---- 1) 可用宽与右栏宽 ----
     _, _, parent_w, _ = self.get_content_area()
@@ -2283,6 +2297,28 @@ def add_para(self: LayoutObject,
         lhr = getattr(style, "line_height_ratio", None)
     if lhr is None:
         lhr = 1.2
+    # 首行实高（pt 空间的字格高换算到 mm）—— 图标的"首行对齐"以它为准
+    first_line_h = style.font_size * lhr * PT_TO_MM
+    if icon_anchor == "first_line":
+        # 让图标**中心**落在首行中心：
+        #     图标中心 = pad_top + 图标高/2            （左栏内边距 + 半个图标）
+        #     首行中心 = 首行高/2
+        #  => pad_top = 首行高/2 − 图标高/2
+        # 这不是固定值：它随字号 / 行高系数 / 图标边长变化，所以必须算而不要手填。
+        _pad_top = first_line_h / 2 - icon_width / 2
+        if _pad_top < 0:
+            # 需要负内边距才能把图标推到首行中心 —— 物理上做不到
+            # （引擎的内容区从行顶开始，没有负内边距就压不上去）。
+            # 与其静默错位几毫米，不如明确报错并给出三条出路。
+            raise ValueError(
+                f"add_para: icon_anchor='first_line' 要求图标中心对齐首行中心，"
+                f"但图标 {icon_width:.2f}mm 比首行高 {first_line_h:.3f}mm 还大，"
+                f"需要负内边距（{_pad_top:+.3f}mm）才能实现。可选：\n"
+                f"  1) 把 icon_width 调到 ≤ {first_line_h:.2f}mm；\n"
+                f"  2) 提高行高（style.line_height_ratio 或 text_cfg）；\n"
+                f"  3) 改用 icon_anchor='cell'（图标在整块左栏里居中，"
+                f"不对齐首行）")
+        left_pad = Padding(top=_pad_top)
     text_h = wrapped_height(text, style, text_w, line_height_ratio=lhr) \
         + padding.top + padding.bottom
     icon_need = icon_width + left_pad.top + left_pad.bottom
@@ -2291,7 +2327,6 @@ def add_para(self: LayoutObject,
     n = sum(1 for c in self.children if "_para_" in c.name)
     prefix = name if name else f"{self.name}_para_{n}"
 
-    # ---- 3) 行容器：缩进做成 padding；高度显式算好 ----
     # ---- 3) 行容器：缩进做成 padding；高度显式算好 ----
     # name_suffix 让调用方能给整行指定后缀。默认 content；
     # add_detail(desc_mode="para") 用 description，使第一段的主节点
@@ -2334,7 +2369,8 @@ def add_para(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.CENTER,
-        align_y=icon_align,
+        # first_line 锚定时已用左栏内边距把位置算准，图标自身贴顶即可
+        align_y=(AlignY.TOP if icon_anchor == "first_line" else icon_align),
         layer=layer + 1,
     )
     left.add_child(icon_obj)
@@ -2743,16 +2779,15 @@ if __name__ == "__main__":
                  "<c:CC0000>**95ms**</c>，并支撑大促三倍峰值。",
             layer=1,
         ),
-        # 强调最要紧的一条：图标放大 + 贴顶对齐
+        # 强调最要紧的一条：用颜色 + 加粗，而不是放大图标
+        # （图标一旦大于首行高就无法对齐首行中心，模板会明确报错）
         right_column.add_para(
             text="<c:CC0000>**主导**</c>了千万级流量系统的重构。",
-            icon_width=5.0,
-            icon_align=AlignY.TOP,
             layer=1,
         ),
     ]
     print(f"  ✅ add_para {len(para_demos)} 条"
-          f"（含放大图标 + 贴顶对齐的强调条目）", flush=True)
+          f"（含行内彩色加粗的强调条目）", flush=True)
 
     # ---- 7. 渲染与高度结算 ----
     print("\n【7. 渲染 PDF】", flush=True)
@@ -3071,29 +3106,29 @@ if __name__ == "__main__":
     print(f"  ✅ 图标段落几何通过（左栏 {_pl['w']:.1f}×{_pl['h']:.2f} 满高 / "
           f"图标 {_pi['w']:.1f}×{_pi['h']:.1f} 正方 / 右栏 {_prr['w']:.1f})", flush=True)
 
-    # 9.8 图标在左栏内的三种竖直对齐，且行高被图标撑起（不溢出左栏）
+    # 9.8 icon_anchor="cell" 时，图标在整块左栏里按 icon_align 摆
+    #     （默认 icon_anchor="first_line" 会忽略 icon_align，见 9.11）
     _tops = {}
     for _al in (AlignY.TOP, AlignY.VCENTER, AlignY.BOTTOM):
         _r2 = LayoutObject(name=f"P2_{_al.name}", width=110.0, height=100,
                            padding=Padding.all(0), layer=0)
         with contextlib.redirect_stdout(io.StringIO()):
-            _h2 = _r2.add_para(text=_P_TEXT, icon_align=_al)
+            _h2 = _r2.add_para(text=_P_TEXT, icon_anchor="cell",
+                               icon_width=3.0, icon_align=_al)
             _r2.layout(pdf=pdf, force=True)
         _tops[_al] = _h2.icon.get_absolute_y() - _h2.node.get_absolute_y()
     assert _tops[AlignY.TOP] < _tops[AlignY.VCENTER] < _tops[AlignY.BOTTOM], \
         f"三种对齐的图标 y 应递增，实际 {_tops}"
-    # 左栏上内边距（默认 0.5）应把 TOP 的情形也往下推 0.5
-    assert abs(_tops[AlignY.TOP] - DEFAULT_PARA_ICON_PAD_TOP) < 0.01, \
-        f"TOP 时图标 y 应=左栏上内边距 {DEFAULT_PARA_ICON_PAD_TOP}，实际 {_tops[AlignY.TOP]:.2f}"
-    print(f"  ✅ 图标段落对齐通过（TOP/VCENTER/BOTTOM -> "
+    print(f"  ✅ icon_anchor=cell 的三种对齐通过（TOP/VCENTER/BOTTOM -> "
           f"{_tops[AlignY.TOP]:.2f}/{_tops[AlignY.VCENTER]:.2f}/{_tops[AlignY.BOTTOM]:.2f}mm）",
           flush=True)
 
     # 9.9 行高必须容纳图标：图标比正文高时，行高被图标撑起
+    #     用 icon_anchor="cell"：first_line 要求图标 ≤ 首行高（见 9.13）
     _r3 = LayoutObject(name="P3", width=110.0, height=100,
                        padding=Padding.all(0), layer=0)
     with contextlib.redirect_stdout(io.StringIO()):
-        _h3 = _r3.add_para(text="短", icon_width=8.0)
+        _h3 = _r3.add_para(text="短", icon_width=8.0, icon_anchor="cell")
         _r3.layout(pdf=pdf, force=True)
     _need = 8.0 + DEFAULT_PARA_ICON_PAD_TOP
     assert _h3.node.get_effective_height() >= _need - 0.01, \
@@ -3120,13 +3155,53 @@ if __name__ == "__main__":
         "显式 icon 应覆盖缺省值"
     print("  ✅ 缺省图标 / 显式覆盖通过", flush=True)
 
-    # 9.11 正文垂直对齐：单行 + 大图标时默认居中
+    # 9.11 图标锚定：默认 first_line —— 图标中心必须对齐**首行**中心
+    _IC_TEXT = ("系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能，"
+                "并支持快速生成针对不同岗位的定制化简历，覆盖完整链路。")
+    for _n_lines, _txt in ((1, "单行短文本"), (2, "系统采用分层排版引擎，支持样式定制、"
+                                                "多模板切换、自动分栏等高级功能。"),
+                           (3, _IC_TEXT)):
+        _r5 = LayoutObject(name=f"IC_{_n_lines}", width=110.0, height=100,
+                           padding=Padding.all(0), layer=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _h5 = _r5.add_para(text=_txt, icon_width=4.0)
+            _r5.layout(pdf=pdf, force=True)
+        _rt = _h5.node.get_absolute_y()
+        _icon_c = _h5.icon.get_absolute_y() + _h5.icon.get_effective_height() / 2 - _rt
+        _line_h = _h5.text.font_size * _h5.text.line_height_ratio * PT_TO_MM
+        assert abs(_icon_c - _line_h / 2) < 0.01, (
+            f"{_n_lines} 行时图标中心应=首行中心 {_line_h / 2:.3f}，"
+            f"实际 {_icon_c:.3f}（偏差 {_icon_c - _line_h / 2:+.3f}mm）")
+    print(f"  ✅ 图标首行对齐通过（1/2/3 行图标中心均=首行中心 "
+          f"{_line_h / 2:.3f}mm，偏差 < 0.01mm）", flush=True)
+
+    # 9.12 first_line 的物理上限：图标大于首行高时**明确报错**，不静默错位
+    def _ic_probe(**kw):
+        _r = LayoutObject(name="ICh_Root", width=110.0, height=100,
+                          padding=Padding.all(0), layer=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _h = _r.add_para(**kw)
+            _r.layout(pdf=pdf, force=True)
+        return _h
+
+    try:
+        _ic_probe(text="x", icon_width=5.0)       # 首行高 4.233mm < 5.0
+        raise AssertionError("图标大于首行高时应报错，而不是静默错位")
+    except ValueError as _e:
+        assert "first_line" in str(_e), f"报错应说明 first_line 的要求：{_e}"
+    _ok = _ic_probe(text="x", icon_width=5.0, icon_anchor="cell")
+    assert _ok.icon.get_effective_width() == 5.0
+    print("  ✅ 首行对齐上限通过（图标 > 首行高时明确报错；"
+          "icon_anchor='cell' 可绕过）", flush=True)
+
+    # 9.13 正文垂直对齐：单行 + 大图标（行高被撑起）时默认居中
     #      （此前正文是 FLOW 顶对齐，两个格子又都是满高，于是"文字浮在上面"）
+    #      用 icon_anchor="cell" 是为了让图标能大于首行高（first_line 有上限，见 9.12）
     def _para_probe(**kw):
         _r = LayoutObject(name="PA_Root", width=110.0, height=100,
                           padding=Padding.all(0), layer=0)
         with contextlib.redirect_stdout(io.StringIO()):
-            _h = _r.add_para(**kw)
+            _h = _r.add_para(icon_anchor="cell", **kw)
             _r.layout(pdf=pdf, force=True)
         return _h
 

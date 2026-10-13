@@ -99,6 +99,14 @@ DEFAULT_HIGHLIGHT_HEIGHT: float = 9.0           # 重点突出信息行默认高
 DEFAULT_BULLET_SIZE: float = 3.2                # 分条目的正方形引导符边长
 DEFAULT_BULLET_INDENT: float = 1.0              # 分条目整行的左缩进
 DEFAULT_BULLET_GAP: float = 2.0                 # 引导符与文本之间的距离
+DEFAULT_PARA_ICON_WIDTH: float = 4.0            # 图标段落：左栏宽 = 图标宽
+DEFAULT_PARA_ICON_INDENT: float = 1.0           # 图标段落：整行左缩进
+DEFAULT_PARA_ICON_PAD_TOP: float = 0.5          # 图标段落：左栏上内边距
+# 图标段落（add_para）的缺省图标。
+# ⚠️ 这是**可配置的占位值**：`Resources/` 里的图标都是语义化的（教育/项目/…），
+#    目前没有通用的"重点标记"符号，所以这里先借一个方形图标顶上。
+#    换图标只需改这一处（或每次调用显式给 icon=…）。
+DEFAULT_PARA_ICON: str = ".\\Resources\\icon_Project_History.png"
 
 
 def profile_content_height(style: Optional[Style] = None,
@@ -699,6 +707,33 @@ class BulletListHandle:
 
     def __getitem__(self, i) -> BulletHandle:
         return self.rows[i]
+
+
+@dataclass
+class ParaHandle:
+    """
+    图标段落句柄（左栏图标 + 右栏文本）。
+
+    与 `BulletHandle` 的区别：这里左栏是**满高的图标栏**（宽 = 图标宽），
+    图标在其中按左栏内边距与自身对齐摆放；而 `BulletHandle` 的左栏是
+    对准正文首行的正方形引导符。
+    """
+    node: LayoutObject              # 整行容器
+    left: LayoutObject              # 左栏（图标栏，满高）
+    icon: ImageObject               # 图标（正方形）
+    right: LayoutObject             # 右栏（正文栏，占满剩余宽高）
+    text: TextObject                # 正文
+
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    def fill(self, text: str = "", icon: str = "") -> 'ParaHandle':
+        """就地替换正文与图标（图标留空表示不改）"""
+        self.text.set_text(text)
+        if icon:
+            self.icon.set_image(icon)
+        return self
 
 
 @dataclass
@@ -2032,6 +2067,189 @@ def add_bullet_list(self: LayoutObject,
 
 
 # ============================================================================
+# 5e. 图标段落（左栏图标 + 右栏文本）
+# ============================================================================
+
+def add_para(self: LayoutObject,
+             text: str = "",
+             icon: str = DEFAULT_PARA_ICON,
+             icon_width: float = DEFAULT_PARA_ICON_WIDTH,
+             icon_align: AlignY = AlignY.VCENTER,
+             indent: float = DEFAULT_PARA_ICON_INDENT,
+             gap: float = DEFAULT_BULLET_GAP,
+             left_pad: Optional[Padding] = None,
+             style: Optional[Style] = None,
+             text_cfg: Optional[TextConfig] = None,
+             padding: Optional[Padding] = None,
+             align_x: AlignX = AlignX.LEFT,
+             layer: int = 0) -> ParaHandle:
+    """
+    图标段落子模板 —— **左栏图标 + 右栏文本**，用于在大片密集信息里标出重点。
+
+    与 `add_bullets` 的区别（两者刻意分开，几何契约不同）：
+
+    | | `add_para`（本模板） | `add_bullets` |
+    | --- | --- | --- |
+    | 左栏尺寸 | **图标宽 × 行高（满高）** | 正方形小格（边长 `bullet_size`） |
+    | 图标竖直位置 | **左栏内边距 + 自身对齐**决定 | **对准正文首行中心** |
+    | 图标尺寸 | 独立参数（正方形） | 引导符边长 |
+
+    结构：
+        self
+        └─ ..._para_{n}_content（高 = max(正文实高, 图标高 + 左栏上内边距)）
+             ├─ ..._left（宽 = icon_width，FILL 满高，padding = left_pad）
+             │    └─ ..._icon : ImageObject（正方形）
+             └─ ..._right（宽 = 剩余，FILL 满高）
+                  └─ ..._text : TextObject（自动折行，支持内联 Markdown）
+
+    ⚠️ **为什么手工摆放而不用 `create_band`**（实测结论）：
+
+    1. `create_band(cells=[5.0, 1.0])` 会把 `5.0` 当**比例**，得到 91.67/18.33
+       而不是 5mm —— 它不支持固定像素宽；
+    2. `create_band` 要求父容器内容区高为正，而 `SizeY.CONTENT` 的行在测量期
+       高为 0，会直接抛
+       `ValueError: create_band: 高度必须为正`。
+
+    ⚠️ **图标必须显式给高才保持正方形**：`ImageObject(width=4, height=0,
+    keep_aspect_ratio=True)` 会拿**可用高反推**（实测 5.00×6.97，不是正方形）；
+    给 `height=icon_width` 才是 5.00×5.00。
+
+    ⚠️ **行高取 `max(正文实高, 图标高 + 上内边距)`**：否则图标会溢出左格
+    （实测短正文行高 4.23、图标 5.0 时溢出 2.27mm）。正文通常比图标高，
+    所以这一项只在图标偏大时生效。
+
+    Args:
+        text: 正文（支持 \\n 与内联 Markdown：`**粗**`、`<c:RRGGBB>色</c>` 等）
+        icon: 图标路径。**必填项，但给了一个缺省值** `DEFAULT_PARA_ICON`
+        icon_width: 图标边长 = 左栏宽度 (mm)。图标按正方形处理
+        icon_align: 图标在左栏内的竖直对齐（TOP / VCENTER / BOTTOM）
+        indent: 整行左缩进 (mm)，用行容器的内边距表达
+        gap: 左栏与右栏之间的距离 (mm)
+        left_pad: 左栏内边距。None 表示 `Padding(top=DEFAULT_PARA_ICON_PAD_TOP)`
+        style: 正文字样式。默认 `STYLES["bullet_text"]`
+        text_cfg: 正文的对齐 / 行距 / 断行禁则配置
+        padding: 正文格内边距
+        align_x: 正文水平对齐
+
+    Returns:
+        ParaHandle(node / left / icon / right / text)
+
+    Example:
+        >>> for t in paragraphs:
+        ...     col.add_para(text=t, icon=".\\\\Resources\\\\icon_Project_History.png")
+        >>> # 只强调最要紧的一条
+        >>> col.add_para(text="<c:CC0000>**主导**</c>了千万级流量系统的重构",
+        ...              icon_width=5.0, icon_align=AlignY.TOP)
+    """
+    icon_path = icon if icon else DEFAULT_PARA_ICON
+    style = STYLES["bullet_text"] if style is None else style
+    padding = Padding.all(0) if padding is None else padding
+    if left_pad is None:
+        left_pad = Padding(top=DEFAULT_PARA_ICON_PAD_TOP)
+
+    # ---- 1) 可用宽与右栏宽 ----
+    _, _, parent_w, _ = self.get_content_area()
+    if parent_w <= 0:
+        raise ValueError(f"add_para: 挂载点 '{self.name}' 没有可用宽度")
+    inner_w = max(parent_w - indent, 0.0)
+    text_w = max(inner_w - icon_width - gap, 0.0)
+
+    # ---- 2) 行高 = max(正文折行实高, 图标高 + 左栏上内边距) ----
+    # 行高系数必须在这里定（本模板的行高是量出来的，不是引擎现算的）
+    lhr = None
+    if text_cfg is not None:
+        lhr = text_cfg.line_height_ratio
+    if lhr is None:
+        lhr = getattr(style, "line_height_ratio", None)
+    if lhr is None:
+        lhr = 1.2
+    text_h = wrapped_height(text, style, text_w, line_height_ratio=lhr) \
+        + padding.top + padding.bottom
+    icon_need = icon_width + left_pad.top + left_pad.bottom
+    row_h = max(text_h, icon_need)
+
+    n = sum(1 for c in self.children if "_para_" in c.name)
+    prefix = f"{self.name}_para_{n}"
+
+    # ---- 3) 行容器：缩进做成 padding；高度显式算好 ----
+    row = LayoutObject(
+        name=f"{prefix}_content",
+        x=0, y=0, width=0, height=row_h,
+        color=White,
+        padding=Padding(left=indent),
+        align_x=AlignX.CENTER,
+        align_y=AlignY.FLOW,
+        layer=layer,
+    )
+    row.size_x = SizeX.FILL
+    row.size_y = SizeY.FIXED        # 显式高：见上面 create_band 的两条限制
+    self.add_child(row)
+
+    # ---- 4) 左栏：宽 = 图标宽，满高 ----
+    left = LayoutObject(
+        name=f"{prefix}_left",
+        x=0, y=0, width=icon_width, height=0,
+        color=White,
+        padding=left_pad,
+        align_x=AlignX.NONE,
+        align_y=AlignY.NONE,
+        layer=layer,
+    )
+    left.size_x = SizeX.FIXED
+    left.size_y = SizeY.FILL
+    row.add_child(left)
+
+    icon_obj = ImageObject.from_style(
+        f"{prefix}_icon",
+        Style(image_path=icon_path, font_name=style.font_name,
+              font_size=style.font_size),
+        width=icon_width,
+        height=icon_width,          # ⚠️ 显式给高才是正方形（见 docstring）
+        image_path=icon_path,
+        keep_aspect_ratio=True,
+        color=White,
+        padding=Padding.all(0),
+        align_x=AlignX.CENTER,
+        align_y=icon_align,
+        layer=layer + 1,
+    )
+    left.add_child(icon_obj)
+
+    # ---- 5) 右栏：剩余宽，满高 ----
+    right = LayoutObject(
+        name=f"{prefix}_right",
+        x=icon_width + gap, y=0, width=text_w, height=0,
+        color=White,
+        padding=padding,
+        align_x=AlignX.NONE,
+        align_y=AlignY.NONE,
+        layer=layer,
+    )
+    right.size_x = SizeX.FIXED
+    right.size_y = SizeY.FILL
+    row.add_child(right)
+
+    text_obj = TextObject.from_style(
+        f"{prefix}_text", style,
+        text=text,
+        width=0, height=0,
+        color=White,
+        padding=Padding.all(0),
+        align_x=align_x,
+        align_y=AlignY.FLOW,
+        multi_line=True,
+        layer=layer + 1,
+    )
+    right.add_child(text_obj)
+
+    handle = ParaHandle(node=row, left=left, icon=icon_obj,
+                        right=right, text=text_obj)
+    if text_cfg is not None:
+        text_cfg.apply(text_obj)
+    return handle
+
+
+# ============================================================================
 # 6. 组合模板：由子模板构成，体现"整个模板就是子模板的组合"
 # ============================================================================
 
@@ -2172,6 +2390,7 @@ _TEMPLATE_METHODS = {
     "add_highlight": add_highlight,
     "add_bullets": add_bullets,
     "add_bullet_list": add_bullet_list,
+    "add_para": add_para,
     "add_section": add_section,
     "add_text_row": add_text_row,
     "add_spacer": add_spacer,
@@ -2608,6 +2827,88 @@ if __name__ == "__main__":
         f"行高比应约等于系数比 1.25，实际 {_hb / _ha:.3f}"
     print(f"  ✅ 行高系数参与测算通过（{_ha:.2f} -> {_hb:.2f}mm，比值 "
           f"{_hb / _ha:.2f}）", flush=True)
+
+    # 9.7 图标段落 add_para（左栏图标 + 右栏文本）
+    _p_root = LayoutObject(name="P_Root", width=110.0, height=400,
+                           padding=Padding.all(0), layer=0)
+    _P_TEXT = ("系统采用<c:CC0000>**分层排版引擎**</c>，支持样式定制、"
+               "多模板切换、自动分栏等高级功能。")
+    with contextlib.redirect_stdout(io.StringIO()):
+        _p = _p_root.add_para(text=_P_TEXT, icon_width=4.0,
+                              indent=1.0, gap=2.0)
+        _p_root.layout(pdf=pdf, force=True)
+    _pr = _p.node.get_layout_info()["effective"]
+    _pl = _p.left.get_layout_info()["effective"]
+    _pi = _p.icon.get_layout_info()["effective"]
+    _prr = _p.right.get_layout_info()["effective"]
+    _pt = _p.text.get_layout_info()["effective"]
+    # 左栏宽 = 图标宽、左栏满高
+    assert abs(_pl["w"] - 4.0) < 0.01, f"左栏宽应=图标宽 4.0，实际 {_pl['w']:.2f}"
+    assert abs(_pl["h"] - _pr["h"]) < 0.01, "左栏应占满行高"
+    # 右栏 = 剩余宽，且满高
+    assert abs(_prr["w"] - (110.0 - 1.0 - 4.0 - 2.0)) < 0.01, \
+        f"右栏宽应为 容器-缩进-图标-gap = 103.0，实际 {_prr['w']:.2f}"
+    assert abs(_prr["h"] - _pr["h"]) < 0.01, "右栏应占满行高"
+    # 图标必须是正方形（width=height 显式给高才有可能）
+    assert abs(_pi["w"] - _pi["h"]) < 0.01, \
+        f"图标应保持正方形，实际 {_pi['w']:.2f}x{_pi['h']:.2f}"
+    # 正文不得溢出右栏
+    assert _pt["x"] + _pt["w"] <= _prr["x"] + _prr["w"] + 0.01, "正文溢出右栏"
+    # 行高由正文主导（正文比图标高）
+    assert abs(_pr["h"] - wrapped_height(_P_TEXT, STYLES["bullet_text"],
+                                         _pt["w"])) < 0.01, \
+        f"行高应由正文折行实高决定，实际 {_pr['h']:.2f}"
+    print(f"  ✅ 图标段落几何通过（左栏 {_pl['w']:.1f}×{_pl['h']:.2f} 满高 / "
+          f"图标 {_pi['w']:.1f}×{_pi['h']:.1f} 正方 / 右栏 {_prr['w']:.1f})", flush=True)
+
+    # 9.8 图标在左栏内的三种竖直对齐，且行高被图标撑起（不溢出左栏）
+    _tops = {}
+    for _al in (AlignY.TOP, AlignY.VCENTER, AlignY.BOTTOM):
+        _r2 = LayoutObject(name=f"P2_{_al.name}", width=110.0, height=100,
+                           padding=Padding.all(0), layer=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _h2 = _r2.add_para(text=_P_TEXT, icon_align=_al)
+            _r2.layout(pdf=pdf, force=True)
+        _tops[_al] = _h2.icon.get_absolute_y() - _h2.node.get_absolute_y()
+    assert _tops[AlignY.TOP] < _tops[AlignY.VCENTER] < _tops[AlignY.BOTTOM], \
+        f"三种对齐的图标 y 应递增，实际 {_tops}"
+    # 左栏上内边距（默认 0.5）应把 TOP 的情形也往下推 0.5
+    assert abs(_tops[AlignY.TOP] - DEFAULT_PARA_ICON_PAD_TOP) < 0.01, \
+        f"TOP 时图标 y 应=左栏上内边距 {DEFAULT_PARA_ICON_PAD_TOP}，实际 {_tops[AlignY.TOP]:.2f}"
+    print(f"  ✅ 图标段落对齐通过（TOP/VCENTER/BOTTOM -> "
+          f"{_tops[AlignY.TOP]:.2f}/{_tops[AlignY.VCENTER]:.2f}/{_tops[AlignY.BOTTOM]:.2f}mm）",
+          flush=True)
+
+    # 9.9 行高必须容纳图标：图标比正文高时，行高被图标撑起
+    _r3 = LayoutObject(name="P3", width=110.0, height=100,
+                       padding=Padding.all(0), layer=0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _h3 = _r3.add_para(text="短", icon_width=8.0)
+        _r3.layout(pdf=pdf, force=True)
+    _need = 8.0 + DEFAULT_PARA_ICON_PAD_TOP
+    assert _h3.node.get_effective_height() >= _need - 0.01, \
+        (f"行高应 >= 图标高+上内边距 = {_need}，实际 "
+         f"{_h3.node.get_effective_height():.2f}（否则图标溢出左栏）")
+    # 图标不得溢出左栏
+    assert (_h3.icon.get_absolute_y() + _h3.icon.get_effective_height()
+            <= _h3.left.get_absolute_y() + _h3.left.get_effective_height() + 0.01), \
+        "图标不得溢出左栏"
+    print(f"  ✅ 行高容纳图标通过（图标8mm -> 行高 "
+          f"{_h3.node.get_effective_height():.2f}，图标未溢出）", flush=True)
+
+    # 9.10 缺省图标与显式覆盖
+    _r4 = LayoutObject(name="P4", width=110.0, height=100,
+                       padding=Padding.all(0), layer=0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _p_def = _r4.add_para(text="用缺省图标")
+        _p_ovr = _r4.add_para(text="显式覆盖",
+                              icon=".\\Resources\\icon_Education_History.png")
+        _r4.layout(pdf=pdf, force=True)
+    assert _p_def.icon.get_image() == DEFAULT_PARA_ICON, \
+        f"缺省图标应为 {DEFAULT_PARA_ICON}，实际 {_p_def.icon.get_image()}"
+    assert _p_ovr.icon.get_image().endswith("icon_Education_History.png"), \
+        "显式 icon 应覆盖缺省值"
+    print("  ✅ 缺省图标 / 显式覆盖通过", flush=True)
 
     # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），

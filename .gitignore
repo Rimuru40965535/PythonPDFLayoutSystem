@@ -369,18 +369,31 @@ FodyWeavers.xsd
 # 测试/示例生成的 PDF。可由各文件的测试入口重新生成，不入库。
 *.pdf
 
-# 简历生成输出目录（见 ResumeCore.Generate 的 output_dir 默认值）。
-# 注意：该规则只匹配任意层级的 output 目录。
+# 简历生成输出目录。
 output/
+output_multi/
+output_demo/
+
+# ---- 个人数据不入库（2026-10-13）----
+# 你自己的简历内容文件。示例是 demo_multi_version.py（虚构数据，可入库）；
+# 真实信息请写进下面这些名字的文件 —— 它们**永远不会被提交**。
+# 见 README「如何使用」与 TECHNICAL 第 5.8 节。
+my_resumes.py
+my_resume*.py
+resumes_private/
 
 # Resources/ 下的**全部素材**一律不入库（字体、图标、头像、证件照）。
 #
 # 决定（2026-10-13，与 feature_resume_sub_templates 分支一致）：
 # 素材体积小但数量会持续变动、随时可能被替换成自己的素材，需要时未来再补齐入库。
 #
-# 后果：新克隆的仓库没有 Resources/ 内容 ——
-#   * 缺字体 -> 中文静默降级为空白（引擎退回内置 helvetica，不报错）
-#   * 缺图标 -> 图标位置留空（ImageObject.render 对空路径直接返回，不报错）
+# 后果（**2026-10-13 实测更正** —— 此前这里写的是"缺字体则中文变空白"，是错的）：
+#   * 缺**图片** -> 静默降级、继续运行，该位置留空，入口仍退出码 0
+#   * 缺**字体** -> **明确报错并中止**（wrapped_height 把 fpdf 的 CJK 异常
+#                   包成可读的中文 RuntimeError）
+#   ！"退出码 0"本身不是目标：静默产出错误内容比明确报错危险得多。
+#   标准见 SKILLS.md 的 G.4（D1–D3），验收脚本 check_degradation.py。
+#
 # 恢复方式：把字体与图标放回 Resources/ 即可，代码按固定文件名引用。
 #
 # 目录本身由 Resources/.gitkeep 保留，因此克隆后目录存在但为空。

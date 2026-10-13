@@ -9,54 +9,239 @@
 
 ---
 
-## 中层 API 速览
+## 如何使用？
 
-子模板一律以**方法**形式挂在任意节点上调用，返回**结果句柄**：
+**期望两种使用方式，目前的完成度不同**：
+
+| 使用方式 | 状态 |
+| --- | --- |
+| 开发者把这个库下载下来，在源文件里 `import` 并构造数据 | ✅ **已可用** |
+| 源文件读取 `.md` 等文本文档，自动排版 | ⏳ 待做（**前置**：`.md` 格式规范未定，见 `SKILLS.md` I.1）|
+
+### 五分钟上手
+
+```bash
+# 1. 拿到字体（必需，见下一节「资源获取」），放进 Resources/
+# 2. 复制个人模板，填你自己的信息
+copy demo_multi_version.py my_resumes.py     # Windows
+#   cp demo_multi_version.py my_resumes.py   # Linux / macOS
+# 3. 改 my_resumes.py 里 [填写] 标记的地方
+# 4. 跑
+py my_resumes.py
+#   只生成某几个版本：
+py my_resumes.py --only 后端开发岗
+```
+
+产物在 `./output_multi/{姓名}_{职位}_{公司}.pdf`。
+
+> `my_resumes.py` **已被 `.gitignore` 排除**（含你的真实信息，永远不会被提交）。
+> `demo_multi_version.py` 是**虚构数据**的完整示例，可以入库、也建议留着当参考。
+
+### 我该改哪个文件？
+
+| 你想做的事 | 改哪里 |
+| --- | --- |
+| 填/改简历内容、增删版本 | `my_resumes.py`（你的个人文件） |
+| 调间距、边距、缩进、配色、字号 | 同上 —— `Spacing(...)` / `Theme(...)` 都能在调用侧表达 |
+| 改**样式的全局默认值**（如姓名行字号） | `ResumeTemplate.py` 的 `STYLES` 字典 |
+| 加/改子模板（新版面结构） | `ResumeTemplate.py` |
+| 改排版引擎（几何、断行、行高） | `LayoutEngine.py` —— 属底层，改动要谨慎 |
+
+**日常使用只需要动 `my_resumes.py`。** 完整可调项总表（留白 15 项 / 版式 34 项 /
+内容字段 / 版本与批量）见 **`SKILLS.md` 的 H 节**；计划中的改动见 **I 节**。
+
+### 四个概念（理解这四个，其余都是填值）
+
+| 概念 | 是什么 |
+| --- | --- |
+| **内容** | 姓名、学校、项目、技能…（`Profiles` / `SkillsAwards` / `Details` / `Section`）|
+| **留白** | 各处间距，单位 mm（中层 `Spacing`）|
+| **版式** | 页面、边距、缩进、配色、样式（顶层 `Theme`）|
+| **版本** | 一次投递 = 选哪些节 + 配哪档留白/版式（`ResumeVersion`）|
+
+关键：`Section` 的 `title` 是**取用键**，`ResumeVersion.sections=[...]` 引用的就是它；
+而 `sections` 的**顺序 = 呈现顺序**。所以投不同公司通常**只需加一个 `ResumeVersion`**，
+不用复制任何内容。
 
 ```python
-basic   = root.add_basic(ratio=[1.0, 2.5], right_padding=Padding.left(8))
-left, right = basic.left, basic.right          # 直接拿到两栏，不再按名字查
+from ResumeCore import Profiles, Section, Details, ResumeBook, ResumeVersion, Theme
+from ResumeTemplate import Spacing
 
-profile = left.add_profile(index=0, icon_width=6).fill("韩 梅 梅", icon_path)
-title   = right.add_section_title(index=0).fill("教育背景", icon_path)
-
-detail  = right.add_details(index=0, key="...", during_time="...",
-                            tags="...", description="...")   # 建好即填好
-detail.description.set_text("改一下")           # 句柄随时可取子部件
-
-right.add_details_list(section.details)         # 列表入口：同一蓝图复用 N 次
-right.add_section(section)                      # 组合模板：节标题 + 该节全部详情
-left.add_text_row(name="...", text="...")       # 一行文本（技能/证书/荣誉共用）
+book = ResumeBook(profile=me, skills_awards=sa, spacing=Spacing())
+book.add_section(项目经历).add_section(教育背景)        # 素材入池
+book.add_version(ResumeVersion(                        # 一个投递版本
+    name="腾讯-后端", company="腾讯科技", job="后端开发工程师",
+    sections=["项目经历", "教育背景"],                   # 顺序即呈现顺序
+    spacing=Spacing.compact(),                         # 逐版本调留白
+    theme=Theme(page_padding=12),                      # 逐版本调版式
+    summary="…"))
+book.render_all()                                      # 批量生成
 ```
+
+### 改完怎么确认没改坏
+
+```bash
+py ResumeCore.py            # 顶层验收 V1–V11 + 整合入口
+py ResumeTemplate.py        # 中层 15 个模板 + 渲染级落点断言
+py LayoutEngine.py          # 几何 / 断行 / 渲染行距
+py check_degradation.py     # 缺资源时的降级行为
+```
+
+---
+
+---
+
+## 资源获取
+
+### 字体（**必需**）
+
+`Resources/` 下的字体文件**不入库**（约 117 MB），需要自行下载。
+
+> ⚠️ **缺字体会明确报错并中止**（不是静默降级）——
+> `wrapped_height()` 会把 fpdf 的 CJK 异常包成可读的中文 `RuntimeError`。
+> 这是**有意的**：静默产出"中文变空白"的 PDF 比明确报错危险得多。
+> （本文档此前写"静默降级为空白、退出码 0"，**2026-10-13 实测为假**，
+> 见 `SKILLS.md` G.4 / `TECHNICAL.md` 4.9。）
+
+需要的是**霞鹜文楷（LXGW WenKai）**，作者 LXGW，采用 SIL Open Font License 1.1，可免费商用。
+
+- 项目主页：<https://github.com/lxgw/LxgwWenKai>
+- 发布页（选最新 Release）：<https://github.com/lxgw/LxgwWenKai/releases>
+- 等宽版本（可选，`LXGWWenKaiMono*`）：<https://github.com/lxgw/LxgwWenKaiMono>
+
+下载后按下列**文件名**放入 `Resources/`（代码按这些名字引用）：
+
+| 文件名 | 用途 |
+| --- | --- |
+| `LXGWWenKai-Regular.ttf` | 正文（注册为 `LXGW` 的常规体） |
+| `LXGWWenKai-Bold.ttf` | 粗体（注册为 `LXGW` 的 `B` 风格） |
+| `LXGWWenKai-Light.ttf` | 可选 |
+| `LXGWWenKaiMono-Regular.ttf` | 可选，等宽 |
+| `LXGWWenKaiMono-Bold.ttf` | 可选，等宽 |
+| `LXGWWenKaiMono-Light.ttf` | 可选，等宽 |
+
+> 最少只需要 `Regular` 与 `Bold` 两个。若解压后的文件名与上表不同，请重命名。
+
+### 图标与照片（可选）
+
+顶层与中层引用了若干图标与照片，**这些资源尚未入库**。底层排版引擎不依赖它们。
+
+```
+icon.png  icon_Education_History.png  icon_Project_History.png
+woman_student.png  photo_1.png
+telephone.png  email.png  locate.png
+social_media.png  contact_address.png  website.png
+black_circle.png          # add_para 的默认圆点（顶层联系方式用）
+```
+
+**缺图片不会报错** —— `ImageObject` 静默跳过绘制，该位置留空，其余排版正常。
+`Theme.validate()` 会把"缺哪些图标"作为**警告**报出来（不阻断渲染）。
+排查「图标不见了」时先确认这些文件是否存在。
+
+---
+
+---
+
+## 三层 API 速览
+
+分层依赖只向下：`ResumeCore.py`（顶层）→ `ResumeTemplate.py`（中层）→ `LayoutEngine.py`（底层）。
+
+### 顶层：数据容器 + 渲染器（`ResumeCore.py`）
+
+| 类 / 函数 | 作用 |
+| --- | --- |
+| `Profiles` / `SkillsAwards` / `Details` / `Section` / `Resume` | **纯数据**，不 import 引擎、不做 I/O |
+| `Theme` | 版式配置（页面、边距、缩进、配色、样式）|
+| `ResumeVersion` / `ResumeBook` | 多版本管理（素材池 + 装配 + 批量渲染）|
+| `ContentConfig` / `RenderConfig` | 整合入口的"内容 / 呈现"配置对 |
+| `build_layout(resume, theme, spacing)` | 把数据落成排版树（唯一认识中层词汇的地方）|
+| `render(resume, output_dir, *, spacing, theme, debug, creation_date, filename, pdf)` | **无副作用**渲染 |
+| `render_many(...)` / `render_into(pdf, ...)` | 批量 / 一个 PDF 装多份 |
+
+> ⚠️ **`render()` 不修改 `resume`** —— 旧版 `Generate()` 会往自己身上写
+> `_root` / `_pdf_path`。同一容器可反复渲染、可批量。自检 **V1** 守着这条。
+
+### 中层：子模板（`ResumeTemplate.py`）
+
+**15 个子模板**，一律以**方法**形式挂在任意节点上调用，返回**结果句柄**：
 
 | 方法 | 返回句柄 | 主要部件 |
 | --- | --- | --- |
-| `add_basic` | `BasicHandle` | `node` / `left` / `right` |
-| `add_profile` | `ProfileHandle` | `icon` / `text` / `split` / `icon_range` / `text_range` |
-| `add_profile_photo` | `PhotoHandle` | `photo` |
-| `add_section_title` | `TitleHandle` | `icon` / `text` / `divider` |
-| `add_details` | `DetailsHandle` | `key` / `during_time` / `tags` / `description` / `brief` / 三个 col |
-| `add_summary` | `SummaryHandle` | `description` |
-| `add_section` | `SectionHandle` | `title` + `details`（句柄列表） |
-| `add_details_list` | `List[DetailsHandle]` | 与传入数据一一对应 |
-| `add_text_row` | `TextObject` | 容器可按 `{name}_content` 查找 |
+| `add_split` / `add_basic` | `SplitHandle` | `node` / `left` / `right` |
+| `add_info` | `ProfileHandle` | `icon` / `text` / `split` / `icon_range` / `text_range` |
+| `add_photo` | `PhotoHandle` | `photo` |
+| `add_section_heading` | `TitleHandle` | `icon` / `text` / `divider` |
+| `add_detail` | `DetailsHandle` | `key` / `during_time` / `tags` / `description` / `brief` |
+| `add_detail_head` / `add_detail_body` | `DetailHeadHandle` / `DetailBodyHandle` | 可单独使用的两个半成品 |
+| `add_highlight` | `HighlightHandle` | 重点突出行 |
+| `add_bullets` / `add_bullet_list` | `BulletHandle` / `BulletListHandle` | 单条 / 批量分条目 |
+| `add_para` | `ParaHandle` / `ParaDeferredHandle` | **图标段落**（圆点 + 文本，行高由内容决定）|
+| `add_section` | `SectionHandle` | 组合模板：节标题 + 该节全部详情 |
+| `add_text_row` | `TextObject` | 一行文本（技能/证书/荣誉共用）|
 | `add_spacer` | `LayoutObject` | 流式留白 |
+
+**6 个旧名已退役**（会 `AttributeError`，不留兼容层）：
+`add_profile` / `add_profile_photo` / `add_section_title` / `add_details` /
+`add_summary` / `add_details_list`。
 
 句柄都带 `fill(...)` / `apply(data)`（就地填充，返回 self 以便链式），
 `apply` 同时接受 dict 与 dataclass。
 
-### 尺寸与高度
-
-容器高度交给引擎的 `SizeY.CONTENT` **自动结算**，本层不再手算 `_height`。
-若某个部件需要固定高度，显式传 `description_height=12` / `content_height=13` 即可。
-
----
-
----
+**留白集中在中层的 `Spacing`**（15 项，frozen dataclass）——
+`Spacing()` / `.compact()` / `.loose()` / `.scaled(k)` / 单项微调。
 
 ## 开发日志
 
 ### 2026-10-13
+
+#### **02：30 个人模板拆分 + 可调项文档化（给后来人的入口）**
+
+**起因**：用户确认"只改 `demo_multi_version.py` 就能完成排版与间距调整"这一条
+是否成立。实测后**基本成立**，但揪出一个真缺口并补上，然后把"怎么用"写进文档。
+
+**一、补上唯一挡住"只改调用侧"的缺口：左栏底色**
+
+盘点时发现 `STYLES["left_column"]`（蓝底）在 `ResumeCore.py` 里**完全没被引用** ——
+`add_basic` 把底色**硬取**中层共享样式，于是"换配色"必须改库文件或污染全局 `STYLES`。
+
+- 中层 `add_basic(..., color=None)` —— `None` = 历史行为；显式传值派生，不改共享 `STYLES`
+- 顶层 `Theme(left_column_color=...)`
+
+实测换色后 PDF 内容流里真的出现 `0.0 0.502 0.377 rg`（默认是 `0.0 0.314 0.627`），
+**不是只改了对象属性**；且**默认产物字节数与改动前完全一致**。
+
+**二、拆成"个人模板 + 示例"两份**
+
+| 文件 | 用途 | 入库 |
+| --- | --- | --- |
+| `my_resumes.py` | **个人数据**，空白可直接填空，含逐版本调留白/版式的注释示例 | ❌ 被 `.gitignore` 排除 |
+| `demo_multi_version.py` | **虚构数据**的完整示例（三个真实感版本）| ✅ 保留 |
+
+`.gitignore` 新增 `my_resumes.py` / `my_resume*.py` / `resumes_private/`，
+并用 `git check-ignore` 验证过**不会被提交**。
+
+> 用户的要求："改完了之后，记得不要提交带有我真实信息的那一份，提交一份示例就行。"
+
+**三、文档：让后来的人知道"改哪里起什么作用"**
+
+- **README 开头三节重写**：
+  - 「如何使用？」—— **五分钟上手**（复制模板 → 填 `[填写]` → 跑 → 产物在哪）、
+    **"我该改哪个文件"对照表**、四个概念、改完怎么验收
+  - 「资源获取」—— 从 `master` 取回（本分支此前丢了），并**修正字体行为的谎报**
+  - 「三层 API 速览」—— 原文列的是 **6 个已退役方法**，已按现状重写（15 个中层模板 + 顶层）
+- **`SKILLS.md` 新增两节**：
+  - **H 节「顶层可调项总表」**—— 留白 15 项 / 版式 34 项 / 内容字段 / 版本与批量 /
+    调整顺序建议 / 有区分度的验收。照这张表改就够，不用读源码
+  - **I 节「计划中的改动」**—— 已定位过、明确知道怎么做的待办，
+    每条注明"为什么现在没做"或"前置条件"；末尾列出**明确不做**的项及理由
+
+**四、顺手修掉的两处旧谎报**
+
+1. `.gitignore` 里"缺字体 → 中文静默降级为空白"—— 实测为假，改为按类型分写
+2. README「资源获取」里同一处谎报
+
+> **教训（第三次）**：同一个错误的行为声称在 `.gitignore`、`README`、`TECHNICAL`、
+> `SKILLS` **四处**都写过。修正时要**全库搜一遍**，否则会漏。
 
 #### **10：35 中层重构：子模板方法风格化 + 句柄化 + 高度自动结算**
 

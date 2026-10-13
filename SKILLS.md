@@ -551,3 +551,212 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 > ⚠️ **实测教训**：文档里的行为声称**必须实测过**。
 > 本仓库曾长期写着"缺字体则中文变空白，因此 `Resources/` 为空仍能退出码 0" ——
 > 2026-10-13 一测，三个入口全部退出码 1。**没跑过的保证不要写进文档。**
+
+## H. 顶层可调项总表（照这张表改就够，不用读源码）
+
+> **日常使用只改 `my_resumes.py`**（个人数据，不入库）或 `demo_multi_version.py`（示例）。
+> 本表是"改哪一行、起什么作用"的完整索引。
+> 定位与用法见 README 的「如何使用」；API 细节见 `TECHNICAL.md` 第 5 章。
+
+### H.0 四个概念（先理解这四个，其余都是填值）
+
+| 概念 | 是什么 | 在哪 |
+| --- | --- | --- |
+| **内容** | 姓名、学校、项目、技能… | `Profiles` / `SkillsAwards` / `Details` / `Section` |
+| **留白** | 各处间距（mm） | 中层 `Spacing`（15 项） |
+| **版式** | 页面、边距、缩进、配色、样式 | 顶层 `Theme`（34 项） |
+| **版本** | 一次投递 = 选哪些节 + 配哪档留白/版式 | `ResumeVersion` |
+
+**关键**：`Section` 的 `title` 是**取用键** —— `ResumeVersion.sections=["项目经历"]`
+引用的就是它。而 `sections` 的**顺序 = 呈现顺序**，所以同一批素材能投不同岗位而不用复制。
+
+### H.1 留白 `Spacing`（15 项，单位 mm）
+
+两种用法：**整体缩放**或**单项微调**。
+
+| 用法 | 写法 |
+| --- | --- |
+| 默认 | `Spacing()` |
+| 整体收紧 ×0.7（内容多、要塞进一页） | `Spacing.compact()` |
+| 整体放松 ×1.3（内容少、要铺匀） | `Spacing.loose()` |
+| 任意比例 | `Spacing().scaled(0.85)` |
+| 单项微调 | `Spacing(between_details=4.0)` |
+
+| 字段 | 默认 | 管什么 |
+| --- | --- | --- |
+| `left_top` | 10.0 | 左栏顶部留白 |
+| `photo_name` | 5.0 | 证件照 ↔ 姓名 |
+| `name_contacts` | 5.0 | 姓名 ↔ 联系方式 |
+| `between_contacts` | 5.0 | 联系方式之间（**注意：顶层实际用 `Theme.contact_gap`，见 H.2**） |
+| `contacts_skills` | 5.0 | 联系方式 ↔ 技能/证书/荣誉 |
+| `between_skills` | 5.0 | 技能 / 证书 / 荣誉三块之间 |
+| `left_bottom` | 5.0 | 左栏底部 |
+| `right_top` | 10.0 | 右栏顶部 |
+| `section_title_to_body` | 0.0 | 节标题分隔线 ↔ 该节首个内容。**默认 0 = 紧贴**；想留白就设 3.0 |
+| `between_paras` | 1.0 | 图标段落之间（`desc_mode="para"` 时生效） |
+| `detail_head_to_body` | 0.0 | 详情三栏 ↔ 描述体 |
+| `between_details` | 5.0 | 节内相邻详情之间 |
+| `between_sections` | 5.0 | 节与节之间 |
+| `right_bottom` | 5.0 | 右栏底部 |
+| `between_bullets` | 0.0 | 分条目之间（`add_bullet_list` 用） |
+
+### H.2 版式 `Theme`（34 项）
+
+| 字段 | 默认 | 管什么 | 常见改法 |
+| --- | --- | --- | --- |
+| `page_width` / `page_height` | 210 / 297 | 纸张尺寸（mm，A4） | 一般不动 |
+| `page_padding` | 10.0 | 四周边距 | 想更满就给 8，想更透气给 14 |
+| `column_ratio` | (1.0, 2.5) | 左右栏宽度比 | 左栏想宽给 (1.3, 2.2) |
+| `right_column_padding_left` | 8.0 | 右栏与左栏的间距 | |
+| `left_column_color` | None | **左栏底色**。None = 中层默认蓝 | `Color(0, 128, 96)`（需 `from LayoutEngine import Color`）|
+| `contact_icon_width` | 4.0 | 联系方式图标边长 | **必须 ≤ 联系方式首行高**（12pt → 5.08mm），否则报错 |
+| `contact_icon_gap` | 2.0 | 图标 ↔ 联系方式文字 |
+| `contact_left_indent` | 3.0 | 联系方式图标左缩进 | **必须 > 0**，否则图标贴在蓝底边界上 |
+| `contact_gap` | 3.0 | **联系方式行距**（行间距 = 行高 + 本值） | 觉得太松给 2.0 |
+| `skills_left_indent` | 3.0 | 技能标题与正文的左缩进 | 两者必须同值 |
+| `body_inner_padding` | None | 描述体文本块的内边距。None = 中层默认 2mm | `Padding.all(0)` 关闭（更紧凑） |
+| `desc_mode` | "para" | 描述体渲染方式 | `"para"` 图标分段 / `"inline"` 整段文本 |
+| `para_icon_width` / `para_icon_gap` | 4.0 / 2.0 | 图标段落的图标与间距 | |
+| `brief_ratio` | (2.0,1.0,2.0) | 详情三栏宽比（关键词/时间/标签） | |
+| `brief_height` | 10.0 | 详情标题带高度 | |
+| `section_icon_fallback` | "" | 节无图标时的兜底图 | |
+| `name_icon` | 学生头像 | 姓名行图标 | |
+| `summary_icon` | "" | 个人总结节标题图标 | |
+| `summary_title` | "个人总结" | 总结的标题文案 | |
+| `skills_title` / `qualifications_title` / `awards_title` | 掌握技能/获得证书/获得荣誉 | 三块标题的**全局默认** | 逐简历改请用 `SkillsAwards(skills_title=...)`（优先级更高）|
+| `contact_icons` | 见下 | 联系方式图标路径字典 | `{"email": r".\Resources\x.png"}` |
+| `section_title_style` 等 **9 个样式字段** | None（取中层） | 各模板的字体/字号/粗体/字色 | `STYLES["name_text"].replace(font_size=20)` |
+
+`contact_icons` 的键：`telephone` / `email` / `locate` / `social` / `address` / `website`。
+
+**9 个样式字段**：`section_title_style`、`section_title_icon_style`、`summary_style`、
+`skills_title_style`、`skills_text_style`、`name_icon_style`、`name_text_style`、
+`contact_text_style`、`photo_style`。
+另有 `detail_styles`（字典，键 `key_style`/`time_style`/`tags_style`/`desc_style`）。
+
+> ⚠️ 改样式要用 `STYLES["键"].replace(...)` **派生新对象**，不要就地改 ——
+> 就地改会污染中层的共享 `STYLES`，影响之后所有简历。
+
+### H.3 内容字段（写什么）
+
+| 类 | 字段 |
+| --- | --- |
+| `Profiles` | `photo` `name` `telephone` `email` `locate` `social_media_qq` `social_media_wechat` `contact_address` `title` `website` `summary` |
+| `Details` | `key` `during_time` `tags` `description`（支持 `\n` 分段与内联 Markdown） |
+| `Section` | `title`（**取用键**） `icon` `details` |
+| `SkillsAwards` | `skills` `qualifications` `awards` + 三个可选标题 |
+| `Resume` | `intend_company` `intend_job` `profile` `skills_awards` `sections` `summary` |
+
+**空串即不渲染**：`telephone=""` 则联系电话整行消失，不用注释代码。
+
+**内联 Markdown**（写在 `description` / `summary` 里）：
+`**粗体**`、`*斜体*`、`<c:RRGGBB>彩色</c>`、`<b>`/`<i>`。
+嵌套请用 `<b>粗<i>斜</i></b>`（`**粗*斜***` 有歧义，见 E3）。
+
+### H.4 版本与批量
+
+| 想做什么 | 写法 |
+| --- | --- |
+| 加一个投递版本 | `book.add_version(ResumeVersion(name=..., company=..., job=..., sections=[...], summary=...))` |
+| 只渲染某几个版本 | `book.render_all(only=["公司A-岗位名"])` 或命令行 `--only 公司A-岗位名` |
+| 逐版本换留白 | `ResumeVersion(spacing=Spacing.compact())` |
+| 逐版本换版式 | `ResumeVersion(theme=Theme(page_padding=14))` |
+| 某版本独有的节 | `ResumeVersion(extra_sections=[Section(...)])` |
+| 批量：一个 PDF 装多份 | `render_into(make_pdf(), [r1, r2])` |
+| 逐字节可复现（比对方便） | `render(..., creation_date=datetime(2026,1,1,tzinfo=timezone.utc))` |
+
+### H.5 调整顺序建议（省时间）
+
+拿到一份不满意的产物时，按这个顺序调，通常最快：
+
+1. **内容够不够 / 顺序对不对** → 改 `sections` 顺序，或加/减节
+2. **整体太挤或太空** → `Spacing.compact()` / `Spacing.loose()` / `scaled(k)`
+3. **某一处挤** → 定位到 H.1 的具体字段单项微调
+4. **左右栏比例不对** → `Theme(column_ratio=...)`
+5. **配色/字号** → `Theme(left_column_color=...)` / `STYLES[...].replace(...)`
+
+> 前四步都不需要碰库文件。第五步也不用，但需要自己写 `Style` 表达式。
+
+### H.6 有区分度的验收（改完怎么确认没改坏）
+
+| 命令 | 验什么 |
+| --- | --- |
+| `py ResumeCore.py` | 顶层 V1–V11 + 整合入口（内容/留白/版式/幂等/多版本隔离） |
+| `py ResumeTemplate.py` | 中层 15 个模板 + 渲染级落点断言 |
+| `py LayoutEngine.py` | 几何 / 断行 / 渲染行距 |
+| `py check_degradation.py` | 缺资源时的降级行为（缺图片→继续 / 缺字体→明确报错） |
+
+改 **留白或版式** 时特别要看 `ResumeCore.py` 的 **V1**（渲染不得修改内容容器）
+与 **V11**（多版本素材隔离）—— 它们卡的正是"改一处结果别处变形"这类问题。
+
+
+## I. 计划中的改动（未来优先考虑这些）
+
+> 这不是愿望清单，而是**已经定位过、明确知道该怎么做**的待办。
+> 每条都写了"为什么现在没做"或"前置条件是什么"。
+> 排在前面的是优先级更高的。
+
+### I.1 阶段二：`.md` 输入（优先级最高）
+
+| 项 | 说明 |
+| --- | --- |
+| **`.md` 格式规范** | **前置条件**：仓库里还没有任何简历 `.md`，规范未定。需要先定"哪个标题是一节、条目怎么写、重点怎么标" |
+| `from_markdown(path) -> Resume` | 解析器。产出 `Resume`，**不认识渲染器** |
+| CLI 批量 | 遍历目录里的 `.md` 批量渲染 |
+
+**为什么放在最前**：README 的两种使用方式里，第二条（读文档自动排版）还没兑现，
+而第一条（`import` 使用）已经可用。
+
+### I.2 外部配置文件（JSON / YAML）
+
+| 项 | 说明 |
+| --- | --- |
+| `RenderConfig.to_dict()` | **已实现** —— 可序列化快照已就绪 |
+| `from_dict()` | 反向装载。需要处理 `Style` / `Padding` / `Color` 对象与 `datetime` |
+| 界面化配置 | 有了 `from_dict` 才谈得上 |
+
+**为什么现在没做**：序列化 `Style` 对象（含 `Padding` / `Color`）需要一层映射，
+在 `.md` 规范定下来之前做容易白做。
+
+### I.3 描述体与文本排版
+
+| 项 | 说明 | 前置 |
+| --- | --- | --- |
+| `AlignX.JUSTIFY`（两端对齐） | 设计已定：**跳过最后一行与单行**；CJK 按字间补、拉丁按词间补 | 引擎侧改动，需回 `master` |
+| 图标分辨率建议 | 4mm 显示只需 **96px**（≈600 DPI）；当前 `black_circle.png` 是 2048×2048，实测让产物从 11.3KB 涨到 65.8KB | 等用户提供低分辨率素材 |
+| `add_detail_body` 内边距语义 | 内边距**计入 CONTENT 高度**，单行文本时"文字略微偏下"。已可通过 `inner_padding=Padding.all(0)` 绕开，但语义值得再想 | |
+
+### I.4 配色与样式的覆盖面
+
+| 项 | 说明 |
+| --- | --- |
+| 右栏底色 | 目前只有 `left_column_color`，右栏是白底写死 |
+| `highlight_text` 配色 | 中层有该样式，顶层未暴露（`add_highlight` 未在顶层使用）|
+| 样式默认值的集中配置 | 现在 9 个样式字段靠 `__post_init__` 从 `STYLES` 回填，无法表达"我要空样式" |
+| 主题预设（`Theme.dark()` 之类） | 有多个配色方案时才值得做 |
+
+### I.5 版面健壮性
+
+| 项 | 说明 |
+| --- | --- |
+| 一页装不下的明确告知 | 现在 `V5` 只验"不越出纸面"，不验"内容是否被静默截断"。内容多时应**明确警告**而不是产出缺内容的 PDF |
+| 自动缩放到一页 | 内容超出时自动试 `Spacing.compact()` / 更小比例，类似"适配一页" |
+| 图片存在性检查已做（警告级） | `Theme.validate()` 的 warnings 已覆盖；可以把"缺哪些图标"报得更细 |
+
+### I.6 验证与工程
+
+| 项 | 说明 |
+| --- | --- |
+| 顶层渲染级断言补强 | 现在 V 组偏结构；可沿用中层 G.3 的方法给关键区块加落点断言 |
+| 逐字节基线比对 | `verify_pdfs.py` 是底层在 `master` 上的工具；顶层重建后需要重做基线 |
+| 新模板准入清单已定 | 见 G.6 —— 新增模板时**逐条对照** |
+
+### I.7 明确不做 / 暂缓
+
+| 项 | 为什么 |
+| --- | --- |
+| 多页简历 | 现状是"一页装满"，多页牵涉页眉页脚与分页断点，需求未明确 |
+| 富文本编辑器 | 与"`.md` 输入"重复 |
+| 云端/服务化 | 定位是本地工具 |
+| 恢复 `description_height` | 那是 CONTENT 高度偏大 2.83 倍时代的手调旋钮，单位修好后**不需要了**（见 7.29） |
+

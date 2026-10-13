@@ -1799,7 +1799,32 @@ class ParaHandle:
 > 也就是说**素材是顶层与测试的事**，中层保持对具体图标的零知识。
 
 
-## 5. ResumeCore.py API
+## 5. ResumeCore.py API（顶层）
+
+> **2026-10-13 整体重写**。旧版 `Resume.Generate()` + `Lead` 字典的写法已移除。
+> 变更清单见 7.30；动机是"顶层只做内容封装，渲染单开一层"（README 的两种使用方式）。
+
+### 5.0 分层与导入
+
+模块**单文件**，但按"认识什么"分四段，靠**函数边界**分层（不是文件边界）：
+
+| 段 | 内容 | 认识什么 |
+| --- | --- | --- |
+| 1 | `Profiles` / `SkillsAwards` / `Details` / `Section` / `Resume` | **纯数据**：不 import 引擎、不做 I/O。整段可原样复制复用 |
+| 2 | `Theme` | 版式配置（样式 + 图标 + 版面骨架常量） |
+| 3 | `build_layout()` | 唯一认识中层模板词汇的地方 |
+| 4 | `render()` / `render_many()` / `render_into()` | **只读数据** |
+
+依赖方向：`ResumeCore.py` → `ResumeTemplate.py` → `LayoutEngine.py`（只向下）。
+
+**分界原则：能随简历变的是内容（放数据类），跨简历稳定的是呈现（放 `Theme`）。**
+
+```python
+from ResumeCore import (Profiles, SkillsAwards, Details, Section, Resume,
+                        Theme, Spacing, Padding,
+                        render, render_many, render_into, build_layout,
+                        make_pdf, RenderError)
+```
 
 ### 5.1 数据类
 
@@ -1807,147 +1832,212 @@ class ParaHandle:
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `photo` | `str` | `""` | 证件照路径 |
-| `name` | `str` | `""` | 姓名 |
-| `telephone` | `str` | `""` | 电话 |
-| `locate` | `str` | `""` | 现居城市 |
-| `email` | `str` | `""` | 邮箱 |
-| `social_media_qq` | `str` | `""` | QQ |
-| `social_media_wechat` | `str` | `""` | 微信 |
-| `contact_address` | `str` | `""` | 联系地址 |
+| `photo` | `str` | `""` | 证件照资源路径 |
+| `name` | `str` | `""` | 姓名（**渲染必需**） |
+| `telephone` / `email` / `locate` | `str` | `""` | 电话 / 邮箱 / 现居城市 |
+| `social_media_qq` / `social_media_wechat` | `str` | `""` | QQ / 微信 |
+| `contact_address` / `website` | `str` | `""` | 联系地址 / 个人网站 |
 | `title` | `str` | `""` | 求职头衔 |
-| `website` | `str` | `""` | 个人网站/GitHub |
-| `summary` | `str` | `""` | 个人简介 |
+| `summary` | `str` | `""` | 个人简介**正文**（内容） |
 
-| 方法 | 返回 |
-| --- | --- |
-| `to_dict()` | `Dict[str, Any]` |
-| `is_empty()` | `bool` —— `name/telephone/email/qq/wechat` **全空**才算空 |
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `to_dict()` | `Dict[str, Any]` | |
+| `is_empty()` | `bool` | 姓名与**全部**联系方式皆空才算空 |
+| `contact_rows()` | `List[tuple]` | `[(图标路径, 文本), ...]`，只含非空项。顺序：电话 → 邮箱 → 城市 → QQ → 微信 → 地址 → 网站 |
 
 #### `class SkillsAwards`
 
 ```python
 SkillsAwards(
-    skills_title: str = "掌握技能",       skills: List[str] = [],
-    qualifications_title: str = "获得证书", qualifications: List[str] = [],
-    awards_title: str = "获得荣誉",        awards: List[str] = [],
+    skills: List[str] = [], qualifications: List[str] = [], awards: List[str] = [],
+    # 三块标题：None = 不表态，由 Theme 决定；给了就用它（逐简历定制）
+    skills_title: Optional[str] = None,
+    qualifications_title: Optional[str] = None,
+    awards_title: Optional[str] = None,
 )
 ```
 
 | 方法 | 返回 | 说明 |
 | --- | --- | --- |
 | `is_empty()` | `bool` | 三个列表全空 |
-| `get_char_skills()` | `str` | 用 `\n` 连接（批次 0 已修，不再有末尾换行） |
-| `get_char_qualifications()` | `str` | 用 `\n` 连接（同上） |
-| `get_char_awards()` | `str` | 用 `\n` 连接（同上） |
+| `blocks(theme=None)` | `List[tuple]` | `[(块名, 标题, 条目列表), ...]`，只含非空块。标题优先级：**本对象显式给的 > theme 的 > 内置默认** |
+| `to_dict()` | `Dict[str, Any]` | |
 
-> ✅ 三个 `get_char_*` 原先用循环拼接，`if i < len(...)` 恒为真导致**每段结尾多一个 `\n`**；
-> 批次 0 已改为 `'\n'.join(...)`。历史记录见 7.15。
->
-| `blocks()` | `List[tuple]` | `[(块名, 标题, 条目列表), ...]`，只含非空块（供编排循环用） |
-
-> ✅ **可变默认参数已消除（2026-10-13）**：改为 `Optional[List[str]] = None` 再在
-> 函数体内 `list(...)` 复制。`Details.description_height` 与 `Resume.Lead` 同步处理，
-> 见 7.10。
+> ⚠️ **与旧版不同**：旧版把 `skills_title` 放在第一个位置参数；新版把它移到末尾并改成
+> `Optional[str]`，条目列表在前。旧写法 `SkillsAwards("掌握技能", [...])` 会**静默把标题当条目**，
+> 迁移时务必改用关键字参数。
 
 #### `@dataclass Details`
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `key` | `str` | `""` | 学校/项目/公司名 |
+| `key` | `str` | `""` | 关键词（学校 / 项目 / 公司） |
 | `during_time` | `str` | `""` | 起讫时间 |
-| `tags` | `str` | `""` | 专业/技术栈 |
-| `description` | `str` | `""` | 详情描述 |
-| `description_height` | `Optional[float]` | `None` | 描述排版高度（mm）。`None` = 由引擎按真实行数**自动结算**；给正值则固定高度 |
+| `tags` | `str` | `""` | 补充信息（专业 / 技术栈） |
+| `description` | `str` | `""` | 描述（支持 `\n` 分段与内联 Markdown） |
 
-方法：`to_dict()`、`is_empty()`（`key` 与 `description` 全空才算空）。
+> 旧版的 `description_height` 字段**已删除** —— 高度一律由内容结算
+> （这正是 `_source_h` 单位修复后可以做到的事，见 7.29）。
 
 #### `@dataclass Section`
 
-字段：`icon: str = ""`、`title: str = ""`、`details: List[Details] = field(default_factory=list)`。
+字段：`title: str`、`icon: str`、`details: List[Details]`。
 
-方法：`add_detail(detail) -> Section`（链式）、`remove_detail(index) -> bool`、`to_dict()`、
-`is_empty()`（`title` 与 `details` 全空才算空）。
+> 这三个字段**正好就是中层 `add_section` 的鸭子契约**（它用 `_field_getter` 读
+> `title` / `icon` / `details`），所以 `Section` 可以整个交给它。
 
-### 5.2 间距默认值
+方法：`add_detail(detail) -> Section`（链式）、`remove_detail(index) -> bool`、
+`to_dict()`、`is_empty()`。
 
-模块级私有常量 `__Lead_default_settings__`（键名 → mm 值）：
+### 5.2 `@dataclass Theme` —— 版式配置
 
-| 键 | 默认 | 含义 |
+只放**跨简历稳定**的呈现信息，以及版面骨架常量（改动会移动所有元素，故集中于此）。
+
+| 组 | 字段 | 默认 |
 | --- | --- | --- |
-| `Left_Column_Above_All` | 10 | 左栏上方留白 |
-| `Left_Column_Below_Photo_Avove_Name` | 5 | 照片下方、姓名上方 |
-| `Left_Column_Below_Name_Above_Contacts` | 5 | 姓名下方、联系方式上方 |
-| `Left_Column_Between_Contacs` | 5 | 联系方式之间 |
-| `Left_Column_Below_Contacts_Above_Skills&Awards` | 5 | 联系方式下方、技能上方 |
-| `Left_Column_Between_Skills&Awards` | 5 | 技能/证书/荣誉之间 |
-| `Left_Column_Below_All` | 5 | 左栏底部 |
-| `Right_Column_Above_All` | 10 | 右栏上方 |
-| `Right_Column_Between_SectionTitle_SectionDetails` | 3 | 节标题与节详情之间 |
-| `Right_Column_Between_Sections` | 5 | 节之间 |
-| `Right_Column_Between_Details` | 5 | 节内详情之间 |
-| `Right_Column_Below_All` | 5 | 右栏底部 |
+| 纸张/分栏 | `page_width` / `page_height` / `page_padding` | `210` / `297` / `10` |
+| | `column_ratio` / `right_column_padding_left` | `(1.0, 2.5)` / `8.0` |
+| 样式 | `section_title_style` / `section_title_icon_style` / `detail_styles` | 取中层 `STYLES` |
+| | `summary_style` / `skills_title_style` / `skills_text_style` | 同上 |
+| | `name_icon_style` / `name_text_style` / `contact_text_style` / `photo_style` | 同上 |
+| 版面标签 | `summary_title` | `"个人总结"` |
+| | `skills_title` / `qualifications_title` / `awards_title` | `"掌握技能"` / `"获得证书"` / `"获得荣誉"` |
+| 图标 | `summary_icon` / `name_icon` / `section_icon_fallback` | `""` / 学生头像 / `""` |
+| 详情区 | `brief_ratio` / `brief_height` | `(2.0, 1.0, 2.0)` / `10.0` |
+| | `desc_mode` | `"para"`（图标段落）/ `"inline"`（整段文本） |
+| | `para_icon_width` / `para_icon_gap` | `4.0` / `2.0` |
+| | `body_inner_padding` | `None`（= 中层默认 `Padding.all(2)`） |
+| 联系方式 | `contact_icon_width` / `contact_icon_gap` | `4.0` / `2.0` |
+| | `contact_left_indent` | `3.0` |
+| | `contact_gap` | `3.0` |
+| 技能块 | `skills_left_indent` | `3.0` |
 
-> 键名含 `&` 与拼写错误（`Above`→`Avove`、`Contacts`→`Contacs`、`Between_Sections`）。
-> 因为是用 `&` 访问的字符串键，改名会影响调用方，建议保持不动作兼容处理。
+**两个非数据字段**（`init=False`）：`ICON_TELEPHONE` / `ICON_EMAIL` / `ICON_LOCATE` /
+`ICON_SOCIAL` / `ICON_ADDRESS` / `ICON_WEBSITE` —— 联系方式图标路径，`Profiles.contact_rows()` 使用。
 
-### 5.3 `class Resume`
+方法：
+
+| 方法 | 返回 | 说明 |
+| --- | --- | --- |
+| `skills_body_padding()` | `Padding` | 技能正文的文本块内边距 = 左 `skills_left_indent` + 上下沿用 `body_inner_padding` |
+
+> ⚠️ **技能标题与正文必须用同一个左缩进**。正文的缩进要做进**文本块内边距**，
+> 否则标题有缩进而正文没有，左边缘差一个缩进值（实测 2.00 vs 0.00）。
+>
+> ⚠️ `skills_title_style` 默认是 `STYLES["skillsawards_title"].replace(bold=True)`
+> —— 即**加粗**。顶层用 `replace` 派生新对象，**不改中层的共享 `STYLES`**。
+>
+> ⚠️ `contact_left_indent` **必须 > 0**：`add_para(indent=0)` 时图标会精确落在蓝底
+> 左栏边界上（实测图标 x = 左栏 `abs_x`）。
+
+### 5.3 `class Resume` —— 纯数据容器
 
 ```python
 Resume(
-    intend_company: str = "",
-    intend_job: str = "",
+    intend_company: str = "", intend_job: str = "",
     profile: Optional[Profiles] = None,
     skills_awards: Optional[SkillsAwards] = None,
     sections: Optional[List[Section]] = None,
-    summary_icon = "",
     summary: str = "",
-    summary_title: str = "个人总结",
-    summary_height: Optional[float] = None,
-    Lead: dict = {},          # ← 可变默认参数（见 7.10）
 )
 ```
-
-构造函数副作用：向 `self.Lead` **就位补齐**所有缺省键，并对每个缺失键打印
-`>>>⚠未指定间距：{key}，将该间距设定为默认值：{value}。`
 
 | 方法 | 签名 | 返回 |
 | --- | --- | --- |
 | `add_section` | `(section: Section) -> Resume` | self（链式） |
 | `remove_section` | `(index: int) -> bool` | 是否成功 |
-| `get_file_name` | `() -> str` | `{姓名}_{职位}_{公司}.pdf`，非法字符替换为 `_` |
-| `Generate` | `(debug: int = 0, output_dir: str = "./output") -> str` | 生成的 PDF 路径 |
-| `get_pdf_path` | `() -> Optional[str]` | |
-| `get_root` | `() -> Optional[LayoutObject]` | |
-| `find` | `(name: str) -> Optional[LayoutObject]` | 委托 `root.find_by_name` |
+| `get_file_name` | `() -> str` | `{姓名}_{职位}_{公司}.pdf`，非法字符替换为 `_`（**纯函数**） |
+| `is_empty` | `() -> bool` | 无任何可渲染内容 |
+| `to_dict` | `() -> Dict[str, Any]` | |
 
-`Generate(debug=...)` 的三种模式：
+> **刻意不提供任何渲染方法。** 旧版 `Generate()` 会往自己身上写
+> `_root` / `_left_column` / `_right_column` / `_pdf_path` 四个属性，
+> 导致同一实例反复渲染会带上残留状态。新版把这些全部去掉，
+> 由自检 **V1** 断言守住（`vars(resume)` 渲染前后必须完全一致）。
+>
+> 这样同一个 `Resume` 可以被反复渲染、被不同留白配置渲染、被批量填充。
 
-| `debug` | 行为 |
+### 5.4 `Spacing` —— 留白（来自中层）
+
+顶层**不再有 `Lead` 字典**。留白一律用中层的 `ResumeTemplate.Spacing`：
+
+```python
+Spacing()                      # 默认
+Spacing.compact()              # ×0.7，内容多、要塞进一页
+Spacing.loose()                # ×1.3，内容少、要排布均匀
+Spacing().scaled(0.85)         # 任意比例
+Spacing(photo_name=3.0)        # 单项微调
+```
+
+字段见 4.x 的 `Spacing` 小节。**注意**：顶层还有两个"应用侧疏密"旋钮在 `Theme` 里
+（`contact_gap` / `skills_left_indent`），它们**没有**改中层的默认值 —— 疏密是顶层的选择。
+
+### 5.5 `render()`
+
+```python
+render(resume, output_dir="./output", *,
+       spacing=None, theme=None, debug=0,
+       creation_date=None, filename=None, pdf=None) -> str
+```
+
+| 参数 | 说明 |
 | --- | --- |
-| `0` | 仅 `root.render(pdf, is_fill=False)` |
-| `1` | 仅 `root.render_debug(pdf, is_fill=True, ...)` |
-| 其他 | 先 `render_debug` 再 `render` |
+| `spacing` | `ResumeTemplate.Spacing`；`None` → `Spacing()` |
+| `theme` | `Theme`；`None` → `Theme()` |
+| `debug` | `0` 只渲染内容；`1` 只渲染调试框；其他值两者都渲染 |
+| `creation_date` | **必须是 `datetime` 对象**。给了就能**逐字节复现** |
+| `filename` | 覆盖输出文件名 |
+| `pdf` | 传入现成的 `FPDF`（一个 PDF 装多份用）。此时返回 `""` |
 
-`Generate` 的完整流程：校验 `profile.is_empty()` → 建 PDF/加页 → 注册 LXGW 字体
-（失败静默吞掉）→ 设置元数据 → 建 `Root`（210×297，padding 10）→ `root.add_basic(...)`
-→ 从 `BasicHandle` 直接取左右栏 → `_fill_left_column()` → `_fill_right_column()`
-→ **`root.layout(pdf=pdf, force=True)`** → 渲染 → 输出到 `output_dir`。
+返回：生成的 PDF 路径。
 
-> ⚠️ **`layout(pdf=...)` 这一步不能省**：`SizeY.CONTENT` 的高度要靠真实文本测量才能结算，
-> 而精确测量需要 `pdf` 实例。旧的固定高度写法不需要它，所以旧流程没有这一步。
+**硬约束（自检 V1–V3 守住）**：不修改 `resume`；不修改 `spacing` / `theme`；
+两次调用版面相同；给了 `creation_date` 则逐字节相同。
 
-`_fill_left_column()` 顺序：上方留白 → 证件照 → 照片/姓名间留白 → 姓名行 →
-姓名/联系人间留白 → 联系方式（`_contact_rows()` 的每一条 + 间隔留白，N 条只加 N-1 个）
-→ 技能/证书/荣誉（`_fill_skills_awards()`）→ 底部留白。
+> ⚠️ `creation_date` 传字符串 fpdf 会抛 `TypeError`。这里**显式校验并报错**，
+> 不用 `except: pass` —— 早前那样写导致"固定时间"**静默失效**（自检 V8 因此失败）。
+>
+> ⚠️ **`build_layout()` 之后必须 `root.layout(pdf=doc, force=True)`**：
+> `SizeY.CONTENT` 的高度要靠真实文本测量才能结算，而精确测量需要 `pdf` 实例。
 
-`_fill_right_column()` 顺序：上方留白 → 遍历 `sections`（每节一次 `root.add_section(...)`）
-→ 节间留白 → 个人总结（节标题 + 留白 + `add_summary`）→ 底部留白。
+**渲染前置校验**（`_validate()`，失败抛 `RenderError`）：
 
-> ✅ **7.12 已消除**：编号不再由顶层手工维护，改由 `add_section` 内部按
-> `"{节号}_{节内序号}"` 分配，不存在"详情编号跳号"或"跨节同名"的问题。
+| 条件 | 报错 |
+| --- | --- |
+| `profile.name` 为空 | 缺姓名（姓名用于文件名与左栏标题，必需） |
+| `sections` 与 `summary` 都为空 | 没有任何可渲染的章节或总结 |
 
----
+> 旧版的条件是 `profile.is_empty()`（任何关键联系方式非空就通过），
+> 且**在数据类构造时**就抛 `RuntimeError` —— 新版把校验移入渲染器，数据类不抛异常。
+
+### 5.6 `render_many()` / `render_into()` / `make_pdf()`
+
+| 函数 | 签名 | 说明 |
+| --- | --- | --- |
+| `render_many` | `(resumes, output_dir="./output", *, spacing=None, theme=None, creation_date=None, **kw) -> List[str]` | 批量；共享的 `spacing` / `theme` **不被修改** |
+| `render_into` | `(pdf, resumes, *, spacing=None, theme=None) -> FPDF` | 装进同一个 PDF，**每份一页**（内部 `add_page()`） |
+| `make_pdf` | `(theme=None) -> FPDF` | 空文档 + 注册中文字体（缺字体时退回内置字体，不抛异常） |
+
+### 5.7 使用示例
+
+```python
+from ResumeCore import Profiles, Section, Details, Resume, render
+from ResumeTemplate import Spacing
+
+me = Profiles(name="张三", telephone="138-0000-0000", email="a@b.com")
+edu = Section(title="教育背景")
+edu.add_detail(Details(key="某大学", during_time="2020-2024",
+                       tags="计算机 | 本科", description="主修课程：…\n绩点 3.8。"))
+resume = Resume(profile=me, sections=[edu], summary="五年后端开发经验。")
+
+render(resume, output_dir="output")                            # 生成
+render(resume, output_dir="tight", spacing=Spacing.compact())  # 同一容器换松紧
+render_many([r1, r2, r3], output_dir="batch")                  # 批量
+```
+
+可运行示例见 `demo_top_layer.py`；验收自检见 `py ResumeCore.py`（V1–V10）。
+
 
 ## 6. 命名与查找约定
 
@@ -2834,26 +2924,56 @@ box._height = content_h
 
 ---
 
-## 9. 测试入口
+## 9. 测试入口与验收
 
 沿用项目传统：单元测试写在**各文件自己的 `if __name__ == "__main__":` 里**，可覆盖旧测试。
 
 | 命令（在项目根目录执行） | 覆盖 | 产出 |
 | --- | --- | --- |
-| `py LayoutEngine.py` | 几何、流式、分栏、横向带、留白、图层、缓存、三种渲染对象 | `test_layout_engine_cached.pdf` |
-| `py ResumeTemplate.py` | 全部 `generate_*` + `fill_*` + `split_column_advanced` | `resume_template_v2_test.pdf` |
-| `py ResumeCore.py` | 完整 `Resume.Generate` 链路 | `output/{姓名}_{职位}_{公司}.pdf` |
+| `py LayoutEngine.py` | 几何、流式、分栏、横向带、留白、图层、缓存、三种渲染对象、断行禁则、嵌套标记、渲染行距 | `test_layout_engine_cached.pdf` |
+| `py ResumeTemplate.py` | 全部模板方法（15 个）+ 句柄契约 + 渲染级落点断言 + `Spacing` + 段落模式 | `resume_template_v2_test.pdf` |
+| `py ResumeCore.py` | **顶层验收 V1–V10**（见下） | 临时目录（`_resumecore_selftest`） |
+| `py demo_top_layer.py` | 顶层两种使用方式 + 批量（可运行示例） | `output_demo/` 5 份 PDF |
+| `py check_degradation.py` | **D 组降级验收**：缺图片→继续 / 缺字体→明确报错 | 无（自带资源复位校验） |
 
-注意事项：
+### 9.1 顶层验收 V1–V10
+
+| # | 断言 | 卡住的缺陷类型 |
+| --- | --- | --- |
+| **V1** | `vars(resume)` 渲染前后完全一致（含不新增属性） | 渲染写回数据（旧 `Generate()` 写 `_root` / `_pdf_path`） |
+| V2/V3 | 三个独立对象渲三次结果一致 | 跨实例污染、隐藏状态 |
+| V4 | 空字段可渲染；缺姓名 / 无内容时明确报错 | 降级行为 |
+| V5 | 不越出纸面 **+** 子元素被父内容区包含（两层） | 溢出（只做页面边界会漏掉"父没撑够高"） |
+| V6 | 数据类字段里没有排版对象；`Resume` 上没有渲染方法 | 分层纪律 |
+| V7 | 一个 PDF 装两份 → 2 页 | 分页 |
+| V8 | 固定 `creation_date` → 逐字节可复现 | 确定性 |
+| V9 | 联系方式行高 = 文本行高；行间距 = 行高 + `contact_gap`；图标有左缩进；图标中心 = 首行中心 | 行距被图标撑起、图标贴蓝底边界 |
+| V10 | 技能标题为粗体且字号未变；中层 `STYLES` 未被污染；技能标题与正文左边缘一致 | 样式污染、左边缘参差 |
+
+> ⚠️ **断言必须有区分度**。本项目对 V1 / V9 / 中层 9c 都做过**反向验证**：
+> 临时注入对应缺陷，确认断言会失败（`exit=1`），再还原。
+> 没有区分度的断言等于没有断言。
+
+### 9.2 注意事项
 
 1. **必须用 `py`**（3.14 + fpdf2 2.8.8）。DSH 自带运行时没有 fpdf2。
-2. 字体路径是相对路径 `.\Resources\...`，**必须在项目根目录执行**，否则字体会静默降级为 helvetica，
-   中文变空白。字体需自行下载，见 README 的「资源获取」。
-3. `Resources/` 缺全部图片资源（1.4 节），图片相关的视觉验收目前无法进行。
+2. 字体路径是相对路径 `.\Resources\...`，**必须在项目根目录执行**。
+3. **缺资源的行为按类型分两种**（2026-10-13 实测）：
+   - 缺**图片** → 静默降级、继续运行，入口退出码 0；
+   - 缺**字体** → **明确报错并中止**（`wrapped_height()` 把 fpdf 的 CJK 异常包成可读中文）。
+   > ⚠️ 本文档此前写"缺字体则中文变空白（退回 helvetica）" —— **实测为假**。
+   > 而且"退出码 0"本身不是目标：静默产出错误内容比明确报错危险得多。
+   > 标准见 `SKILLS.md` 的 G.4（D1–D3）。
 4. 三个入口都会在 stdout 打印大量渲染日志（7.13），建议重定向到文件再读尾部。
-5. **前两个入口的产物已被 `.gitignore` 忽略**（`*.pdf` 规则），它们由代码可复现，不入库。
+5. **产物已被 `.gitignore` 忽略**（`*.pdf` 规则），由代码可复现，不入库。
+6. 顶层自检**不写工作区产物**（用系统临时目录），`demo_top_layer.py` 才写 `output_demo/`。
 
----
+### 9.3 `DSH_RESUME_SMOKE=1`（跳自检开关）
+
+两个入口都支持该环境变量：只跑"能否生成"，跳过全部自检断言。
+
+用途：`check_degradation.py` 要在"缺字体"这种**必然失败**的环境下尽快拿到第一条真实错误，
+而不是跑完 60+ 条连锁失败的断言。默认关闭，不影响正常自检。
 
 ## 10. 附录：模块常量速查
 
@@ -2966,6 +3086,62 @@ add_para                   -> ParaHandle(node/left/icon/right/text)
 add_section                -> SectionHandle(node/title/details[])
 add_text_row               -> TextObject（容器按 {name}_content 查找）
 add_spacer                 -> LayoutObject
+
+# ---- 本轮（2026-10-13 收尾 + 顶层重建）新增 ----
+
+# 中层：留白集中定义（Spacing，frozen dataclass，15 个字段）
+Spacing()                      # 默认；compact()=×0.7 / loose()=×1.3 / scaled(k)
+Spacing.as_lead()              # -> 顶层旧 Lead 的 12 个键（历史命名，兼容用）
+Spacing.describe()             # -> 一行摘要
+# 字段：left_top / photo_name / name_contacts / between_contacts /
+#       contacts_skills / between_skills / left_bottom /
+#       right_top / section_title_to_body(=0 逐节指定) / between_paras /
+#       detail_head_to_body / between_details / between_sections /
+#       right_bottom / between_bullets
+
+# 中层：图标段落 add_para
+DEFAULT_PARA_ICON          = r".\Resources\black_circle.png"
+DEFAULT_PARA_ICON_WIDTH    = 4.0    DEFAULT_PARA_ICON_INDENT  = 1.0
+DEFAULT_PARA_ICON_PAD_TOP  = 0.5
+add_para:  icon=默认圆点, icon_width=4.0, icon_align=VCENTER,
+           icon_anchor="first_line"（另一取值 "cell"）,
+           indent=1.0, gap=2.0, left_pad=None, style=None, text_cfg=None,
+           padding=None, align_x=LEFT, align_y=VCENTER, name=None,
+           name_suffix="content", layer=0
+# 三条硬约束（见 4.8d）：
+#   1) 不能用 create_band
+#   2) 图标必须显式 height=icon_width 才是正方形
+#   3) 行高 = max(正文实高, 图标高 + 左栏上内边距)
+# icon_anchor="first_line" 时：pad_top = 首行高/2 − 图标边长/2，
+#   且**图标边长必须 ≤ 首行高**，否则明确报错（不静默错位）
+
+# 中层：add_detail_body 新增 inner_padding
+add_detail_body:  height=None（自动结算）, inner_padding=None
+                  # inner_padding=None -> Padding.all(2)（历史行为）
+                  # 它**计入 CONTENT 高度**，故单行文本会上下各留该空白；
+                  # 传 Padding.all(0) 可关闭（紧凑排版 / 调试对齐）
+
+# 中层：add_section_heading 新增 gap_after
+add_section_heading: gap_after=0.0   # 分隔线**之下**的留白（不是图标↔标题的 gap）
+# ⚠️ 直挂内容的调用方必须显式给，否则标题与内容贴在一起（实测 0.00mm）；
+#    add_section 会把它的 title_detail_gap 交给 gap_after，避免"某条路径漏加"
+
+# 中层：add_section / add_detail 的 desc_mode
+desc_mode="inline"（默认）| "para"（按 \n 拆段，每段用 add_para 排版）
+para_gap=1.0    para_kwargs=None（透传给 add_para）
+
+# 顶层默认值（ResumeCore.py）
+Theme:  page_width=210  page_height=297  page_padding=10
+        column_ratio=(1.0, 2.5)  right_column_padding_left=8.0
+        desc_mode="para"  para_icon_width=4.0  para_icon_gap=2.0
+        body_inner_padding=None（= 中层默认 2mm）
+        contact_icon_width=4.0  contact_icon_gap=2.0
+        contact_left_indent=3.0   # 必须 > 0，否则图标贴蓝底边界
+        contact_gap=3.0           # 行间距 = 行高 + 本值
+        skills_left_indent=3.0    # 技能标题与正文必须同值
+        skills_title_style = STYLES["skillsawards_title"].replace(bold=True)
+render():  output_dir="./output"  spacing=None  theme=None  debug=0
+           creation_date=None（**必须 datetime**）  filename=None  pdf=None
 ```
 
 ---
@@ -3230,15 +3406,29 @@ handle.node.get_layout_info()               # 全部几何 + 尺寸方式 + 溢�
 > 想**贴底**用 `BOTTOM`；想让盒高完全贴合文字就用上表的"贴合盒高"，
 > 此时盒高不再是可调旋钮，文字一定占满。
 
-### 11.5 与留白（`Lead`）的分工
+### 11.5 与留白（`Spacing`）的分工
 
-中层**不含任何留白常量** —— 节间距、行间距都在顶层 `ResumeCore.__Lead_default_settings__`。
-中层只提供 `add_spacer(name, height)` 这个动作。
+> **2026-10-13 更新**：留白已**收归中层**，不再由顶层用 `Lead` 字典散管。
 
-> 所以"节与节之间太挤"这类问题要改 `ResumeCore` 的 `Lead`，
-> **不在本手册范围内**。完整键表见第 5.2 节。
+中层提供 `ResumeTemplate.Spacing`（frozen dataclass，15 个字段）作为**留白的唯一真相源**：
 
-分工原则：**中层管"一个模板内部长什么样"，顶层管"模板之间的间距"。**
+```python
+Spacing()                      # 默认
+Spacing.compact() / .loose()   # ×0.7 / ×1.3
+Spacing().scaled(k)            # 任意比例（整体缩放）
+Spacing(photo_name=3.0)        # 单项微调
+```
+
+顶层 `render(resume, spacing=Spacing(...))` 传入；顶层 `Theme` 里另有**两个应用侧疏密旋钮**
+（`contact_gap` / `skills_left_indent`），它们**没有**改中层的默认值。
+
+分工原则仍成立：**中层管「一个模板内部长什么样」（含模板之间的留白），
+顶层管「哪种应用用它、用哪一档疏密」。**
+
+> 完整字段表见第 4 章的 `Spacing` 小节；顶层如何传见第 5.4 节。
+>
+> ⚠️ 第 5.2 节此前的「间距默认值（12 个 `Lead_*` 键）」表已随第 5 章重写移除。
+> `Spacing.as_lead()` 仍能导出那 12 个历史键名（兼容用），但**不再是对外接口**。
 
 ### 11.6 不该动的参数（避免踩坑）
 
@@ -3263,9 +3453,9 @@ handle.node.get_layout_info()               # 全部几何 + 尺寸方式 + 溢�
 | ✅ **想让文字正好占满盒子** | 盒高设成 11.4b 表里的"贴合盒高" | 此时 `dy_align=0`，与 `align_y` 无关 |
 | ✅ **文字跑到盒子外面 / 压住下面的元素** | 先确认盒高 ≥ 文字实高（11.4b 表） | 引擎已修单位缺陷；若仍溢出就是盒高真不够 |
 | **左栏整体太挤 / 太空** | 左栏内容总高 = 证件照 + 姓名行 + 联系方式行 + 技能三块之和 | 改任一行高度都会推动其下所有行 |
-| 姓名行太高/太矮 | `add_profile(content_height=N)`，或 `icon_width`（参与下限） | 只改字号可能被图标下限顶住 |
-| 证件照太大/太小 | `add_profile_photo(photo_width=N)` | 行高 = 宽 × 1.6，**平方级影响** |
-| 左栏文字离左边太近/太远 | `add_profile(row_inset=N)` | 宽度同步收窄，文本可用宽变小 |
+| 姓名行太高/太矮 | 中层的 `add_info(content_height=N)`，或 `icon_width`（参与下限） | 只改字号可能被图标下限顶住 |
+| 证件照太大/太小 | 中层的 `add_photo(photo_width=N)`；顶层 `Theme` 可换样式 | 行高 = 宽 × 1.6，**平方级影响** |
+| 左栏文字离左边太近/太远 | 姓名/联系方式行用 `add_info(row_inset=N)`；联系方式（`add_para`）用 `Theme.contact_left_indent` | 宽度同步收窄，文本可用宽变小 |
 | 技能/证书/荣誉之间太挤 | `ResumeCore` 的 `Lead["Left_Column_Between_Skills&Awards"]` | **不在中层**，见 11.5 |
 | 技能正文行留空太多 | `add_text_row(height=...)`；`ResumeCore` 传的是 `条目数×6` | 该行只有一个文本块，`VCENTER` 会把它居中 |
 | 左右栏宽度不合理 | `add_basic(ratio=[a, b])` | **改一处动全篇**：变窄→更多折行→后续下移 |
@@ -3278,6 +3468,11 @@ handle.node.get_layout_info()               # 全部几何 + 尺寸方式 + 溢�
 | 关键词一栏太窄/太宽 | `add_details(brief_ratio=[a,b,c])` | 必须 3 个元素；影响该条详情 |
 | 详情描述行距太密/太松 | **只能改字号或行数** | 行高系数 1.2 未暴露（见 11.6） |
 | 详情描述下方留空太多 | `add_details(description_height=N)` 固定高度；默认自动结算 | 固定值小于实际内容高会**溢出**（`content_overflows`） |
+| ✅ **联系方式行距太大** | 顶层 `Theme.contact_gap`（默认 3.0） | 行间距 = 行高 + 本值。**注意别再退回 `add_info`** —— 它的行高被图标列撑到 7mm，行距会变成 12mm |
+| ✅ **图标贴住蓝底左栏边界** | 顶层 `Theme.contact_left_indent`（默认 3.0，**必须 > 0**） | `add_para(indent=0)` 时图标精确落在左栏 `abs_x` 上 |
+| ✅ **技能标题比正文更靠右** | 顶层 `Theme.skills_left_indent`（默认 3.0） | 标题与正文**必须同值**；正文的缩进做进文本块内边距 |
+| ✅ **块标题太弱** | 顶层 `Theme.skills_title_style` 默认已 `replace(bold=True)` | 用 `replace` 派生，**不改中层的共享 `STYLES`** |
+| ✅ **一段文字整体偏高/偏矮** | 中层的 `add_detail_body(inner_padding=Padding.all(0))` 可关掉上下 2mm 内边距 | 该内边距**计入 CONTENT 高度**，单行文本时表现为「文字略微偏下」 |
 | 某些字想加粗/变色 | `TextObject` 的**行内 Markdown**：`**粗**`、`*斜*`、`` `等宽` ``、`<c:RRGGBB>色</c>` | 已默认开启（`markdown=True`），见 3.4c |
 | 个人总结太高/太矮 | `add_summary(description_height=N)` | 默认自动结算 |
 

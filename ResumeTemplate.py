@@ -2082,6 +2082,7 @@ def add_para(self: LayoutObject,
              text_cfg: Optional[TextConfig] = None,
              padding: Optional[Padding] = None,
              align_x: AlignX = AlignX.LEFT,
+             align_y: AlignY = AlignY.VCENTER,
              layer: int = 0) -> ParaHandle:
     """
     图标段落子模板 —— **左栏图标 + 右栏文本**，用于在大片密集信息里标出重点。
@@ -2130,6 +2131,10 @@ def add_para(self: LayoutObject,
         text_cfg: 正文的对齐 / 行距 / 断行禁则配置
         padding: 正文格内边距
         align_x: 正文水平对齐
+        align_y: **正文在行内的垂直对齐**，默认 VCENTER（盒内居中）。
+                两个格子都是满高，所以文字比格子矮时会居中而不是浮在顶部；
+                多行正文比图标高时行高由正文决定，居中无副作用。
+                想贴顶就传 AlignY.TOP
 
     Returns:
         ParaHandle(node / left / icon / right / text)
@@ -2236,7 +2241,10 @@ def add_para(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=align_x,
-        align_y=AlignY.FLOW,
+        # 默认盒内垂直居中：本模板两个格子都是**满高**，文字比格子矮时
+        # （单行正文、或图标把行高撑起来）顶对齐会显得"文字浮在上面"。
+        # 多行正文比图标高时行高由正文决定，居中自然无副作用。
+        align_y=align_y,
         multi_line=True,
         layer=layer + 1,
     )
@@ -2909,6 +2917,40 @@ if __name__ == "__main__":
     assert _p_ovr.icon.get_image().endswith("icon_Education_History.png"), \
         "显式 icon 应覆盖缺省值"
     print("  ✅ 缺省图标 / 显式覆盖通过", flush=True)
+
+    # 9.11 正文垂直对齐：单行 + 大图标时默认居中
+    #      （此前正文是 FLOW 顶对齐，两个格子又都是满高，于是"文字浮在上面"）
+    def _para_probe(**kw):
+        _r = LayoutObject(name="PA_Root", width=110.0, height=100,
+                          padding=Padding.all(0), layer=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _h = _r.add_para(**kw)
+            _r.layout(pdf=pdf, force=True)
+        return _h
+
+    _pa_top = _para_probe(text="单行短文本", icon_width=8.0, align_y=AlignY.TOP)
+    _pa_ctr = _para_probe(text="单行短文本", icon_width=8.0)
+    assert _pa_ctr.text.align_y is AlignY.VCENTER, \
+        f"add_para 正文默认应为 VCENTER，实际 {_pa_ctr.text.align_y}"
+    assert _pa_top.text.align_y is AlignY.TOP, "显式 align_y=TOP 应生效"
+    _rowh = _pa_ctr.node.get_effective_height()
+    # ⚠️ 注意：TextObject 的 effective 高是**盒子高**（本模板下满高 = 行高），
+    #    不是文字实高。要核对居中量必须用 wrapped_height 算真实文字高。
+    _th = wrapped_height("单行短文本", STYLES["bullet_text"],
+                         _pa_ctr.text.get_effective_width())
+    assert _rowh - _th > 0.5, \
+        f"本用例前提：行高应明显大于文字实高（{_rowh:.2f} vs {_th:.2f}）"
+    _expect_dy = (_rowh - _th) / 2
+    assert _expect_dy > 0.5, f"居中量应为正，实际 {_expect_dy:.2f}"
+    # 多行时行高由正文决定，居中不得产生副作用
+    _pa_ml = _para_probe(text="很长的文本内容用于触发多行折行，" * 3)
+    assert abs(_pa_ml.node.get_effective_height()
+               - wrapped_height("很长的文本内容用于触发多行折行，" * 3,
+                                STYLES["bullet_text"],
+                                _pa_ml.text.get_effective_width())) < 0.01, \
+        "多行时行高应由正文折行实高决定，居中无副作用"
+    print(f"  ✅ 图标段落垂直对齐通过（单行+大图标 行高{_rowh:.2f}/文字{_th:.2f}"
+          f" → 居中量 {_expect_dy:.2f}mm；多行时行高仍由正文决定）", flush=True)
 
     # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），

@@ -44,6 +44,7 @@
 
 import contextlib
 import io
+import os
 import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Sequence
@@ -2710,6 +2711,8 @@ _install_methods()
 # ============================================================================
 
 if __name__ == "__main__":
+    # DSH_RESUME_SMOKE=1：只验“能否生成”，跳过自检断言（供资源降级测试用）
+    _SMOKE = os.environ.get("DSH_RESUME_SMOKE") == "1"
     from fpdf import FPDF
 
     print("=" * 60, flush=True)
@@ -2764,7 +2767,7 @@ if __name__ == "__main__":
     # 联系方式：同一个蓝图复用 N 次
     contacts = [
         (".\\Resources\\telephone.png", "138-0000-0000"),
-        (".\\Resources\\email.png", "hanmeimei@example.com"),
+        (".\\Resources\\email.png", "hanmeimei@ex.com"),
     ]
     for i, (icon_path, value) in enumerate(contacts, start=1):
         left_column.add_info(
@@ -2977,7 +2980,7 @@ if __name__ == "__main__":
     with contextlib.redirect_stdout(io.StringIO()):
         _bh_root.render(_probe, is_fill=False)
     _cell_recs = _probe.cells
-
+    
     # ---- 7c. TextConfig 可控性探针（同样必须在 pdf.output() 之前）----
     def _head_probe(**kw):
         """渲染一次详情三栏，返回 (三栏基线列表, 几何)，供断言核对"""
@@ -3001,10 +3004,14 @@ if __name__ == "__main__":
     _tc_time, _tc_geo2 = _head_probe(time_align=TextConfig(align_y=AlignY.TOP))
     _tc_all, _tc_geo3 = _head_probe(text_cfg=TextConfig(align_y=AlignY.TOP))
     _tc_lhr, _tc_geo4 = _head_probe(text_cfg=TextConfig(line_height_ratio=2.0))
-
+    
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)
     print(f"\n✅ PDF 已生成: {output_path}", flush=True)
+
+    if _SMOKE:
+        print("\n【smoke 模式】已生成，跳过自检断言（DSH_RESUME_SMOKE=1）")
+        raise SystemExit(0)
 
     # ---- 8. 回归契约断言 ----
     print("\n【8. 回归契约断言】", flush=True)
@@ -3393,6 +3400,61 @@ if __name__ == "__main__":
           f"{_g_probe[0.0]:.2f}/{_g_probe[3.0]:.2f}/{_g_probe[6.0]:.2f}mm）", flush=True)
     print(f"  ✅ Spacing 通过（{Spacing().describe()}；"
           f"scaled(0.5) 等比、as_lead 导出 12 键）", flush=True)
+
+    # ---- 9c. 段落模式（desc_mode="para"）的渲染级断言 ----
+    # ⚠️ 为什么必须走渲染：这三处（段内行距 / 段间距 / 与三栏基线的相对位置）
+    #    在**几何上完全看不出来** —— 段落文字盒都是满高 FILL，
+    #    x/y/w/h 与落点无关。批次 9 那个"行距被放大 2.83 倍"的缺陷，
+    #    任何只比几何的验收都抓不到，就是这个原因。
+    print("\n【9c. 段落模式渲染级断言】", flush=True)
+    _pc_root = LayoutObject(name="PC_Root", width=135.0, height=400,
+                            padding=Padding.all(0), layer=0)
+    _PC_LONG = ("系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能，"
+                "并支持快速生成针对不同岗位的定制化简历，覆盖完整链路。")
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pc = _pc_root.add_detail(
+            index=0, key="日本农业苞谷大学", during_time="2020.09 - 2024.06",
+            tags="本科 | 计算机", description=_PC_LONG + "\n第二段。",
+            brief_ratio=[2.0, 1.0, 2.0], brief_height=DEFAULT_BRIEF_HEIGHT,
+            desc_mode="para", para_gap=1.0,
+            para_kwargs={"icon_width": 4.0, "indent": 0.0, "gap": 2.0},
+            **BRIEF_DETAIL_STYLES)
+        _pc_root.layout(pdf=pdf, force=True)
+    _pc_recs = []
+    _pr = _ProbePdf(pdf)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pc_root.render(_pr, is_fill=False)
+    _pc_recs = [(y + h / 2.0, t) for (_x, y, h, t) in _pr.cells]
+    _base_head = [b for (b, t) in _pc_recs if t in ("日本农业苞谷大学",
+                                                    "2020.09 - 2024.06",
+                                                    "本科 | 计算机")]
+    assert len(_base_head) == 3, f"三栏应各有落点，实际 {len(_base_head)}"
+    _head_b = _base_head[0]
+    assert max(_base_head) - min(_base_head) < 0.01, "三栏基线必须对齐"
+    # 描述段的落点：排除三栏
+    _para_b = [b for (b, t) in _pc_recs if t not in
+               ("日本农业苞谷大学", "2020.09 - 2024.06", "本科 | 计算机")]
+    assert len(_para_b) >= 3, f"应观测到多行描述，实际 {len(_para_b)}"
+    _lh = STYLES["bullet_text"].font_size * 1.2 * PT_TO_MM      # 行高
+    # (1) 段内行距 = 行高（多行折行的相邻行）
+    _within = _para_b[1] - _para_b[0]
+    assert abs(_within - _lh) < 0.01, \
+        (f"段内行距应为行高 {_lh:.4f}mm，实际 {_within:.4f}mm"
+         f"（若接近 {STYLES['bullet_text'].font_size * 1.2:.2f} 则是把 pt 当 mm 了）")
+    # (2) 段间距 = para_gap + 行高（第二段首行相对第一段末行）
+    _between = _para_b[2] - _para_b[1]
+    assert abs(_between - (1.0 + _lh)) < 0.01, \
+        f"段间距应为 para_gap(1.0) + 行高({_lh:.4f})，实际 {_between:.4f}mm"
+    # (3) 描述首行基线相对三栏基线的位置必须精确
+    #     = 带高 − 三栏基线到带底的距离(= brief_height/2) + 描述首行半高
+    _expect_off = DEFAULT_BRIEF_HEIGHT - DEFAULT_BRIEF_HEIGHT / 2 + _lh / 2
+    assert abs((_para_b[0] - _head_b) - _expect_off) < 0.01, \
+        (f"描述首行基线应比三栏基线低 {_expect_off:.3f}mm，"
+         f"实际 {_para_b[0] - _head_b:.3f}mm")
+    print(f"  ✅ 段内行距 = 行高（{_within:.4f}mm = 10pt×1.2）", flush=True)
+    print(f"  ✅ 段间距 = para_gap + 行高（{_between:.4f}mm）", flush=True)
+    print(f"  ✅ 描述首行基线相对三栏 = {_para_b[0] - _head_b:.3f}mm（预期 "
+          f"{_expect_off:.3f}）", flush=True)
 
     # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），

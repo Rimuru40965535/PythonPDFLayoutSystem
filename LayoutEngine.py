@@ -449,7 +449,25 @@ def parse_inline_markdown(text: str, base: Optional[TextRun] = None,
         \\*  \\`  \\<        -> 转义，输出字面量
 
     **不支持的标记原样保留为文本** —— 不做静默丢弃，写错时看得见。
-    嵌套标记暂不支持（内层会被当成普通文字）。
+
+    **标记可以嵌套**，样式会合成。例如：
+
+        <c:CC0000>**都是重点**</c>   -> 一段文字，同时 bold=True 且 color=#CC0000
+        **<c:CC0000>都是重点</c>**   -> 同上（外壳在内、内层在外都一样）
+        **粗*斜***                   -> 第一段 bold，第二段 bold + italic
+
+    合成规则：外层标记只覆盖它自己那一项，**内层已经解析出的其它样式全部保留**。
+    因此"颜色外壳 + 粗体"等价于"粗体外壳 + 颜色"，两种写法结果一致。
+
+    ⚠️ **一处已知限制**：`**粗*斜***` 这种"粗体结尾连着斜体结尾"的星号写法
+    解析不出斜体（得到 `"粗*斜"` + 孤立的 `"*"`）。原因是 `\\*\\*(.+?)\\*\\*`
+    与 `\\*(.+?)\\*` 在重叠定界符上有歧义。**请改用 HTML 写法**：
+
+        <b>粗<i>斜</i></b>       -> '粗'=B, '斜'=B|I   ✅
+        **粗<i>斜</i>**          -> 同上               ✅（与星号外壳混用也可以）
+
+    > 说明：`<c:>` 会覆盖 `base` 自带的颜色（颜色是无状态的覆盖项，
+    > 无法与 base 想表达的"粗体/斜体"那样区分开来）。
 
     Args:
         text: 待解析文本
@@ -472,6 +490,21 @@ def parse_inline_markdown(text: str, base: Optional[TextRun] = None,
             runs.append(base.with_text(pending))
             pending = ""
 
+    def _inner(raw: str) -> List[TextRun]:
+        """
+        解析标记内部内容。
+
+        ⚠️ 必须用**外层未加本标记的 base** 递归，否则内层每个片段都会提前继承
+        本标记的样式，后面再叠加一次就重复了（例如 `<c:>普通**粗**</c>` 里的
+        "普通"会被染成红色）。
+        """
+        return parse_inline_markdown(raw, base, mono_font)
+
+    def _merge(inner: List[TextRun], **outer) -> List[TextRun]:
+        """把外层标记的样式合到内层已解析的片段上（只覆盖 outer 里给了的项）"""
+        return [r.derive(**{k: v for k, v in outer.items() if v is not None})
+                for r in inner]
+
     for m in _MD_TOKEN_RE.finditer(text):
         kind = m.lastgroup
         if kind == "escape":
@@ -480,23 +513,25 @@ def parse_inline_markdown(text: str, base: Optional[TextRun] = None,
         if kind == "text":
             pending += m.group(0)
             continue
-        # 命中了某个标记：先把累积的裸文本落盘，再追加标记片段
+        # 命中了某个标记：先把累积的裸文本落盘，再追加标记片段（含嵌套）
         flush()
         if kind == "b":
-            runs.append(base.with_text(m.group("b")).derive(bold=True))
+            runs.extend(_merge(_inner(m.group("b")), bold=True))
         elif kind == "i":
-            runs.append(base.with_text(m.group("i")).derive(italic=True))
+            runs.extend(_merge(_inner(m.group("i")), italic=True))
         elif kind == "c":
             hexs = m.group("col")
-            runs.append(base.with_text(m.group("c")).derive(
-                color=Color(int(hexs[0:2], 16), int(hexs[2:4], 16), int(hexs[4:6], 16))))
+            col = Color(int(hexs[0:2], 16), int(hexs[2:4], 16), int(hexs[4:6], 16))
+            runs.extend(_merge(_inner(m.group("c")), color=col))
         elif kind == "bold":
-            runs.append(base.with_text(m.group("bold")).derive(bold=True))
+            runs.extend(_merge(_inner(m.group("bold")), bold=True))
         elif kind == "ital":
-            runs.append(base.with_text(m.group("ital")).derive(italic=True))
+            runs.extend(_merge(_inner(m.group("ital")), italic=True))
         elif kind == "code":
-            runs.append(base.with_text(m.group("code")).derive(
-                **({"font_name": mono_font} if mono_font else {})))
+            if mono_font:
+                runs.extend(_merge(_inner(m.group("code")), font_name=mono_font))
+            else:
+                runs.extend(_inner(m.group("code")))
         else:
             pending += m.group(0)               # 兜底：当普通文字
     flush()
@@ -4609,5 +4644,54 @@ if __name__ == "__main__":
     assert _bp_max_gap < 15.0, \
         f"非末行的剩余空白不应过大（最大 {_bp_max_gap:.2f}mm），禁则可能引入了大空洞"
     print(f"    ✅ 填满度通过（非末行最大剩余空白 {_bp_max_gap:.2f}mm）")
+
+    # 15. 内联标记的嵌套合成
+    #     此前 parse_inline_markdown 是单层非递归的：命中 <c:…>…</c> 后内部整段
+    #     当纯文本，于是 `<c:CC0000>**重点**</c>` 会**字面输出** `**重点**` ——
+    #     给重点同时上"粗体+彩色"是最自然的写法，却静默出错。
+    print("\n【15. 内联标记的嵌套合成】")
+    _md_base = TextRun(font_name=font_name, font_size=10)
+
+    def _md_sig(text):
+        """把解析结果压成可比较的签名：(文字, bold, italic, 颜色)"""
+        return [(r.text, r.bold, r.italic, (r.color.r, r.color.g, r.color.b))
+                for r in parse_inline_markdown(text, _md_base)]
+
+    # 15.1 颜色外壳 + 粗体，与反过来的写法必须一致（合成与顺序无关）
+    _a = _md_sig("<c:CC0000>**重点**</c>")
+    _b = _md_sig("**<c:CC0000>重点</c>**")
+    assert _a == _b, f"两种嵌套顺序应得到相同结果\n  {_a}\n  {_b}"
+    assert len(_a) == 1 and _a[0][1] is True and _a[0][3] == (0xCC, 0, 0), \
+        f"应为单段「粗体 + #CC0000」，实际 {_a}"
+    print("    ✅ 颜色×粗体 合成通过（两种嵌套顺序结果一致）")
+
+    # 15.2 外壳内的普通文字不得被内层标记"染色"（递归要传外层未加本标记的 base）
+    _c = _md_sig("<c:CC0000>普通**粗**字</c>")
+    assert [x[0] for x in _c] == ["普通", "粗", "字"], f"分段不正确：{_c}"
+    assert all(x[3] == (0xCC, 0, 0) for x in _c), f"三段都应是红色：{_c}"
+    assert [x[1] for x in _c] == [False, True, False], f"只有中段加粗：{_c}"
+    print("    ✅ 外壳内普通文字不被染色 / 内层覆盖正确")
+
+    # 15.3 三层嵌套：粗体 + 斜体 + 颜色同时生效
+    _d = _md_sig("**<c:CC0000>*三层*</c>**")
+    assert len(_d) == 1 and _d[0][1] and _d[0][2] and _d[0][3] == (0xCC, 0, 0), \
+        f"三层嵌套应同时 bold/italic/color，实际 {_d}"
+    print("    ✅ 三层嵌套（粗+斜+色）通过")
+
+    # 15.4 HTML 写法用于有歧义的星号嵌套
+    _e = _md_sig("<b>粗<i>斜</i></b>")
+    assert [x[0] for x in _e] == ["粗", "斜"], f"HTML 嵌套分段不正确：{_e}"
+    assert _e[0][1] and not _e[0][2] and _e[1][1] and _e[1][2], \
+        f"应为「粗=B」+「斜=B|I」，实际 {_e}"
+    print("    ✅ HTML 写法（<b>…<i>…</i></b>）通过")
+
+    # 15.5 单层行为与转义不得回归
+    _f = _md_sig("普通 **粗体** 普通")
+    assert [x[0] for x in _f] == ["普通 ", "粗体", " 普通"] and _f[1][1], \
+        f"单层粗体行为变了：{_f}"
+    _g = _md_sig(r"字面 \*星号\* 和 **真粗**")
+    assert _g[0][0] == "字面 *星号* 和 " and not _g[0][1], f"转义行为变了：{_g}"
+    assert _g[-1][0] == "真粗" and _g[-1][1], f"转义后的真粗体不对：{_g}"
+    print("    ✅ 单层行为与反斜杠转义无回归")
 
     print("\n✅ 回归契约断言全部通过")

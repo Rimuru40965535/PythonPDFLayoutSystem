@@ -1288,7 +1288,7 @@ if __name__ == "__main__":
         text_style=STYLES["name_text"],
         icon_width=6,
         layer=1,
-    ).fill(text="韩 梅 梅", image_path=".\\Resources\\icon.png")
+    ).fill(text="韩 梅 梅", image_path=".\\Resources\\icon_Profile_Name.png")
     print(f"  ✅ 个人信息: {profile.node.name} → {profile.text.get_text()}", flush=True)
 
     # 联系方式：同一个蓝图复用 N 次

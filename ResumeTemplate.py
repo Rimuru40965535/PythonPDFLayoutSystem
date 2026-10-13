@@ -682,6 +682,26 @@ class BulletHandle:
 
 
 @dataclass
+class BulletListHandle:
+    """批量分条目句柄：一次挂出的所有条目"""
+    node: LayoutObject                 # 条目们共同挂载的父节点
+    rows: List[BulletHandle]           # 按传入顺序
+
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __getitem__(self, i) -> BulletHandle:
+        return self.rows[i]
+
+
+@dataclass
 class SectionHandle:
     """组合模板（节标题 + N 条详情）句柄"""
     node: Optional[LayoutObject]
@@ -1823,6 +1843,19 @@ def add_bullets(self: LayoutObject,
     bullet_style = STYLES["bullet_mark"] if bullet_style is None else bullet_style
     padding = Padding.all(0) if padding is None else padding
 
+    # ---- 0) 定出行高系数 ----
+    # ⚠️ 必须在"量行高"之前定好：本模板的行高是**量出来的**（不是引擎按
+    # TextObject.line_height_ratio 现算的），所以 text_cfg 里的行高系数要提前取，
+    # 事后 apply 到 TextObject 上已经晚了（对象属性变了，行高却还是旧的）。
+    # 优先级：text_cfg > 样式 > 引擎默认 1.2
+    lhr = None
+    if text_cfg is not None:
+        lhr = text_cfg.line_height_ratio
+    if lhr is None:
+        lhr = getattr(style, "line_height_ratio", None)
+    if lhr is None:
+        lhr = 1.2
+
     # ---- 1) 先算可用宽与正文列宽 ----
     _, _, parent_w, _ = self.get_content_area()
     if parent_w <= 0:
@@ -1834,10 +1867,11 @@ def add_bullets(self: LayoutObject,
     # ⚠️ `wrapped_height` 走的是 `TextRun` + `measure_text` 这条路，而 `TextRun`
     # 只承载文字度量属性（text / font_name / font_size / bold / italic / color），
     # **不含 padding**。所以内边距必须在这里补上，否则带了 padding 的样式会偏矮。
-    text_h = wrapped_height(item, style, text_w) + padding.top + padding.bottom
-    lines = wrapped_lines(item, style, text_w)
+    text_h = wrapped_height(item, style, text_w, line_height_ratio=lhr) \
+        + padding.top + padding.bottom
+    lines = wrapped_lines(item, style, text_w, line_height_ratio=lhr)
     # 单行实高（用于把引导符对准首行）：字号 × 行高系数 + 该样式的上下留白
-    line_h = (style.font_size * 1.2 * PT_TO_MM) + padding.top + padding.bottom
+    line_h = (style.font_size * lhr * PT_TO_MM) + padding.top + padding.bottom
     row_h = max(text_h, line_h if lines else 0.0, bullet_size)
 
     n = sum(1 for c in self.children if "_bullet_" in c.name)
@@ -1928,6 +1962,73 @@ def add_bullets(self: LayoutObject,
 
     return BulletHandle(node=row, mark_cell=mark_cell, text_cell=text_cell,
                         text=text_obj, mark=mark)
+
+
+# ============================================================================
+# 5d. 批量分条目
+# ============================================================================
+
+def add_bullet_list(self: LayoutObject,
+                    items: Sequence[Any],
+                    gap: float = 0.0,
+                    gap_name: str = "Bullet_Gap",
+                    text_cfg: Optional[TextConfig] = None,
+                    **shared) -> BulletListHandle:
+    """
+    批量分条目子模板 —— 一次挂出 N 条「正方形引导符 + 正文」。
+
+    **内部就是对 `add_bullets` 的循环**，因此单条入口的一切能力（引导符三形态、
+    高度按折行自适应、引导符对准正文首行、内联 Markdown 强调）在批量里同样有效。
+    单条入口本身一行未改，两者可以混用。
+
+    结构：
+        self
+        └─ ..._bullet_0_content   （第 1 条，见 add_bullets）
+        └─ <gap_name>_0            （条间留白，仅在 gap > 0 时插入）
+        └─ ..._bullet_1_content   （第 2 条）
+        └─ ...
+
+    Args:
+        items: 条目列表。每项可以是
+                 · 字符串 —— 直接作为正文
+                 · dict     —— 本条的**独立覆盖**（键同 add_bullets 的参数名，
+                               外加 `text` 表示正文），未给的键沿用 shared 与默认
+        gap: 条间留白 (mm)。0 表示条间不留白。**只在条目之间插入**，
+             最后一条之后不加（避免末尾多出空隙把后续内容推下去）
+        gap_name: 条间留白的命名前缀
+        text_cfg: 传给每一条的 TextConfig（条目内可用 `text_cfg` 键单独覆盖）
+        **shared: 所有条目共用的参数（bullet_kind / bullet_value / indent /
+                  style / padding / align_x / layer 等）
+
+    Returns:
+        BulletListHandle —— `.rows` 按传入顺序给出每条的 BulletHandle
+
+    Example:
+        >>> col.add_bullet_list(
+        ...     items=[
+        ...         "响应时间从 <c:CC0000>**320ms**</c> 降到 <c:0066CC>**95ms**</c>。",
+        ...         "重构缓存层，QPS 提升 3 倍。",
+        ...         {"text": "带独立符号的条目", "bullet_value": "▪", "indent": 2.0},
+        ...     ],
+        ...     bullet_kind="text", bullet_value="·", gap=1.5,
+        ... )
+    """
+    rows: List[BulletHandle] = []
+    n = len(items)
+    for i, item in enumerate(items):
+        params = dict(shared)
+        if isinstance(item, dict):
+            params.update(item)
+            body = params.pop("text", "")
+        else:
+            body = "" if item is None else str(item)
+        if text_cfg is not None and "text_cfg" not in params:
+            params["text_cfg"] = text_cfg
+        rows.append(self.add_bullets(item=body, **params))
+        # 只在前 n-1 条之后加留白
+        if gap > 0 and i < n - 1:
+            self.add_spacer(f"{gap_name}_{i}", gap)
+    return BulletListHandle(node=self, rows=rows)
 
 
 # ============================================================================
@@ -2070,6 +2171,7 @@ _TEMPLATE_METHODS = {
     "add_detail_body": add_detail_body,
     "add_highlight": add_highlight,
     "add_bullets": add_bullets,
+    "add_bullet_list": add_bullet_list,
     "add_section": add_section,
     "add_text_row": add_text_row,
     "add_spacer": add_spacer,
@@ -2457,6 +2559,55 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("  ✅ 引导符三形态通过（text / image / block，非法值报错）", flush=True)
+
+    # 9.5 批量入口 add_bullet_list
+    _bl_root = LayoutObject(name="BL_Root", width=120, height=400,
+                            padding=Padding.all(0), layer=0)
+    _bl_long = ("响应时间从 <c:CC0000>**320ms**</c> 降到 <c:0066CC>**95ms**</c>，"
+                "并支撑大促期间三倍的峰值流量，同时把错误率压到万分之一以下。")
+    _bl = _bl_root.add_bullet_list(
+        items=[
+            _bl_long,
+            "单行条目。",
+            {"text": "独立覆盖的条目", "bullet_value": "#", "indent": 3.0},
+        ],
+        bullet_kind="text", bullet_value="·", gap=1.5,
+    )
+    _bl_root.layout(pdf=pdf, force=True)
+    assert len(_bl) == 3, f"应挂出 3 条，实际 {len(_bl)}"
+    assert [b.node.name for b in _bl] == \
+        [f"BL_Root_bullet_{i}_content" for i in range(3)], \
+        f"条目命名应按顺序：{[b.node.name for b in _bl]}"
+    # 条间留白只在条目之间（3 条 => 2 个），末条之后不得多出空隙
+    _gaps = [c for c in _bl_root.children if "Bullet_Gap" in c.name]
+    assert len(_gaps) == 2, f"3 条之间应有 2 个留白，实际 {len(_gaps)}"
+    _sibling_names = [c.name for c in _bl_root.children]
+    assert len(_sibling_names) == len(set(_sibling_names)), \
+        f"同层不得重名：{_sibling_names}"
+    # 逐条覆盖生效：第三条的符号与缩进与其余不同
+    assert _bl[2].mark is not None and _bl[2].mark.get_text() == "#", \
+        "逐条 bullet_value 覆盖应生效"
+    assert _bl[0].text.get_effective_width() > _bl[2].text.get_effective_width(), \
+        "第三条 indent=3.0 更大，正文列宽应更窄"
+    print(f"  ✅ 批量入口通过（3 条 + 2 个条间留白，逐条覆盖生效）", flush=True)
+
+    # 9.6 行高系数必须参与**行高测算**（本模板的行高是量出来的，不是引擎现算的）
+    #     曾经的缺陷：text_cfg 事后才 apply 到 TextObject，对象属性变了、行高却没变。
+    _lhr_root = LayoutObject(name="LHR_Root", width=120, height=400,
+                             padding=Padding.all(0), layer=0)
+    _lhr_a = _lhr_root.add_bullets(item=_bl_long, bullet_kind="text",
+                                   bullet_value="·")
+    _lhr_b = _lhr_root.add_bullets(item=_bl_long, bullet_kind="text",
+                                   bullet_value="·",
+                                   text_cfg=TextConfig(line_height_ratio=1.5))
+    _lhr_root.layout(pdf=pdf, force=True)
+    _ha, _hb = _lhr_a.node.get_effective_height(), _lhr_b.node.get_effective_height()
+    assert _hb > _ha + 0.5, (
+        f"行高系数 1.5 应让行高明显变大（1.2 时为 {_ha:.2f}），实际 {_hb:.2f}")
+    assert abs(_hb / _ha - 1.5 / 1.2) < 0.02, \
+        f"行高比应约等于系数比 1.25，实际 {_hb / _ha:.3f}"
+    print(f"  ✅ 行高系数参与测算通过（{_ha:.2f} -> {_hb:.2f}mm，比值 "
+          f"{_hb / _ha:.2f}）", flush=True)
 
     # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），

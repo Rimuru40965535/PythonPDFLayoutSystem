@@ -56,6 +56,8 @@ from LayoutEngine import (
     # 样式与文本片段
     Style,
     TextRun,
+    BreakPolicy,
+    DEFAULT_BREAK_POLICY,
     parse_inline_markdown,
     measure_text,
     PT_TO_MM,
@@ -1325,6 +1327,7 @@ def add_detail_body(self: LayoutObject,
                     description: str = "",
                     style: Optional[Style] = None,
                     height: Optional[float] = None,
+                    break_policy: Optional[BreakPolicy] = None,
                     layer: int = 0) -> DetailBodyHandle:
     """
     详情·描述子模板（可自动换行的多行文本块）。
@@ -1370,6 +1373,7 @@ def add_detail_body(self: LayoutObject,
         align_x=AlignX.LEFT,
         align_y=AlignY.FLOW,
         multi_line=True,
+        break_policy=break_policy,
         # line_height 不显式传入：引擎按 line_height_ratio 推出行高
         layer=layer + 1,
     )
@@ -1394,6 +1398,7 @@ def add_detail(self: LayoutObject,
                during_time: str = "",
                tags: str = "",
                description: str = "",
+               break_policy: Optional[BreakPolicy] = None,
                layer: int = 0) -> DetailsHandle:
     """
     节详情子模板 —— **容器**，由"标题三栏"与"描述"两个子模板组合而成。
@@ -1448,7 +1453,7 @@ def add_detail(self: LayoutObject,
     body = add_detail_body(
         content, prefix,
         description=description, style=desc_style,
-        height=description_height, layer=layer,
+        height=description_height, break_policy=break_policy, layer=layer,
     )
     return DetailsHandle(node=content, head=head, body=body)
 

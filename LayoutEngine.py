@@ -2548,11 +2548,18 @@ class TextObject(LayoutObject):
                 r = self._runs[ri]
                 # 基线对齐：本行底边对齐，故片段顶边 = 行顶 + (行高 − 自身行高)
                 #
-                # 单位说明：line_top / line_h 来自 measure_text，是 **pt** 数值；
-                # 片段自身的行高也用同一 pt 数值 —— 两者相减得到的行内偏移自洽，
-                # 因此 **这一项不需要换算**。
+                # ⚠️ **单位（这里曾有缺陷，批次 9 修复）**：
+                #   `line_top` / `line_h` / `own_h_pt` 都来自 measure_text，是 **pt 数值**；
+                #   而 `cy` / `dy_align` 是 **mm**（盒内偏移）。
+                #   - `line_top` 是**累计行偏移**，要落到 mm 空间，**必须换算** ×PT_TO_MM；
+                #   - `(line_h - own_h_pt)` 是**同一空间内的差**（行高减自身行高），
+                #     两者都是 pt，相减自洽，**不需要换算**。
+                #   旧实现把 `line_top` 也直接当 mm 加进去，于是每换一行就多走
+                #   约 2.83 倍的行高：字号 10pt / 系数 1.2 时行距实测 12.00mm
+                #   （应为 4.233mm），8 行累计漂移 +54.4mm —— 表现就是
+                #   "换行后两行之间的距离变成字高的好几倍"。
                 own_h_pt = r.font_size * self.line_height_ratio
-                py = cy + dy_align + line_top + (line_h - own_h_pt)
+                py = cy + dy_align + line_top * PT_TO_MM + (line_h - own_h_pt)
                 # 但 pdf.cell 的 h 是用户空间单位（mm），**必须换算**（见文件头 PT_TO_MM）。
                 own_h_mm = own_h_pt * PT_TO_MM
                 pdf.set_text_color(r.color.r, r.color.g, r.color.b)
@@ -4455,6 +4462,58 @@ if __name__ == "__main__":
     assert abs(_m.total_height - _m.line_count * 14.4) < 1e-6, \
         f"总高应为 行数×行高 = {_m.line_count * 14.4}，实际 {_m.total_height}"
     print("    ✅ 总高 = 行数 × 行高 通过")
+
+    # 12.2b **渲染侧**行距：连续行的基线间距必须等于 行高×PT_TO_MM
+    #   这是批次 9 修的缺陷：render 里把 `line_top`（pt 累计量）当 mm 直接加进 y，
+    #   于是每换一行就多走 1/PT_TO_MM ≈ 2.83 倍，10pt/1.2 时行距实测 12.00mm
+    #   （应为 4.233mm），8 行累计漂移 +54.4mm。
+    #   ⚠️ 注意：**只测 measure_text 是抓不到的** —— 它的 total_height 自洽（pt 空间），
+    #   缺陷只在 render 的落点上。所以这里必须走真实渲染。
+    _rs_pdf = FPDF()
+    _rs_pdf.add_page()
+    try:
+        _rs_pdf.add_font("LXGW", '', ".\\Resources\\LXGWWenkai-Regular.ttf")
+    except Exception:
+        pass
+    _rs_fs, _rs_lhr = 10.0, 1.2
+    _rs_expect = _rs_fs * _rs_lhr * PT_TO_MM        # = 4.2333 mm
+    import io as _rs_io, contextlib as _rs_ctx
+    _rs_root = LayoutObject(name="RS_root", width=100, height=400,
+                            padding=Padding.all(0))
+    _rs_n = 5
+    _rs_obj = TextObject(
+        name="RS_text", font_name=font_name, font_size=_rs_fs,
+        text="\n".join(f"第{i+1}行" for i in range(_rs_n)),
+        width=0, height=0, color=White, padding=Padding.all(0),
+        align_x=AlignX.LEFT, align_y=AlignY.FLOW, multi_line=True,
+        line_height_ratio=_rs_lhr,
+    )
+    _rs_root.add_child(_rs_obj)
+    with _rs_ctx.redirect_stdout(_rs_io.StringIO()):
+        _rs_root.layout(pdf=_rs_pdf, force=True)
+    _rs_calls = []
+    _rs_orig = _rs_pdf.set_xy
+
+    def _rs_spy(x, y):
+        _rs_calls.append((x, y))
+        return _rs_orig(x, y)
+
+    _rs_pdf.set_xy = _rs_spy
+    try:
+        with _rs_ctx.redirect_stdout(_rs_io.StringIO()):
+            _rs_root.render(_rs_pdf, is_fill=False)
+    finally:
+        _rs_pdf.set_xy = _rs_orig
+    _rs_ys = sorted(y for (_x, y) in _rs_calls)
+    assert len(_rs_ys) == _rs_n, f"应观测到 {_rs_n} 个落点，实际 {len(_rs_ys)}"
+    _rs_gaps = [round(_rs_ys[i + 1] - _rs_ys[i], 4) for i in range(_rs_n - 1)]
+    for _g in _rs_gaps:
+        assert abs(_g - _rs_expect) < 0.01, \
+            (f"换行后的行距应为 行高 = {_rs_expect:.4f}mm，实际 {_g:.4f}mm"
+             f"（若接近 {_rs_fs * _rs_lhr:.2f} 则是把 pt 数值当 mm 用了）")
+    print(f"    ✅ 渲染行距通过（{_rs_fs:.0f}pt × {_rs_lhr} → 每行 "
+          f"{_rs_gaps[0]:.3f}mm，{_rs_n} 行零漂移）")
+
     # 12.3 硬换行：\n 一定断行
     _m2 = measure_text(pdf, [TextRun(text="甲\n乙\n丙", font_name=font_name, font_size=12)],
                        available_width=999)

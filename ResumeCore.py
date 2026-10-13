@@ -62,6 +62,7 @@ from fpdf import FPDF
 
 from LayoutEngine import (
     AlignX,
+    Color,
     AlignY,
     LayoutObject,
     PT_TO_MM,
@@ -420,6 +421,11 @@ class Theme:
     # ---- 技能/证书/荣誉的左缩进 ----
     # 标题行与正文行必须用**同一个值**，否则标题比正文更靠右、参差不齐。
     skills_left_indent: float = 3.0
+
+    # ---- 左栏底色 ----
+    # None = 用中层 STYLES[left_column].fill_color（历史观感）。
+    # 显式给 Color 即可换配色，**不需要改中层的共享 STYLES**。
+    left_column_color: Optional[Color] = None
 
     # ---- 版面标签文案（逐简历可被数据类覆盖）----
     summary_title: str = "个人总结"
@@ -793,6 +799,7 @@ def build_layout(resume: Resume,
         ratio=list(th.column_ratio),
         left_padding=Padding.all(0),
         right_padding=Padding.left(th.right_column_padding_left),
+        color=th.left_column_color,
         layer=0,
     )
     _fill_left_column(basic.left, resume, th, sp)

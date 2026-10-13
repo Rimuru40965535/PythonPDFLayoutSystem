@@ -1136,6 +1136,7 @@ def add_basic(self: LayoutObject,
               ratio: Optional[Sequence[float]] = None,
               left_padding: Optional[Padding] = None,
               right_padding: Optional[Padding] = None,
+              color: Optional['Color'] = None,
               layer: int = 0) -> SplitHandle:
     """
     基础模板 —— 左右分栏（`add_split` 的双栏预设）。
@@ -1143,13 +1144,16 @@ def add_basic(self: LayoutObject,
     结构：
         self
         └─ {self.name}_split_container
-             ├─ {self.name}_left_column   : RectangleObject（底色 = STYLES["left_column"]）
+             ├─ {self.name}_left_column   : RectangleObject（底色，见 color）
              └─ {self.name}_right_column  : LayoutObject
 
     Args:
         ratio: 左右比例，默认 [1.0, 2.5]
         left_padding: 左栏内边距，默认 Padding.all(0)
         right_padding: 右栏内边距，默认 Padding.left(5)
+        color: **左栏底色**。None 时取 `STYLES["left_column"].fill_color`
+               （= 历史行为）。这是"逐份简历换配色"的入口 ——
+               显式传值即可，不需要改中层的共享 `STYLES`。
         layer: 图层索引
 
     Returns:
@@ -1162,11 +1166,13 @@ def add_basic(self: LayoutObject,
     ratio = _resolve_ratio(ratio, DEFAULT_RATIO)
     left_padding = Padding.all(0) if left_padding is None else left_padding
     right_padding = Padding.left(5) if right_padding is None else right_padding
+    if color is None:
+        color = STYLES["left_column"].fill_color
 
     left_column = RectangleObject(
         name=f"{self.name}_left_column",
         x=0, y=0, width=0, height=0,
-        color=STYLES["left_column"].fill_color,
+        color=color,
         padding=left_padding,
         align_x=AlignX.NONE,
         align_y=AlignY.NONE,

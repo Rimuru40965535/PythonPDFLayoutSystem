@@ -28,6 +28,7 @@
 | 动引擎内部几何逻辑 | 第 3.2 ~ 3.5 节 |
 | 判断重构该动哪里 | 第 7 章（已知缺陷）、第 8 章（重构方向） |
 | 跑测试 | 第 9 章 |
+| **调版面参数 / 查"某处不对该拧哪里"** | **第 11 章（中层调参手册）** |
 
 ---
 
@@ -2553,3 +2554,271 @@ add_details_list           -> List[DetailsHandle]（与传入数据一一对应�
 add_text_row               -> TextObject（容器按 {name}_content 查找）
 add_spacer                 -> LayoutObject
 ```
+
+---
+
+## 11. 中层调参手册
+
+> **用途**：跑完 PDF 之后，看到某处不对，能直接查到该改哪个参数、改多少、
+> 会不会连带推开别的元素。
+>
+> **单位**：全部是 **mm**（引擎的长度单位，见 2.3）。字号是 **pt**。
+>
+> **改哪里**：参数默认值集中在 `ResumeTemplate.py` 第 1 节（模块常量，约 77–87 行）。
+> 改模块常量 = 改全局默认；在调用点传参 = 只改那一个实例。
+>
+> ⚠️ 本手册的"影响范围/连带效应"是**按引擎几何推导并实测过结构快照**的，可以信；
+> 但"这个值好不好看"必须你自己看 PDF 判断 —— 见 11.7 的待补症状表。
+
+### 11.1 调参的三条基本规律
+
+**规律一：容器高度一改，同栏后面所有元素一起平移。**
+
+左栏与右栏都是 `AlignY.FLOW` 的流式序列。改任意一个元素的高度，
+**它下面同栏的所有元素整体下移（或上移）相同距离**，`x` 不变。
+跨栏**互不影响** —— 左栏变高不会推动右栏。
+
+**规律二：`row_padding` 与 `row_inset` 是两回事。**
+
+| 做法 | 效果 |
+| --- | --- |
+| `row_inset=3` | 整条行容器**右移 3mm 且宽度减少 3mm**（内容被挤在右侧） |
+| `row_padding=Padding.left(3)` | 行容器位置与宽度不变，内容在容器内右侧留白 3mm |
+
+对**纯左缩进**两者视觉等价。但 `row_inset` 会同时收窄宽度（文本可用宽变小、
+换行可能提前）；`row_padding` 不会改变容器占位。**要缩进又不想改变占位时用 `row_inset`。**
+
+**规律三：文本高度 = 行数 × 该行最大字号 × 1.2 + 上下 padding。**
+
+行高系数固定为 `line_height_ratio=1.2`，**没有暴露成参数**（见 11.6）。
+所以想让多行文本变矮，只能**改字号**或**减少行数**。
+
+### 11.2 参数总览
+
+#### 模块常量（`ResumeTemplate.py` 第 1 节）
+
+| 常量 | 默认 | 含义 | 谁在用 |
+| --- | --- | --- | --- |
+| `DEFAULT_RATIO` | `[1.0, 2.5]` | 左右栏比例 | `add_basic` |
+| `DEFAULT_TITLE_HEIGHT` | `15.0` | 节标题整体高 | `add_section_title` |
+| `DEFAULT_DIVIDER_HEIGHT` | `0.5` | 节标题分隔线粗细 | `add_section_title` |
+| `DEFAULT_BRIEF_HEIGHT` | `10.0` | 详情三栏（关键词/时间/标签）高 | `add_details` |
+| `DEFAULT_BRIEF_RATIO` | `[2.0, 1.0, 2.0]` | 详情三栏横向比例 | `add_details` |
+| `DEFAULT_ICON_WIDTH` | `4.0` | 个人信息行左格（图标）宽 | `add_profile` |
+| `DEFAULT_TITLE_ICON_WIDTH` | `10.0` | 节标题左格（图标）宽 | `add_section_title` |
+| `DEFAULT_PHOTO_WIDTH` | `30.0` | 证件照宽 | `add_profile_photo` |
+| `PHOTO_ASPECT` | `1.6` | 证件照高 = 宽 × 此值 | `add_profile_photo` |
+| `DEFAULT_ROW_INSET` | `3.0` | 个人信息行左缩进 | `add_profile` |
+| `DEFAULT_ROW_PAD_Y` | `3.0` | 行内图标上下的最低留白 | `profile_content_height` |
+
+#### `add_basic`（左右分栏）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `ratio` | `[1.0, 2.5]` | 两栏宽度比。`1:2.5` → 左 54.29 / 右 135.71（Root 内容宽 190）。改它会同时改变**两栏一切内容的可用宽**，从而改变换行位置 |
+| `left_padding` | `Padding.all(0)` | 左栏内边距（左栏是底色矩形；padding 会把内容往里推） |
+| `right_padding` | `Padding.left(5)` | 右栏左内边距。`ResumeCore` 传的是 `Padding.left(8)` |
+
+> ⚠️ **改 `ratio` 的连带效应最大**：右栏变窄 → 详情描述可能多折一行 →
+> 该条详情变高 → 后面所有节整体下移。它是"改一处、动全篇"的参数。
+
+#### `add_profile`（个人信息行：图标 + 文本）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `icon_width` | `4.0` | 左格宽。**同时是图标宽高的边长**（图标是正方形），文本起点 = `row_inset + icon_width + gap` |
+| `gap` | `0` | 图标与文本之间的间距 |
+| `content_height` | `None` | 整行高。`None` = `max(字号×0.5, icon_width + 3)` |
+| `row_inset` | `3.0` | 整行右移量，**宽度同步收窄** |
+| `icon_style` | `STYLES["name_image"]` | 图标样式（`image_path` 为空，由 `.fill()` 传路径） |
+| `text_style` | `STYLES["profile_text"]` | 文本样式 |
+
+**默认高度的算法**（`profile_content_height`）：
+
+```
+content_height = max(text_style.font_size × 0.5,  icon_width + DEFAULT_ROW_PAD_Y)
+```
+
+实测值：姓名行（22pt / `icon_width=6`）→ `max(11, 9)` = **11mm**；
+联系方式行（12pt / `icon_width=4`）→ `max(6, 7)` = **7mm**。
+
+> ⚠️ **踩坑（2026-10-13 实测发现）**：`profile_content_height()` 的
+> `icon_width` **默认是 0**，此时它退化成"字号×0.5"，**拿不到图标下限**。
+> 所以 `content_height=profile_content_height()` 这种写法会把图标下限顶掉 ——
+> 12pt 联系方式行被压成 6mm，4mm 图标上下只剩 1mm 留白（已实测确认）。
+> **正确做法是不传 `content_height`**，让 `add_profile` 用它的 `icon_width` 自算。
+> `ResumeCore` 原先正是犯了这个错，已修。
+
+> **常见需求**：想让姓名行更高/更矮，改 `content_height`（传具体值），
+> 或改 `icon_width`（它参与下限计算）。**只改字号不一定生效** —— 可能被图标下限顶住。
+
+#### `add_profile_photo`（证件照）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `photo_width` | `30.0` | 照片宽。**高 = 宽 × `PHOTO_ASPECT`** |
+| `icon_style` | `STYLES["profile_photo"]` | `fit_mode="cover"` |
+
+实测：`photo_width=30` → 行高 **48.0mm**。所以**改宽会平方级地影响占位** ——
+宽 30→25，高从 48→40，整行省 8mm。
+
+#### `add_section_title`（节标题）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `height` | `15.0` | 整体高。内部分成"标题带（`height - 0.5`）" + "分隔线（0.5）" |
+| `icon_width` | `10.0` | 左格（图标）宽。**图标是正方形，边长 = 此值** |
+| `gap` | `0` | 图标与标题文字之间的间距 |
+| `text_style` | `STYLES["section_title_text"]` | 标题样式（22pt 粗体深蓝） |
+
+实测（`height=15`）：标题带高 **14.5**、分隔线高 **0.5** 且贴内容区底边；
+图标区 `icon_range` 内的图标**底边对齐**且带 `Padding.bottom(3)`（视觉上抬 3mm）。
+
+> **常见需求**："节标题离正文太近" → 改的是**上层留白**，不是 `height`
+> （`height` 变高只会让标题文字区域更高，标题仍在整块底部）。
+
+#### `add_details`（节详情：三栏 + 描述）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `brief_height` | `10.0` | 顶部三栏高。**关键词/时间/标签都在这一行** |
+| `brief_ratio` | `[2.0, 1.0, 2.0]` | 三栏宽比（左=关键词、中=时间、右=标签）。**必须恰好 3 个元素** |
+| `description_height` | `None` | 描述高。`None` = 按真实行数自动结算；给值 = 固定高 |
+| `key_style` / `time_style` / `tags_style` / `desc_style` | 组 1 四个样式 | 四段文字各自的样式 |
+
+实测：`brief_height=10` 时三栏宽 **51.09 / 25.54 / 25.54**
+（右栏内容宽 102.17 → 按 2:1:2 分，`col_2` 再带 `Padding.right(1.5)`）。
+
+> **这是视觉权重最集中的地方**：关键词（学校/项目/公司名）在**左栏且比例最大**，
+> 13pt 粗体；时间是中间 7pt 灰；标签是右侧 8pt 灰。
+> 想让 HR 一眼看到重点 → 调 `brief_ratio`（给关键词更多宽）或 `key_style.font_size`。
+
+#### `add_summary`（个人总结）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `description_height` | `None` | 同 `add_details`。`ResumeCore` 原先传 `summary_height=18` |
+| `desc_style` | `STYLES["summary_text"]` | 正文样式 |
+
+#### `add_text_row`（一行文本：技能/证书/荣誉共用）
+
+| 参数 | 默认 | 效应 |
+| --- | --- | --- |
+| `height` | `None` | 行高。`None` = `style.font_size × row_height_ratio` |
+| `row_height_ratio` | `0.5` | 上面那个系数 |
+| `row_padding` | `Padding.all(0)` | 行容器内边距（`ResumeCore` 传 `Padding.left(2)` / `left(7)`） |
+| `text_padding` | `Padding.all(0)` | 文本自身内边距（`ResumeCore` 传 `left(6)`） |
+| `text_width` | `0` | 文本宽。`0` = 撑满容器 |
+| `multi_line` | `False` | 是否自动换行（多行内容必须开） |
+
+> ⚠️ **`ResumeCore` 的正文行高度是"条目数 × 6"**，不是按内容结算。
+> 条目多时可能不够高、条目少时会留空（见 SKILLS.md 的 M8）。
+
+### 11.3 样式层（`STYLES`，19 个键）
+
+改样式 = 改"长什么样"，通常比改几何参数更安全（不会连带推开元素），
+**除非改字号** —— 字号会通过 11.1 规律三改变文本高度，进而推动后续元素。
+
+| 键 | 字号 | 粗体 | 颜色 | 影响 |
+| --- | --- | --- | --- | --- |
+| `name_text` | 22 | ✔ | 黑 | 姓名。**同时参与姓名行高度下限** |
+| `profile_text` | 12 | ✔ | 黑 | 联系方式文本 |
+| `section_title_text` | 22 | ✔ | 深蓝 `(0,80,160)` | 节标题 |
+| `detail_key_1` | 13 | ✔ | 黑 | 关键词（学校/项目/公司） |
+| `detail_time_1` | 7 | ✘ | 灰 `(100,100,100)` | 起讫时间，带 `Padding.top(5)` |
+| `detail_tags_1` | 8 | ✘ | 灰 `(80,80,80)` | 专业/技术栈 |
+| `detail_description` | 10 | ✘ | 黑 | 详情描述正文 |
+| `summary_text` | 10 | ✘ | 黑 | 个人总结正文 |
+| `skillsawards_title` | 14 | ✘ | 灰 `(60,60,60)` | 技能/证书/荣誉标题 |
+| `skillsawards_text` | 10 | ✘ | 灰 `(60,60,60)` | 技能/证书/荣誉正文 |
+| `detail_key_2` / `_time_2` / `_tags_2` | 12 / 8 / 8 | — | — | **当前无调用方**，见 11.6 |
+| `left_column` | — | — | `RimuruBlue` | 左栏底色（`fill_color`） |
+| `profile_photo` | — | — | — | `fit_mode="cover"` |
+| `name_image` / `section_title_image` | — | — | — | `image_path=""`，运行时由 `.fill()` 传 |
+| `contact_text` | 10 | ✘ | 灰 | **当前无调用方** |
+
+> **颜色值是 `Color(r, g, b, 0)`**，第 4 个参数是 alpha，当前引擎**只读 rgb**。
+
+### 11.4 高度是怎么算出来的（自查用）
+
+| 元素 | 高度来源 |
+| --- | --- |
+| 左栏 / 右栏 | 撑满 Root 内容高（`FILL`） |
+| 证件照行 | `photo_width × 1.6` |
+| 个人信息行 | `content_height`，默认 `max(字号×0.5, icon_width+3)` |
+| 节标题 | `height`，默认 15 |
+| 详情三栏 | `brief_height`，默认 10 |
+| 详情描述 | **自动**：真实行数 × 该行最大字号 × 1.2 + `Padding.all(2)` 的 4mm |
+| 详情容器 | **自动** = 三栏高 + 描述高 + padding |
+| 个人总结 | **自动**，同描述 |
+| 技能行 | 标题行 `字号×0.5`；正文行 `条目数 × 6` |
+
+**查实际值的方法**（需要 pdf 参与精确测量）：
+
+```python
+handle.description.get_effective_height()   # 有效高
+handle.node.get_layout_info()               # 全部几何 + 尺寸方式 + 溢出标志
+```
+
+`get_layout_info()` 返回的 `content_overflows` 为 `True` 表示**内容装不下**，
+这正是"文本被截断/压扁"的判据。
+
+### 11.5 与留白（`Lead`）的分工
+
+中层**不含任何留白常量** —— 节间距、行间距都在顶层 `ResumeCore.__Lead_default_settings__`。
+中层只提供 `add_spacer(name, height)` 这个动作。
+
+> 所以"节与节之间太挤"这类问题要改 `ResumeCore` 的 `Lead`，
+> **不在本手册范围内**。完整键表见第 5.2 节。
+
+分工原则：**中层管"一个模板内部长什么样"，顶层管"模板之间的间距"。**
+
+### 11.6 不该动的参数（避免踩坑）
+
+| 参数 | 为什么 |
+| --- | --- |
+| `line_height`（`TextObject` 构造参数） | **死参数**：只被写入 `_line_height`，全库从不读取。传了不会有任何效果（见 SKILLS.md D6） |
+| `add_details` 里 `key`/`time`/`tags` 的 `align_y` | 三处刻意不同（姓名行 `VCENTER`、节标题 `BOTTOM`、详情三栏 `VCENTER`），统一会改变每处文字基线 |
+| `STYLES["detail_key_2"]` 系列 | 无调用方。要用就先在调用点显式传 `key_style=STYLES["detail_key_2"]`，别改默认 |
+| `Style.padding` 的默认值 | 引擎已改为"每次新建独立 `Padding`"（修 7.10）。不要把 `None` 改回 `Padding.all(0)` |
+| `create_band` 建出的横带宽度 | `add_profile` / `add_section_title` 会**显式覆盖** `band.width`（配合 `row_inset` 收窄）。改这里要同时改两处 |
+| 直接写 `obj._height` | 绕过尺寸方式解析。要用公开属性 `obj.height = N` |
+
+### 11.7 症状 → 该拧哪个旋钮（⚠️ 待实测补全）
+
+> **本章留骨架**：下面列出的是"结构上必然成立"的对应关系，
+> 已经由引擎几何推导确认；**但具体数值需要看 PDF 实际效果校准**。
+> 实测时用一句话告诉我"哪里不对"（如"左栏姓名下方太空"），
+> 我补上具体参数与实测值。
+
+| 你想解决的问题 | 结构上该动的地方 | 已被验证的连带效应 |
+| --- | --- | --- |
+| **左栏整体太挤 / 太空** | 左栏内容总高由证件照、姓名行、联系方式行、技能三块之和决定 | 改任一行的高度都会推动其下所有行 |
+| 姓名行太高/太矮 | `add_profile(content_height=N)`，或 `icon_width`（参与下限） | 只改字号可能被图标下限顶住 |
+| 证件照太大/太小 | `add_profile_photo(photo_width=N)` | 行高 = 宽 × 1.6，**平方级影响** |
+| 左栏文字离左边太近/太远 | `add_profile(row_inset=N)` | 宽度同步收窄，文本可用宽变小 |
+| 技能/证书/荣誉之间太挤 | `ResumeCore` 的 `Lead["Left_Column_Between_Skills&Awards"]` | **不在中层**，见 11.5 |
+| 技能正文行留空太多 | `add_text_row(height=...)`，`ResumeCore` 传的是 `条目数×6` | 改它只影响该行 |
+| 左右栏宽度不合理 | `add_basic(ratio=[a, b])` | **改一处动全篇**：变窄→更多折行→后续下移 |
+| 右栏正文离左栏太近 | `add_basic(right_padding=Padding.left(N))` | 只改右栏内容区，不影响左栏 |
+| 节标题太高/太矮 | `add_section_title(height=N)` | 内部分成"标题带 `N-0.5`" + "分隔线 0.5" |
+| 节标题图标太大 | `add_section_title(icon_width=N)` | 图标是正方形，边长 = 此值；同时挤压标题文字宽 |
+| 节标题离正文太近/太远 | `ResumeCore` 的 `Lead["Right_Column_Between_SectionTitle_SectionDetails"]` | **不在中层** |
+| 详情三栏太挤 | `add_details(brief_height=N)` | 只影响该条详情的三栏，整条详情随之变高 |
+| 关键词一栏太窄/太宽 | `add_details(brief_ratio=[a,b,c])` | 必须 3 个元素；影响该条详情 |
+| 详情描述行距太密/太松 | **只能改字号或行数** | 行高系数 1.2 未暴露（见 11.6） |
+| 详情描述下方留空太多 | `add_details(description_height=N)` 固定高度；默认自动结算 | 固定值小于实际内容高会**溢出**（`content_overflows`） |
+| 某些字想加粗/变色 | `TextObject` 的**行内 Markdown**：`**粗**`、`*斜*`、`` `等宽` ``、`<c:RRGGBB>色</c>` | 已默认开启（`markdown=True`），见 3.4c |
+| 个人总结太高/太矮 | `add_summary(description_height=N)` | 默认自动结算 |
+
+> **行内 Markdown 是"引导 HR 注意力"的现成手段** —— 无需新模板，
+> 只要在描述文本里写 `**关键成果**` 即可。已验证可用（3.4c 的实测）。
+
+### 11.8 还没做、但你知道会需要的
+
+| 想做的事 | 现状 | 相关条目 |
+| --- | --- | --- |
+| 详情**分条列出**（每行一条 + 项目符号） | 描述是**一块多行文本**，条目靠 `\n` 分隔。分条需要新模板 | SKILLS.md 的视觉优化方向 |
+| 单条详情内**每行独立的左缩进/符号** | 同上 | — |
+| 技能正文按内容自动定高 | `ResumeCore` 用"条目数×6"估算 | SKILLS.md M8 |
+| 关键词单独放大/换色之外的**行内混排** | 可用行内 Markdown，已验证 | 3.4c |

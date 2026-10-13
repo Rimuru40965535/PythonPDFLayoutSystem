@@ -694,6 +694,59 @@ class SectionHandle:
 
 
 # ============================================================================
+# 3b. 文字呈现配置（对齐 / 行距 / 断行禁则）
+# ============================================================================
+
+@dataclass(frozen=True)
+class TextConfig:
+    """
+    "这段文字在框里怎么摆"的配置。
+
+    各模板已经给了**合理的默认值**（如详情三栏默认盒内垂直居中），
+    本对象用于**按需覆盖**：字段为 None 表示"不改动模板的默认"。
+
+    它只影响渲染与测量，**不影响布局几何** —— 对齐不参与 `measure`，
+    所以调它不会挪动盒子，也就不会打乱版面。
+
+    各模板里的参数名是 **`text_cfg=`**（不叫 `text=`，因为 `add_info` /
+    `add_highlight` / `add_text_row` 已经有一个字符串参数叫 `text`）。
+
+    字段：
+        align_x: 文字水平对齐 (AlignX)
+        align_y: 文字盒内垂直对齐 (AlignY)。⭐ 最常用：
+                 `VCENTER` 让文字在框内垂直居中，`BOTTOM` 贴底
+        line_height_ratio: 行高系数（行高 = 字号 × 此值，默认 1.2）
+        break_policy: 断行禁则 (BreakPolicy)
+
+    Example:
+        >>> col.add_detail_body(prefix="p", description="……",
+        ...                     text_cfg=TextConfig(line_height_ratio=1.5))
+        >>> col.add_text_row(name="n", text="x",
+        ...                  text_cfg=TextConfig(align_y=AlignY.BOTTOM))
+        >>> col.add_detail(..., text_cfg=TextConfig(align_y=AlignY.VCENTER),
+        ...                time_align=TextConfig(align_y=AlignY.TOP))  # 时间单独贴顶
+    """
+    align_x: Optional[AlignX] = None
+    align_y: Optional[AlignY] = None
+    line_height_ratio: Optional[float] = None
+    break_policy: Optional[BreakPolicy] = None
+
+    def apply(self, obj) -> None:
+        """
+        把非 None 的字段写进对象；None 的字段保持对象原样。
+
+        只写**对象确实拥有**的属性 —— 因此对 ImageObject（没有
+        line_height_ratio / break_policy）或 None 调用都是安全的。
+        """
+        if obj is None:
+            return
+        for name in ("align_x", "align_y", "line_height_ratio", "break_policy"):
+            val = getattr(self, name)
+            if val is not None and hasattr(obj, name):
+                setattr(obj, name, val)
+
+
+# ============================================================================
 # 4. 内部工具
 # ============================================================================
 
@@ -928,6 +981,7 @@ def add_info(self: LayoutObject,
              gap: float = 0,
              content_height: Optional[float] = None,
              row_inset: float = DEFAULT_ROW_INSET,
+             text_cfg: Optional[TextConfig] = None,
              layer: int = 0) -> ProfileHandle:
     """
     个人信息行子模板（图标 + 文本），一行两格。
@@ -1048,6 +1102,11 @@ def add_info(self: LayoutObject,
         icon_range=icon_range, icon=icon,
         text_range=text_range, text=text_obj,
     )
+    # 文字对齐/行距：模板已给默认（图标与文字均盒内居中），text_cfg 只在需要时覆盖
+    if text_cfg is not None:
+        text_cfg.apply(icon)
+        text_cfg.apply(text_obj)
+
     # text / image_path 非空时直接填入，省掉调用方再写一次 .fill(...)
     if text or image_path:
         handle.fill(text=text, image_path=image_path)
@@ -1118,6 +1177,7 @@ def add_section_heading(self: LayoutObject,
                         height: float = DEFAULT_TITLE_HEIGHT,
                         title: str = "",
                         image_path: str = "",
+                        text_cfg: Optional[TextConfig] = None,
                         layer: int = 0) -> TitleHandle:
     """
     生成节标题模板（图标 + 标题 + 下方分隔线）。
@@ -1195,6 +1255,9 @@ def add_section_heading(self: LayoutObject,
     icon_range.padding = Padding.bottom(3)
     icon_range.add_child(icon)
     text_range.add_child(text)
+    if text_cfg is not None:
+        text_cfg.apply(icon)
+        text_cfg.apply(text)
 
     divider = RectangleObject(
         name=f"{prefix}_divider",
@@ -1228,6 +1291,10 @@ def add_detail_head(self: LayoutObject,
                     tags_style: Optional[Style] = None,
                     ratio: Optional[Sequence[float]] = None,
                     height: float = DEFAULT_BRIEF_HEIGHT,
+                    text_cfg: Optional[TextConfig] = None,
+                    key_align: Optional[TextConfig] = None,
+                    time_align: Optional[TextConfig] = None,
+                    tags_align: Optional[TextConfig] = None,
                     layer: int = 0) -> DetailHeadHandle:
     """
     详情·标题三栏子模板（关键词 / 时间 / 标签）。
@@ -1322,6 +1389,16 @@ def add_detail_head(self: LayoutObject,
     col_time.add_child(time_obj)
     col_tags.add_child(tags_obj)
 
+    # 对齐/行距：先套用统一配置，再套用逐栏配置（后者优先），
+    # 都没给就保持上面三处硬编码的默认（三栏同为 VCENTER => 基线对齐）。
+    if text_cfg is not None:
+        for _o in (key_obj, time_obj, tags_obj):
+            text_cfg.apply(_o)
+    for _cfg, _o in ((key_align, key_obj), (time_align, time_obj),
+                     (tags_align, tags_obj)):
+        if _cfg is not None:
+            _cfg.apply(_o)
+
     return DetailHeadHandle(
         node=brief, band=band,
         col_key=col_key, col_time=col_time, col_tags=col_tags,
@@ -1335,6 +1412,7 @@ def add_detail_body(self: LayoutObject,
                     style: Optional[Style] = None,
                     height: Optional[float] = None,
                     break_policy: Optional[BreakPolicy] = None,
+                    text_cfg: Optional[TextConfig] = None,
                     layer: int = 0) -> DetailBodyHandle:
     """
     详情·描述子模板（可自动换行的多行文本块）。
@@ -1386,6 +1464,9 @@ def add_detail_body(self: LayoutObject,
     )
     details.add_child(desc_obj)
 
+    if text_cfg is not None:
+        text_cfg.apply(desc_obj)
+
     handle = DetailBodyHandle(node=details, description=desc_obj)
     set_content_height(desc_obj, height)
     return handle
@@ -1406,6 +1487,10 @@ def add_detail(self: LayoutObject,
                tags: str = "",
                description: str = "",
                break_policy: Optional[BreakPolicy] = None,
+               text_cfg: Optional[TextConfig] = None,
+               key_align: Optional[TextConfig] = None,
+               time_align: Optional[TextConfig] = None,
+               tags_align: Optional[TextConfig] = None,
                layer: int = 0) -> DetailsHandle:
     """
     节详情子模板 —— **容器**，由"标题三栏"与"描述"两个子模板组合而成。
@@ -1455,12 +1540,15 @@ def add_detail(self: LayoutObject,
         content, prefix,
         key=key, during_time=during_time, tags=tags,
         key_style=key_style, time_style=time_style, tags_style=tags_style,
-        ratio=brief_ratio, height=brief_height, layer=layer,
+        ratio=brief_ratio, height=brief_height,
+        text_cfg=text_cfg, key_align=key_align, time_align=time_align,
+        tags_align=tags_align, layer=layer,
     )
     body = add_detail_body(
         content, prefix,
         description=description, style=desc_style,
-        height=description_height, break_policy=break_policy, layer=layer,
+        height=description_height, break_policy=break_policy,
+        text_cfg=text_cfg, layer=layer,
     )
     return DetailsHandle(node=content, head=head, body=body)
 
@@ -1537,6 +1625,7 @@ def add_text_row(self: LayoutObject,
                  multi_line: bool = False,
                  text_width: float = 0,
                  row_height_ratio: float = 0.5,
+                 text_cfg: Optional[TextConfig] = None,
                  layer: int = 0) -> TextObject:
     """
     生成"一行文本块"：容器（定高、FLOW）+ 其中的文本。
@@ -1594,6 +1683,8 @@ def add_text_row(self: LayoutObject,
     )
     if text_width <= 0:
         block.size_x = SizeX.FILL
+    if text_cfg is not None:
+        text_cfg.apply(block)
     content.add_child(block)
     return block
 
@@ -1608,6 +1699,7 @@ def add_highlight(self: LayoutObject,
                   height: float = DEFAULT_HIGHLIGHT_HEIGHT,
                   padding: Optional[Padding] = None,
                   align_x: AlignX = AlignX.LEFT,
+                  text_cfg: Optional[TextConfig] = None,
                   layer: int = 0) -> HighlightHandle:
     """
     重点突出信息行子模板 —— 一条显著突出的单行信息。
@@ -1661,6 +1753,8 @@ def add_highlight(self: LayoutObject,
         layer=layer + 1,
     )
     content.add_child(text_obj)
+    if text_cfg is not None:
+        text_cfg.apply(text_obj)
     return HighlightHandle(node=content, text=text_obj)
 
 
@@ -1679,6 +1773,7 @@ def add_bullets(self: LayoutObject,
                 style: Optional[Style] = None,
                 padding: Optional[Padding] = None,
                 align_x: AlignX = AlignX.LEFT,
+                text_cfg: Optional[TextConfig] = None,
                 layer: int = 0) -> BulletHandle:
     """
     通用分条目子模板 —— 一行「正方形引导符 + 正文」。
@@ -1826,6 +1921,10 @@ def add_bullets(self: LayoutObject,
         layer=layer + 1,
     )
     text_cell.add_child(text_obj)
+
+    if text_cfg is not None:
+        text_cfg.apply(text_obj)
+        text_cfg.apply(mark)          # ImageObject / TextObject / None，apply 会自行判断
 
     return BulletHandle(node=row, mark_cell=mark_cell, text_cell=text_cell,
                         text=text_obj, mark=mark)
@@ -2201,6 +2300,30 @@ if __name__ == "__main__":
         _bh_root.render(_probe, is_fill=False)
     _cell_recs = _probe.cells
 
+    # ---- 7c. TextConfig 可控性探针（同样必须在 pdf.output() 之前）----
+    def _head_probe(**kw):
+        """渲染一次详情三栏，返回 (三栏基线列表, 几何)，供断言核对"""
+        _r = LayoutObject(name="TC_Root", width=200, height=40,
+                          padding=Padding.all(0), layer=0)
+        _h = _r.add_detail_head(
+            prefix="TC", height=DEFAULT_BRIEF_HEIGHT,
+            key="日本农业苞谷大学", during_time="2020.09 - 2024.06",
+            tags="金坷垃制造与苞米发酵工程 | 本科",
+            key_style=BRIEF_DETAIL_STYLES["key_style"],
+            time_style=BRIEF_DETAIL_STYLES["time_style"],
+            tags_style=BRIEF_DETAIL_STYLES["tags_style"], **kw)
+        _r.layout(pdf=pdf, force=True)
+        _p = _ProbePdf(pdf)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _r.render(_p, is_fill=False)
+        _geo = (_h.node.get_effective_height(), _h.band.get_effective_height())
+        return [(y + h / 2.0) for (_x, y, h, _t) in _p.cells], _geo
+
+    _tc_base, _tc_geo = _head_probe()
+    _tc_time, _tc_geo2 = _head_probe(time_align=TextConfig(align_y=AlignY.TOP))
+    _tc_all, _tc_geo3 = _head_probe(text_cfg=TextConfig(align_y=AlignY.TOP))
+    _tc_lhr, _tc_geo4 = _head_probe(text_cfg=TextConfig(line_height_ratio=2.0))
+
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)
     print(f"\n✅ PDF 已生成: {output_path}", flush=True)
@@ -2351,6 +2474,30 @@ if __name__ == "__main__":
         f"检查是否有某一栏的 align_y 或 padding 与其余不一致")
     print(f"  ✅ 三栏基线对齐通过（极差 {_spread:.3f}mm，同为 "
           f"{_bases[0][0]:.2f}mm）", flush=True)
+
+    # 10b. TextConfig 可控性：对齐/行距能改，且**不改几何**
+    #      （对齐不参与 measure，所以盒子不该动 —— 这正是它安全的原因）
+    #      探针在【7c】就已渲染好（pdf.output() 之后不能再渲染）
+    assert _tc_geo == (DEFAULT_BRIEF_HEIGHT, DEFAULT_BRIEF_HEIGHT), \
+        f"基准几何异常：{_tc_geo}"
+    # 只把"时间"一栏改成贴顶：只有它该动
+    assert _tc_geo2 == _tc_geo, "对齐配置不得改变几何"
+    assert abs(_tc_time[0] - _tc_base[0]) < 0.01, "关键词栏不该被 time_align 影响"
+    assert abs(_tc_time[2] - _tc_base[2]) < 0.01, "标签栏不该被 time_align 影响"
+    assert _tc_time[1] < _tc_base[1] - 0.1, \
+        f"时间栏应贴顶（更小的基线），实测 {_tc_time[1]:.3f} vs {_tc_base[1]:.3f}"
+    print(f"  ✅ TextConfig 逐栏覆盖通过（time_align=TOP 只动时间栏："
+          f"{_tc_base[1]:.2f} -> {_tc_time[1]:.2f}mm）", flush=True)
+
+    # 统一 text_cfg：三栏一起改
+    assert _tc_geo3 == _tc_geo, "统一对齐配置同样不得改变几何"
+    assert all(b < _tc_base[i] - 0.1 for i, b in enumerate(_tc_all)), \
+        f"三栏都应贴顶，基准 {_tc_base}，实测 {_tc_all}"
+    print("  ✅ TextConfig 统一覆盖通过（三栏同时贴顶，几何不变）", flush=True)
+
+    # 行距：只改行高，不改几何
+    assert _tc_geo4 == _tc_geo, "行距配置不得改变几何"
+    print("  ✅ TextConfig 行距可控且不改几何", flush=True)
 
     print("\n✅ 回归契约断言全部通过", flush=True)
     print("\n" + "=" * 60, flush=True)

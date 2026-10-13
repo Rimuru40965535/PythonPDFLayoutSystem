@@ -1697,7 +1697,9 @@ def add_bullets(self: LayoutObject,
         indent: 整行左缩进 (mm)
         gap: 引导符与正文之间的距离 (mm)
         style: 正文字样式。默认 `STYLES["bullet_text"]`
-        padding: 正文格内边距
+        padding: 正文格内边距。**它由本参数控制，`style.padding` 不参与** ——
+                 本模板内部以 `Padding.all(0)` 构造文本对象，正文留白统一走这里，
+                 行高也随之 = 折行实高 + `padding` 上下。默认全 0
         align_x: 正文水平对齐
 
     Returns:
@@ -1722,13 +1724,14 @@ def add_bullets(self: LayoutObject,
     text_w = max(inner_w - bullet_size - gap, 0.0)
 
     # ---- 2) 量出正文折行后的实际高度与行数 ----
-    text_h = wrapped_height(item, style, text_w)
+    # ⚠️ `wrapped_height` 走的是 `TextRun` + `measure_text` 这条路，而 `TextRun`
+    # 只承载文字度量属性（text / font_name / font_size / bold / italic / color），
+    # **不含 padding**。所以内边距必须在这里补上，否则带了 padding 的样式会偏矮。
+    text_h = wrapped_height(item, style, text_w) + padding.top + padding.bottom
     lines = wrapped_lines(item, style, text_w)
-    # 单行实高（用于把引导符对准首行）
+    # 单行实高（用于把引导符对准首行）：字号 × 行高系数 + 该样式的上下留白
     line_h = (style.font_size * 1.2 * PT_TO_MM) + padding.top + padding.bottom
-    row_h = max(text_h + padding.top + padding.bottom,
-                line_h if lines else 0.0,
-                bullet_size)
+    row_h = max(text_h, line_h if lines else 0.0, bullet_size)
 
     n = sum(1 for c in self.children if "_bullet_" in c.name)
     prefix = f"{self.name}_bullet_{n}"

@@ -42,6 +42,8 @@
 ================================================================================
 """
 
+import contextlib
+import io
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
 
@@ -1168,7 +1170,7 @@ def add_section_heading(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.LEFT,
-        align_y=AlignY.BOTTOM,
+        align_y=AlignY.VCENTER,
         multi_line=False,
         layer=layer + 1,
     )
@@ -1294,7 +1296,12 @@ def add_detail_head(self: LayoutObject,
         text=during_time,
         width=0, height=0,
         color=White,
-        padding=time_style.padding,   # 与历史行为一致：沿用样式内边距
+        # ⚠️ 这里**不能**沿用 time_style.padding（detail_time_1 带 Padding(top=5)）。
+        # 原因：本对象是 SizeY.FILL，effective_h = 父容器高（= 带高），
+        # 引擎按 inner_h = eff_h - padding 算纵向居中量，于是那 5mm 顶内边距
+        # 会把文字**整体下推** 5mm，破坏与左右两格的视觉对齐。
+        # 实测（带高 10mm）：沿用 padding 时三格基线为 5.00/6.48/5.00（极差 1.48mm）。
+        padding=Padding.all(0),
         align_x=AlignX.CENTER,
         align_y=AlignY.VCENTER,
         multi_line=False,
@@ -2108,7 +2115,7 @@ if __name__ == "__main__":
 
     proj_items = [
         {
-            "key": "基于PDF的简历自动生成系统",
+            "key": "Python 文档排版系统",
             "during_time": "2025.03 - 2025.06",
             "tags": "Python, FPDF, 排版引擎",
             "description": "设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能。\n实现了简历元件的模块化管理，支持快速生成针对不同岗位的定制化简历。",
@@ -2136,6 +2143,39 @@ if __name__ == "__main__":
     print("\n【7. 渲染 PDF】", flush=True)
     root.layout(pdf=pdf, force=True)
     root.render(pdf, is_fill=False)
+
+    # ---- 7b. 详情标题三栏的基线探针（必须在 pdf.output() 之前做）----
+    # 用一个独立的小树渲染一次，抓 pdf.cell 的真实落点。
+    # 之所以放在这里：pdf.output() 会终结文档，之后不能再渲染。
+    _bh_root = LayoutObject(name="BH_Root", width=200, height=50,
+                            padding=Padding.all(0), layer=0)
+    _bh = _bh_root.add_detail_head(
+        prefix="BH", height=DEFAULT_BRIEF_HEIGHT,
+        key="日本农业苞谷大学", during_time="2020.09 - 2024.06",
+        tags="金坷垃制造与苞米发酵工程 | 本科",
+        key_style=BRIEF_DETAIL_STYLES["key_style"],
+        time_style=BRIEF_DETAIL_STYLES["time_style"],
+        tags_style=BRIEF_DETAIL_STYLES["tags_style"],
+    )
+    _bh_root.layout(pdf=pdf, force=True)
+    _cell_recs = []
+    _cur_xy = [0.0, 0.0]
+    _o_xy, _o_cell = pdf.set_xy, pdf.cell
+
+    def _spy_xy(x, y):
+        _cur_xy[0], _cur_xy[1] = float(x), float(y)
+        return _o_xy(x, y)
+
+    def _spy_cell(w=0, h=0, txt="", *a, **kw):
+        _cell_recs.append((_cur_xy[0], _cur_xy[1], float(h), str(txt)))
+        return _o_cell(w, h, txt, *a, **kw)
+
+    pdf.set_xy, pdf.cell = _spy_xy, _spy_cell
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bh_root.render(pdf, is_fill=False)
+    finally:
+        pdf.set_xy, pdf.cell = _o_xy, _o_cell
 
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)
@@ -2270,6 +2310,23 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("  ✅ 引导符三形态通过（text / image / block，非法值报错）", flush=True)
+
+    # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
+    # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），
+    #    所以任何只比对几何的验收都**看不出**文字落点的差异 —— 曾经就是这样漏掉了
+    #    一个把时间格 align_y 写成 TOP、并沿用 Padding(top=5) 的回归，
+    #    表现为时间"焊死在底部"。探针在【7b】渲染时就抓好了。
+    print("\n【10. 详情标题三栏的基线对齐】", flush=True)
+    assert len(_cell_recs) == 3, f"三栏应画出 3 段文字，实际 {len(_cell_recs)}"
+    _bases = [(y + h / 2.0, t) for (_x, y, h, t) in _cell_recs]
+    _spread = max(b for b, _ in _bases) - min(b for b, _ in _bases)
+    for _b, _t in _bases:
+        print(f"     基线 {_b:>5.2f}mm  {_t!r}", flush=True)
+    assert _spread < 0.01, (
+        f"三栏文字基线应对齐（视觉上同处一行），实测极差 {_spread:.3f}mm —— "
+        f"检查是否有某一栏的 align_y 或 padding 与其余不一致")
+    print(f"  ✅ 三栏基线对齐通过（极差 {_spread:.3f}mm，同为 "
+          f"{_bases[0][0]:.2f}mm）", flush=True)
 
     print("\n✅ 回归契约断言全部通过", flush=True)
     print("\n" + "=" * 60, flush=True)

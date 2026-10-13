@@ -1,0 +1,9 @@
+# 这个文件的存在是为了让 Resources/ 目录本身能被 Git 保留。
+#
+# Resources/ 下的全部素材（字体、图标、头像、证件照）**一律不入库** ——
+# 见根目录 .gitignore 中 Resources/* 规则及其说明。
+#
+# 克隆仓库后本目录为空，需要自行放入：
+#   * 字体：霞鹜文楷 LXGW WenKai（SIL OFL 1.1，免费商用）
+#           LXGWWenkai-Regular.ttf / LXGWWenkai-Bold.ttf
+#   * 图标：代码按固定文件名引用，见 TECHNICAL.md 的「资源清单」

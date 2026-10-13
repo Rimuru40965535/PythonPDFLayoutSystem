@@ -83,12 +83,38 @@
 > 正确顺序是：**先在 `master` 提交 → 签出功能分支 → 把这两个文件加进分支**。
 > ⚠️ 当前这两个文件**仍未入库**（`git status` 显示 `??`），是本分支最大的风险点。
 
-### A. 文档与元数据层（无行为风险）
+### A. 文档与元数据层 —— ✅ 2026-10-13 全部处理
 
-| 优先级 | 事项 | 说明 |
+| 优先级 | 事项 | 结论 |
 | --- | --- | --- |
-| A1 | **`.pyproj` 补编译项** | 目前只 `Include` 了 `LayoutEngine.py`；加入 `ResumeTemplate.py` / `ResumeCore.py` |
-| A2 | **`Resources/` 图标入库** | 两个文件引用的 **11 个**图片文件尚未入库（`.ttf` 已被 `.gitignore` 排除，小素材应正常入库） |
+| A1 | **`.pyproj` 补编译项** | ✅ **已完成**。`Compile` 含 `LayoutEngine.py` + `ResumeTemplate.py`；`StartupFile` 指向 `ResumeTemplate.py`（本分支的测试入口）。**顶层 `ResumeCore.py` 刻意不入 `.pyproj`** —— 按分支策略，它属另一个分支 |
+| A2 | **`Resources/` 素材入库** | ❌ **改为不入库**。决定见下方说明 |
+
+#### A2 的决定：`Resources/` 全部素材不入库
+
+2026-10-13 决定：**字体、图标、头像、证件照一律不追踪**。理由是素材体积小但数量会持续
+变动、随时可能被替换成自己的素材；需要时可在未来补齐入库。
+
+`.gitignore` 相应从 `Resources/*.ttf` 改为：
+
+```gitignore
+Resources/*
+!Resources/.gitkeep
+```
+
+目录本身由 `Resources/.gitkeep` 保留，克隆后目录存在但为空。
+
+> **为什么这不会让仓库"缺东西就跑不起来"**：素材缺失是**静默降级**，不是崩溃。
+> - 缺字体 → 中文渲染为空白（引擎退回内置 helvetica，不报错）
+> - 缺图标 → 图标位置留空（`ImageObject.render` 对空路径/不存在路径直接返回）
+>
+> 因此两个测试入口在没有 `Resources/` 内容时**仍能退出码 0**。
+> 完整素材清单（文件名 + 使用方）见 `TECHNICAL.md` 的「资源清单」。
+
+> ⚠️ **中层本身不依赖任何图标文件**：`ResumeTemplate.py` 里 5 处图片引用**全在
+> `__main__` 测试入口内**；`add_profile` / `add_section_title` 只接收
+> `icon_style` 与 `image_path` 参数，`STYLES` 里的 `image_path` 都是空串。
+> 也就是说素材是**顶层与测试**的事，不是中层的事。
 
 > 已核实：两个文件都是**完好的 UTF-8**（无 BOM、0 个替换字符）。
 > 之前担心的"编码损坏"是 PowerShell 以 GBK 读取 UTF-8 的显示问题，**不是文件问题**。
@@ -155,6 +181,7 @@
 | 外边距 margin | **已决定不做**。padding + `create_spacer` + `create_band` 的 gap 已覆盖全部场景 |
 | 分页 | **暂缓**（批次 6）。现阶段简历只需一页 A4；多页需求出现时先在 `master` 完成再签分支 |
 | 行内图片 / 上标下标 / 两端对齐 / 链接 | 独立特性，未排期 |
+| `Resources/` 素材入库 | **暂不追踪**（2026-10-13）。理由与后果见 A2 |
 
 ### F. 功能分支的验收方式
 

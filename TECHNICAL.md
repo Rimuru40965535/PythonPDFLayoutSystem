@@ -1372,6 +1372,47 @@ self
 > 会走引擎的"退化规则"去读**尚未测量**的子元素高度，整条内容会塌缩为 0 高。
 > `add_details` / `add_summary` 因此显式把 `content` 与 `details` 设为 `SizeY.CONTENT`。
 
+### 4.8 资源清单（`Resources/` 不入库）
+
+**决定（2026-10-13）**：`Resources/` 下的全部素材**一律不追踪**。
+`.gitignore` 规则为 `Resources/*` + `!Resources/.gitkeep`；目录本身由
+`Resources/.gitkeep` 保留。理由与后果见 `SKILLS.md` 的 A2。
+
+素材缺失是**静默降级**，不是崩溃 —— 缺字体则中文变空白（退回内置 helvetica），
+缺图标则该位置留空（`ImageObject.render` 对空路径直接返回）。
+因此新克隆的仓库即便 `Resources/` 为空，两个测试入口仍能退出码 0。
+
+#### 字体（引擎与全部文本都依赖）
+
+| 文件名 | 用途 |
+| --- | --- |
+| `LXGWWenkai-Regular.ttf` | 正文；`pdf.add_font("LXGW", "", ...)` |
+| `LXGWWenkai-Bold.ttf` | 粗体；`pdf.add_font("LXGW", "B", ...)` |
+
+> 霞鹜文楷（LXGW WenKai），SIL OFL 1.1，可免费商用。
+> 未注册 `B`/`I`/`BI` 变体时引擎会优雅降级并**打印提示**（见 3.4c）。
+
+#### 图标与照片
+
+| 文件名 | 由谁引用 | 用途 |
+| --- | --- | --- |
+| `icon_Profile_Name.png` | `ResumeTemplate.py` 测试入口 | 姓名行左侧图标 |
+| `icon_Education_History.png` | 两个文件的测试入口 | "教育背景"节标题图标 |
+| `icon_Project_History.png` | 两个文件的测试入口 | "项目经历"节标题图标 |
+| `telephone.png` / `email.png` / `locate.png` | `ResumeCore._contact_rows` | 电话 / 邮箱 / 城市 |
+| `social_media.png` | 同上 | QQ / 微信 |
+| `contact_address.png` | 同上 | 联系地址 |
+| `website.png` | 同上 | 个人网站 |
+| `woman_student.png` | `ResumeCore._fill_left_column` | 姓名行默认头像 |
+| `photo_1.png` | `ResumeCore` 测试入口 | 证件照 |
+| `man_student.png` | **无代码引用** | 备用头像 |
+
+> ⚠️ **中层本身不依赖任何图标文件**：`ResumeTemplate.py` 里的 5 处图片引用
+> 全部位于 `__main__` 测试入口内；`add_profile` / `add_section_title` 只接收
+> `icon_style` 与 `image_path` 参数，`STYLES["name_image"].image_path` 等一律为空串。
+> 也就是说**素材是顶层与测试的事**，中层保持对具体图标的零知识。
+
+
 ## 5. ResumeCore.py API
 
 ### 5.1 数据类

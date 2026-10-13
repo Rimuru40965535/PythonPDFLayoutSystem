@@ -62,6 +62,7 @@ from LayoutEngine import (
     AlignX,
     AlignY,
     LayoutObject,
+    PT_TO_MM,
     Padding,
     Style,
     White,
@@ -357,9 +358,14 @@ class Theme:
     skills_text_style: Optional[Style] = None
     name_icon_style: Optional[Style] = None
     name_text_style: Optional[Style] = None
-    contact_icon_style: Optional[Style] = None
     contact_text_style: Optional[Style] = None
     photo_style: Optional[Style] = None
+
+    # ---- 联系方式的图标段落参数（`add_para`）----
+    # 行高由内容决定，图标只影响左栏宽；图标边长须 ≤ 文本首行高
+    # （12pt × 1.2 = 5.08mm），否则中层会明确报错。
+    contact_icon_width: float = 4.0
+    contact_icon_gap: float = 2.0
 
     # ---- 版面标签文案（逐简历可被数据类覆盖）----
     summary_title: str = "个人总结"
@@ -408,10 +414,10 @@ class Theme:
             self.name_icon_style = STYLES["name_image"]
         if self.name_text_style is None:
             self.name_text_style = STYLES["name_text"]
-        if self.contact_icon_style is None:
-            self.contact_icon_style = STYLES["profile_text"]
         if self.contact_text_style is None:
-            self.contact_text_style = STYLES["contact_text"]
+            # 联系方式沿用旧观感的字号（`profile_text` = 12pt）。
+            # 若换成 `contact_text`（10pt）会更紧凑，但联系方式会比现在小一号。
+            self.contact_text_style = STYLES["profile_text"]
         if self.photo_style is None:
             self.photo_style = STYLES["profile_photo"]
 
@@ -469,12 +475,23 @@ def _fill_left_column(column: LayoutObject, resume: Resume,
         _spacer(column, "Lead_Left_Name_Contacts", spacing.name_contacts)
 
     contacts = profile.contact_rows()
-    first_index = 1 if profile.name else 0
     for i, (icon_path, value) in enumerate(contacts):
-        column.add_info(index=first_index + i, text=value,
-                        icon_style=theme.contact_icon_style,
-                        text_style=theme.contact_text_style,
-                        layer=1)
+        # ⚠️ 联系方式用 **`add_para`（图标段落）**，不是 `add_info`。
+        #    原因：`add_info` 的整行高 = max(文本最小高, 图标占高)，
+        #    图标 4mm 把行高顶到 `4+3 = 7mm`，而文字实高只有 5.08mm ——
+        #    上下各空近 1mm，再叠 5mm 留白，行间距达 **12mm（≈ 文字高的 2.4 倍）**，
+        #    目视就是"联系方式行距太大"。
+        #    `add_para` 的行高**由内容决定**（图标按"首行中心"锚定），
+        #    行高 = 文本行高 5.08mm、行间距 10.08mm。
+        column.add_para(
+            text=value,
+            icon=icon_path,
+            icon_width=theme.contact_icon_width,
+            indent=0.0,
+            gap=theme.contact_icon_gap,
+            style=theme.contact_text_style,
+            layer=1,
+        )
         # N 条之间只应有 N-1 个留白
         if i < len(contacts) - 1:
             _spacer(column, f"Lead_Left_Contact_{i}", spacing.between_contacts)
@@ -807,7 +824,10 @@ def _selftest() -> int:
     import tempfile
     import dataclasses
 
-    out_root = os.path.join(tempfile.gettempdir(), "_resumecore_selftest")
+    
+    #out_root = os.path.join(tempfile.gettempdir(), "_resumecore_selftest")
+    out_root = os.path.join("./output", "_resumecore_selftest")
+
     os.makedirs(out_root, exist_ok=True)
     ok = True
 
@@ -890,6 +910,51 @@ def _selftest() -> int:
         check("缺姓名：明确报错", True)
     except Exception as e:
         check("缺姓名：明确报错", False, f"报错类型不对：{type(e).__name__}")
+
+    # ---- V9 联系方式：行高必须由文字决定，不得被图标撑起 ----
+    # 起因（用户目视发现）：联系方式行距太大。
+    # 根因是 `add_info` 的整行高 = max(文本最小高, 图标占高)，图标 4mm 把行高顶到
+    # 7mm（文本只有 5.08mm），再叠 5mm 留白 → 行间距 12mm ≈ 文字高的 2.4 倍。
+    # 现改用 `add_para`（行高由内容决定 + 图标锚定首行中心）。
+    print("\n【V9】联系方式行高由文字决定（不被图标撑起）")
+    r9 = Resume(intend_job="工程师",
+                profile=Profiles(name="测试", telephone="138-0000-0000",
+                                 email="a@b.com", locate="某市"))
+    r9.add_section(Section(title="X", details=[Details(key="k")]))
+    th9 = Theme()
+    root9 = quiet(build_layout, r9, th9, Spacing())
+    lc9 = root9.find_by_name("Root_left_column")
+    paras9 = [c for c in lc9.children if "_para_" in c.name]
+    check("联系方式用 add_para 生成（找到 _para_ 节点）", len(paras9) == 3,
+          f"实际 {len(paras9)} 条")
+    line_h9 = (th9.contact_text_style.font_size
+               * (th9.contact_text_style.line_height_ratio or 1.2) * PT_TO_MM)
+    row_h9 = paras9[0].get_effective_height() if paras9 else 0.0
+    # 行高应等于文本行高；若被图标撑起会明显大于它（旧实现 7.00 vs 5.08）
+    check(f"行高 = 文本行高（{row_h9:.3f} vs {line_h9:.3f}）",
+          abs(row_h9 - line_h9) < 0.01,
+          "行高被图标撑起" if abs(row_h9 - line_h9) >= 0.01 else "")
+    # 相邻两条的间距必须 = 行高 + between_contacts
+    if len(paras9) >= 2:
+        pitch9 = paras9[1].get_absolute_y() - paras9[0].get_absolute_y()
+        want9 = line_h9 + Spacing().between_contacts
+        check(f"行间距 = 行高 + between_contacts（{pitch9:.3f} vs {want9:.3f}）",
+              abs(pitch9 - want9) < 0.01)
+    # 图标必须锚定在**首行中心**（不是整块中心）
+    if paras9:
+        p0 = paras9[0]
+        icon0 = None
+        for c in p0.children:
+            for g in c.children:
+                if type(g).__name__ == "ImageObject":
+                    icon0 = g
+        if icon0 is not None:
+            dy0 = p0.get_absolute_y()
+            ic_c = icon0.get_absolute_y() + icon0.get_effective_height() / 2 - dy0
+            check(f"图标中心 = 首行中心（{ic_c:.4f} vs {line_h9/2:.4f}）",
+                  abs(ic_c - line_h9 / 2) < 0.001)
+        else:
+            check("能在段落里找到图标对象", False)
 
     # ---- V5 不溢出 ----
     # ⚠️ 两层检查都要做：

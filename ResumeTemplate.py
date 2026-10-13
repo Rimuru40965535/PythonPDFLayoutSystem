@@ -2147,9 +2147,16 @@ if __name__ == "__main__":
     # ---- 7b. 详情标题三栏的基线探针（必须在 pdf.output() 之前做）----
     # 用一个独立的小树渲染一次，抓 pdf.cell 的真实落点。
     # 之所以放在这里：pdf.output() 会终结文档，之后不能再渲染。
+    #
+    # ⚠️ **探针绝不能落到产物上**。曾经的写法是把探针树直接 render 到本 pdf，
+    #    结果往第 1 页顶部画了一份三栏复制品（实测多了 3 段文字，落点 y≈2.25/3.52/3.31），
+    #    看起来就像"时间字段跑到页顶去了"。
+    #    现在改用 _ProbePdf：一个**只记录、不落笔**的代理 ——
+    #    cell() 只记账不绘制，rect()/颜色设置一律吞掉，
+    #    set_font 转发给真 pdf（它只改内部状态、不写内容流，且字体度量必须是真的）。
     _bh_root = LayoutObject(name="BH_Root", width=200, height=50,
                             padding=Padding.all(0), layer=0)
-    _bh = _bh_root.add_detail_head(
+    _bh_root.add_detail_head(
         prefix="BH", height=DEFAULT_BRIEF_HEIGHT,
         key="日本农业苞谷大学", during_time="2020.09 - 2024.06",
         tags="金坷垃制造与苞米发酵工程 | 本科",
@@ -2158,24 +2165,41 @@ if __name__ == "__main__":
         tags_style=BRIEF_DETAIL_STYLES["tags_style"],
     )
     _bh_root.layout(pdf=pdf, force=True)
-    _cell_recs = []
-    _cur_xy = [0.0, 0.0]
-    _o_xy, _o_cell = pdf.set_xy, pdf.cell
 
-    def _spy_xy(x, y):
-        _cur_xy[0], _cur_xy[1] = float(x), float(y)
-        return _o_xy(x, y)
+    class _ProbePdf:
+        """只记录 cell 落点、不向文档写任何内容的代理"""
 
-    def _spy_cell(w=0, h=0, txt="", *a, **kw):
-        _cell_recs.append((_cur_xy[0], _cur_xy[1], float(h), str(txt)))
-        return _o_cell(w, h, txt, *a, **kw)
+        def __init__(self, target):
+            self._t = target
+            self.cells = []
+            self._xy = (0.0, 0.0)
 
-    pdf.set_xy, pdf.cell = _spy_xy, _spy_cell
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            _bh_root.render(pdf, is_fill=False)
-    finally:
-        pdf.set_xy, pdf.cell = _o_xy, _o_cell
+        def set_xy(self, x, y):
+            self._xy = (float(x), float(y))
+            return None
+
+        def cell(self, w=0, h=0, txt="", *a, **kw):
+            self.cells.append((self._xy[0], self._xy[1], float(h), str(txt)))
+            return None
+
+        # 绘制类：吞掉
+        def rect(self, *a, **kw):
+            return None
+
+        def set_fill_color(self, *a, **kw):
+            return None
+
+        def set_text_color(self, *a, **kw):
+            return None
+
+        # 字体类：转发给真 pdf（只改内部状态；get_string_width 等要真实度量）
+        def __getattr__(self, name):
+            return getattr(self._t, name)
+
+    _probe = _ProbePdf(pdf)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _bh_root.render(_probe, is_fill=False)
+    _cell_recs = _probe.cells
 
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)
@@ -2315,7 +2339,7 @@ if __name__ == "__main__":
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），
     #    所以任何只比对几何的验收都**看不出**文字落点的差异 —— 曾经就是这样漏掉了
     #    一个把时间格 align_y 写成 TOP、并沿用 Padding(top=5) 的回归，
-    #    表现为时间"焊死在底部"。探针在【7b】渲染时就抓好了。
+    #    表现为时间"焊死在底部"。探针在【7b】用 _ProbePdf 抓好了（不落笔）。
     print("\n【10. 详情标题三栏的基线对齐】", flush=True)
     assert len(_cell_recs) == 3, f"三栏应画出 3 段文字，实际 {len(_cell_recs)}"
     _bases = [(y + h / 2.0, t) for (_x, y, h, t) in _cell_recs]

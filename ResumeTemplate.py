@@ -912,11 +912,12 @@ class Spacing:
 
     # ---- 右栏 ----
     right_top: float = 10.0                 # 右栏顶部
-    section_title_to_body: float = 3.0      # 节标题 ↔ 该节首个内容
-                                            # （= 顶层 Lead 的历史默认值 3）
-                                            # ⚠️ 直挂内容的调用方（不走 add_section）
-                                            #    需自行用它留白，见 add_section_heading
-                                            #    的 gap_after；否则实测为 0.00mm
+    section_title_to_body: float = 0.0      # 节标题 ↔ 该节首个内容。
+                                            # 默认 0（2026-10-13 用户要求：其它留白默认 0）。
+                                            # 需要留白的节**逐个指定** —— 传给
+                                            # add_section_heading(gap_after=…) 或
+                                            # add_section(title_detail_gap=…)。
+                                            # 直挂内容时必须显式给，否则实测 0.00mm
     between_paras: float = 1.0              # 图标段落之间
     detail_head_to_body: float = 0.0        # 详情三栏（关键词/时间/标签）↔ 描述体
     between_details: float = 5.0            # 节内相邻详情之间
@@ -2780,6 +2781,11 @@ if __name__ == "__main__":
     # 留白统一取自 Spacing（中层唯一真相源）。
     # 想整体调松紧：换成 Spacing.compact() / Spacing.loose() / Spacing().scaled(k)
     _SP = Spacing()
+    # 各节"标题分隔线之下"的留白：**逐节指定**，默认 0。
+    # 想给某一节单独留白，只改这一个数字即可。
+    _TITLE_GAP = {
+        "技能亮点": 3.0,      # 这一节单独留白
+    }
     # 图标分段的公共参数：左栏宽 = 图标宽、整行不额外缩进（右栏本身有内边距）
     # 不传 icon_align —— 图标默认按 first_line 锚定（对齐正文首行），
     # icon_align 只在 icon_anchor="cell" 时生效。
@@ -2790,9 +2796,9 @@ if __name__ == "__main__":
         icon_style=STYLES["section_title_image"],
         text_style=STYLES["section_title_text"],
         title="教育背景",
+        gap_after=_TITLE_GAP.get("教育背景", _SP.section_title_to_body),
         image_path=".\\Resources\\icon_Education_History.png",
         # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
-        gap_after=_SP.section_title_to_body,
         layer=1,
     )
     print(f"  ✅ 节标题: {edu_title.node.name} → {edu_title.text.get_text()}", flush=True)
@@ -2835,9 +2841,9 @@ if __name__ == "__main__":
         icon_style=STYLES["section_title_image"],
         text_style=STYLES["section_title_text"],
         title="项目经历",
+        gap_after=_TITLE_GAP.get("项目经历", _SP.section_title_to_body),
         image_path=".\\Resources\\icon_Project_History.png",
         # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
-        gap_after=_SP.section_title_to_body,
         layer=1,
     )
 
@@ -2881,9 +2887,9 @@ if __name__ == "__main__":
         icon_style=STYLES["section_title_image"],
         text_style=STYLES["section_title_text"],
         title="技能亮点",
+        gap_after=_TITLE_GAP.get("技能亮点", _SP.section_title_to_body),
         image_path=".\\Resources\\icon_Project_History.png",
         # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
-        gap_after=_SP.section_title_to_body,
         layer=1,
     )
     print(f"  ✅ 节标题: {demo_title.text.get_text()}", flush=True)
@@ -3354,7 +3360,11 @@ if __name__ == "__main__":
     # 起因（用户目视发现）：直挂内容的节，标题分隔线与首个内容之间实测 0.00mm
     # —— 因为留白只在 add_section 那条路径上加，直挂的调用方没人加。
     print("\n【9b. 留白 Spacing 与 gap_after】", flush=True)
-    assert Spacing().section_title_to_body > 0, "节标题↔内容的默认留白应 > 0"
+    # 设计约定：**所有留白默认 0**，"节标题↔内容"也不例外 —— 要留白的节逐个指定。
+    assert Spacing().section_title_to_body == 0.0, \
+        "节标题↔内容的默认留白应为 0（逐节指定）"
+    assert Spacing().detail_head_to_body == 0.0 and Spacing().between_bullets == 0.0, \
+        "新增的留白项默认也应为 0"
     # scaled 必须等比缩放全部字段
     _sp0, _sp5 = Spacing(), Spacing().scaled(0.5)
     _flds = [f.name for f in dataclasses.fields(Spacing)]
@@ -3364,7 +3374,7 @@ if __name__ == "__main__":
     assert len(Spacing.compact().as_lead()) == 12, "as_lead 应导出 12 个 Lead 键"
     # gap_after 必须精确落到"分隔线之下"
     _g_probe = {}
-    for _gap in (0.0, Spacing().section_title_to_body, 6.0):
+    for _gap in (0.0, 3.0, 6.0):
         _gr = LayoutObject(name=f"Gap_{_gap}", width=135.0, height=200,
                            padding=Padding.all(0), layer=0)
         with contextlib.redirect_stdout(io.StringIO()):

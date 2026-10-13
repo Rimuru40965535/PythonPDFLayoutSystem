@@ -1239,7 +1239,7 @@ root.add_split(...)              # 而不是 generate_basic_subtemplate(root=...
 column.add_detail(...)           # 而不是 generate_section_details_template(root=...)
 ```
 
-**当前 14 个已挂载方法**：
+**当前 15 个已挂载方法**：
 
 | 分类 | 方法 |
 | --- | --- |
@@ -1248,6 +1248,7 @@ column.add_detail(...)           # 而不是 generate_section_details_template(r
 | 右栏 | `add_section_heading` / `add_section` / `add_detail` |
 | 详情部件 | `add_detail_head` / `add_detail_body` |
 | 分条目 | `add_bullets` / `add_bullet_list` |
+| 图标段落 | `add_para` |
 | 通用 | `add_text_row` / `add_spacer` |
 
 > **旧名已全部退役、不留兼容层**：`add_profile`、`add_profile_photo`、
@@ -1633,7 +1634,6 @@ col.add_bullet_list(items=[...], text_cfg=TextConfig(line_height_ratio=1.4))
 > 教训：凡是模板自己量尺寸的地方，配置必须参与**测量**。
 
 ### 4.8c 批量分条目 `add_bullet_list`（2026-10-13 新增）
-
 ```python
 col.add_bullet_list(
     items=[
@@ -1652,6 +1652,78 @@ col.add_bullet_list(
   外加 `text` 表示正文）
 - 条间留白只在**条目之间**插入（n 条 → n-1 个），末条之后不加
 - 返回 `BulletListHandle(node, rows)`，支持 `len()` / 迭代 / 下标
+
+### 4.8d 图标段落 `add_para`（2026-10-13 新增）
+
+**用途**：在**大片密集信息里直接标出重点**。与详情三栏无关
+（那三栏不用这个模板也能展示）。
+
+```python
+col.add_para(
+    text="系统采用<c:CC0000>**分层排版引擎**</c>，支持多模板切换。",
+    icon=".\\Resources\\icon_Project_History.png",   # 必填但给了缺省值
+    icon_width=4.0,            # 左栏宽 = 图标宽
+    icon_align=AlignY.VCENTER, # 图标在左栏内的竖直对齐
+    indent=1.0, gap=2.0,
+    left_pad=None,             # 左栏内边距，默认 Padding(top=0.5)
+)
+```
+
+```python
+@dataclass
+class ParaHandle:
+    node: LayoutObject      # 整行容器
+    left: LayoutObject      # 左栏（图标栏，满高）
+    icon: ImageObject       # 图标（正方形）
+    right: LayoutObject     # 右栏（正文栏，占满剩余宽高）
+    text: TextObject
+```
+
+**结构与实测**（容器 110mm / 图标 4mm / indent 1 / gap 2）：
+
+| 位置 | 尺寸 |
+| --- | --- |
+| 左栏 | 宽 4.0 × 高 8.47（**满高**） |
+| 图标 | 4.0 × 4.0（**正方形**） |
+| 右栏 | 宽 103.0 × 高 8.47（**满高**） |
+| 图标竖直对齐 | `TOP`/`VCENTER`/`BOTTOM` → y = 0.50 / 2.48 / 4.47 |
+
+**与 `add_bullets` 刻意分开**（几何契约不同）：
+
+| | `add_para` | `add_bullets` |
+| --- | --- | --- |
+| 左栏尺寸 | **图标宽 × 行高（满高）** | 正方形小格（边长 `bullet_size`） |
+| 图标竖直位置 | **左栏内边距 + 自身对齐** | **对准正文首行中心** |
+| 图标尺寸 | 独立参数（正方形） | 引导符边长 |
+
+#### 三条实测得出的硬约束（改这个模板前务必先读）
+
+**① 不能用 `create_band`**
+
+- `create_band(cells=[5.0, 1.0])` 把 `5.0` 当**比例**，得到 91.67/18.33，
+  而不是固定 5mm —— 它不支持固定像素宽；
+- `create_band` 要求父容器内容区高为正，而 `SizeY.CONTENT` 的行在测量期高为 0，
+  会直接抛 `ValueError: create_band: 高度必须为正`。
+
+→ 改为**手工摆放 + 显式算高**（同 `add_detail_head` 的做法）。
+
+**② 图标必须显式给高才是正方形**
+
+| 写法 | 实际尺寸 |
+| --- | --- |
+| `width=4, height=0, keep_aspect_ratio=True` | **4.00 × 6.97** ❌ 被可用高反推 |
+| `width=4, height=4` | **4.00 × 4.00** ✅ |
+
+`keep_aspect_ratio` 在"高>0"时是"在框内等比缩放"，"高=0"时是"用可用高反推"。
+
+**③ 行高取 `max(正文折行实高, 图标高 + 左栏上内边距)`**
+
+否则图标会溢出左栏（实测短正文行高 4.23、图标 5.0 时**溢出 2.27mm**）。
+正文通常比图标高，所以这一项只在图标偏大时生效。
+
+> ⚠️ **缺省图标 `DEFAULT_PARA_ICON` 是占位值**：`Resources/` 里现有 11 个 png
+> 全是语义化的（教育/项目/姓名/电话/邮箱…），**没有通用的"重点标记"符号**。
+> 换图标只改这一个常量，或每次调用给 `icon=`。
 
 ### 4.9 资源清单（`Resources/` 不入库）
 
@@ -2826,6 +2898,11 @@ add_detail_body:  height=None（None = 自动结算）
 add_highlight:    height=9, 样式 STYLES["highlight_text"]（13pt 粗体白字深蓝底）
 add_bullets:      bullet_size=3.2, indent=1, gap=2, bullet_kind="block"
                   bullet_kind ∈ {block, text, image}
+add_bullet_list:  gap=0（条间留白只在条目之间，n 条 -> n-1 个）
+add_para:         icon=DEFAULT_PARA_ICON（占位值）, icon_width=4.0,
+                  icon_align=VCENTER, indent=1.0, gap=2.0,
+                  left_pad=None（默认 Padding(top=0.5)）
+                  行高 = max(正文折行实高, 图标高 + 左栏上内边距)
 add_text_row:     height=None（None = 字号 × row_height_ratio=0.5）
 BRIEF_DETAIL_STYLES: detail_key_1 / detail_time_1 / detail_tags_1 / detail_description
 Resume:           summary_height=None（None = 自动结算）, summary_title="个人总结"
@@ -2851,6 +2928,8 @@ add_detail_head            -> DetailHeadHandle(node/band/三个 col/key/during_t
 add_detail_body            -> DetailBodyHandle(node/description)
 add_highlight              -> HighlightHandle(node/text)
 add_bullets                -> BulletHandle(node/mark_cell/text_cell/text/mark)
+add_bullet_list            -> BulletListHandle(node/rows[]，支持 len/迭代/下标)
+add_para                   -> ParaHandle(node/left/icon/right/text)
 add_section                -> SectionHandle(node/title/details[])
 add_text_row               -> TextObject（容器按 {name}_content 查找）
 add_spacer                 -> LayoutObject

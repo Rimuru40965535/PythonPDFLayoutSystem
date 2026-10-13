@@ -373,7 +373,16 @@ FodyWeavers.xsd
 # 注意：该规则只匹配任意层级的 output 目录。
 output/
 
-# 霞鹜文楷字体（LXGW WenKai）。体积约 117 MB，属本地资源，不入库。
-# 字体是免费开源的，获取方式见 README 的「资源获取」一节。
-# 只忽略字体本身；未来补充的图标/照片等小体积素材应正常入库。
-Resources/*.ttf
+# Resources/ 下的**全部素材**一律不入库（字体、图标、头像、证件照）。
+#
+# 决定（2026-10-13，与 feature_resume_sub_templates 分支一致）：
+# 素材体积小但数量会持续变动、随时可能被替换成自己的素材，需要时未来再补齐入库。
+#
+# 后果：新克隆的仓库没有 Resources/ 内容 ——
+#   * 缺字体 -> 中文静默降级为空白（引擎退回内置 helvetica，不报错）
+#   * 缺图标 -> 图标位置留空（ImageObject.render 对空路径直接返回，不报错）
+# 恢复方式：把字体与图标放回 Resources/ 即可，代码按固定文件名引用。
+#
+# 目录本身由 Resources/.gitkeep 保留，因此克隆后目录存在但为空。
+Resources/*
+!Resources/.gitkeep

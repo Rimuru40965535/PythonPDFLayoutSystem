@@ -52,9 +52,10 @@
 """
 
 import os
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from fpdf import FPDF
 
@@ -122,27 +123,33 @@ class Profiles:
                         self.social_media_qq, self.social_media_wechat,
                         self.contact_address, self.website])
 
-    def contact_rows(self) -> List[tuple]:
+    def contact_rows(self, theme: Optional['Theme'] = None) -> List[tuple]:
         """
         产出 `[(图标路径, 文本), ...]` —— 按固定顺序排列的**非空**联系方式。
 
         顺序：电话 → 邮箱 → 城市 → QQ → 微信 → 地址 → 网站
+
+        Args:
+            theme: 取图标路径用（可用 `Theme(contact_icons={...})` 覆盖）。
+                   `None` 时用内置默认图标。
         """
+        ic = (lambda k: theme.icon(k)) if theme is not None \
+            else (lambda k: DEFAULT_CONTACT_ICONS.get(k, ""))
         rows: List[tuple] = []
         if self.telephone:
-            rows.append((Theme.ICON_TELEPHONE, self.telephone))
+            rows.append((ic("telephone"), self.telephone))
         if self.email:
-            rows.append((Theme.ICON_EMAIL, self.email))
+            rows.append((ic("email"), self.email))
         if self.locate:
-            rows.append((Theme.ICON_LOCATE, self.locate))
+            rows.append((ic("locate"), self.locate))
         if self.social_media_qq:
-            rows.append((Theme.ICON_SOCIAL, f"QQ：{self.social_media_qq}"))
+            rows.append((ic("social"), f"QQ：{self.social_media_qq}"))
         if self.social_media_wechat:
-            rows.append((Theme.ICON_SOCIAL, f"微信：{self.social_media_wechat}"))
+            rows.append((ic("social"), f"微信：{self.social_media_wechat}"))
         if self.contact_address:
-            rows.append((Theme.ICON_ADDRESS, self.contact_address))
+            rows.append((ic("address"), self.contact_address))
         if self.website:
-            rows.append((Theme.ICON_WEBSITE, self.website))
+            rows.append((ic("website"), self.website))
         return rows
 
 
@@ -329,6 +336,39 @@ class Resume:
 # ============================================================================
 
 @dataclass
+@dataclass
+class ValidationReport:
+    """
+    配置校验结果。**区分硬错误与警告** —— 见 `Theme.validate()` 的说明。
+    """
+    problems: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """只有硬错误才算不通过；警告不影响通过"""
+        return not self.problems
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __iter__(self):
+        """允许 `for p in report` 直接遍历硬错误（兼容旧的列表用法）"""
+        return iter(self.problems)
+
+    def __len__(self) -> int:
+        return len(self.problems)
+
+    def format(self) -> str:
+        lines = []
+        for p in self.problems:
+            lines.append(f"❌ {p}")
+        for w in self.warnings:
+            lines.append(f"⚠️  {w}")
+        return "\n".join(lines)
+
+
+@dataclass
 class Theme:
     """
     版式配置：**跨简历稳定**的呈现信息。
@@ -401,13 +441,23 @@ class Theme:
     # 传 Padding.all(0) 可关闭，让盒高等于纯文本高（调试对齐时有用）
     body_inner_padding: Optional[Padding] = None
 
-    # ---- 联系方式图标（Profiles.contact_rows 用）----
+    # ---- 联系方式图标（`Profiles.contact_rows()` 用）----
+    # ⚠️ 必须能从构造参数传入。此前是 6 个 `init=False` 字段，
+    #    想换图标只能改类属性 —— 那是模块级共享状态，不是配置。
+    contact_icons: Dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_CONTACT_ICONS))
+
+    # 真值表，同时作为"类属性可读"的兼容面（`Theme.ICON_TELEPHONE` 仍可用）
     ICON_TELEPHONE: str = field(default=r".\Resources\telephone.png", init=False)
     ICON_EMAIL: str = field(default=r".\Resources\email.png", init=False)
     ICON_LOCATE: str = field(default=r".\Resources\locate.png", init=False)
     ICON_SOCIAL: str = field(default=r".\Resources\social_media.png", init=False)
     ICON_ADDRESS: str = field(default=r".\Resources\contact_address.png", init=False)
     ICON_WEBSITE: str = field(default=r".\Resources\website.png", init=False)
+
+    def icon(self, key: str) -> str:
+        """取某个联系方式的图标路径（可在实例上用 `contact_icons` 覆盖）"""
+        return self.contact_icons.get(key, DEFAULT_CONTACT_ICONS.get(key, ""))
 
     def skills_body_padding(self) -> Padding:
         """
@@ -450,10 +500,97 @@ class Theme:
         if self.photo_style is None:
             self.photo_style = STYLES["profile_photo"]
 
+    def validate(self,
+                 resume: Optional['Resume'] = None) -> 'ValidationReport':
+        """
+        检查本配置内部是否有**互相打架**或**不可能成立**的设置。
+
+        **区分两类结果**（这是有意的）：
+
+            problems（硬错误）—— 配置本身不成立，渲染必然失败或明显错误。
+                                调用方应当视作失败。
+            warnings（警告）  —— 能跑，但结果可能不是你要的。
+                                典型：引用的图片不存在 ——
+                                按 `SKILLS.md` 的 G.4/D2 **缺图片是允许的**
+                                （引擎静默降级、该位置留空），
+                                所以**绝不能**把它当硬失败，否则新克隆仓库直接跑不起来。
+
+        一次报全，而不是改一个报一个。
+
+        Args:
+            resume: 给了就一并做"内容与版式是否匹配"的检查
+        """
+        problems: List[str] = []
+        warnings: List[str] = []
+        if self.contact_left_indent <= 0:
+            problems.append(
+                f"contact_left_indent={self.contact_left_indent} 必须 > 0，"
+                f"否则联系方式图标会贴在蓝底左栏边界上")
+        if self.skills_left_indent < 0:
+            problems.append(f"skills_left_indent={self.skills_left_indent} 不能为负")
+        if self.column_ratio and sum(self.column_ratio) <= 0:
+            problems.append(f"column_ratio={list(self.column_ratio)} 之和必须为正")
+        if self.page_padding * 2 >= min(self.page_width, self.page_height):
+            problems.append(
+                f"page_padding={self.page_padding} 过大：两倍已超过页面短边")
+        if self.desc_mode not in ("inline", "para"):
+            problems.append(
+                f"desc_mode={self.desc_mode!r} 只能是 'inline' 或 'para'")
+
+        # 联系方式图标边长必须 ≤ 联系方式文本的首行高
+        # （中层 add_para 的 icon_anchor="first_line" 契约）
+        st = self.contact_text_style
+        if st is not None:
+            first_h = st.font_size * (st.line_height_ratio or 1.2) * PT_TO_MM
+            if self.contact_icon_width > first_h + 1e-9:
+                problems.append(
+                    f"contact_icon_width={self.contact_icon_width}mm > "
+                    f"contact_text_style 首行高 {first_h:.2f}mm —— "
+                    f"中层会拒绝（icon_anchor='first_line' 要求图标 ≤ 首行高）；"
+                    f"把图标调小、或提高该样式的字号/行高系数")
+
+        # 必须有姓名（否则渲染器会拒绝，且文件名无意义）
+        if resume is not None:
+            if not resume.profile.name:
+                problems.append("resume.profile.name 为空 —— 渲染器会拒绝")
+            if not resume.sections and not resume.summary:
+                problems.append("resume 既无 sections 也无 summary —— 渲染器会拒绝")
+
+        # 图标文件不存在 -> **警告**，不是硬错误。
+        # 依据 SKILLS.md G.4/D2：缺图片是允许的降级路径（引擎渲染时留空），
+        # 把它当失败会让"新克隆的仓库（Resources/ 为空）"完全跑不起来。
+        missing = [f"{k}={p}" for k, p in self.contact_icons.items()
+                   if p and not os.path.exists(p)]
+        section_missing = []
+        if resume is not None:
+            section_missing = [sec.title or "(无标题)"
+                               for sec in resume.sections
+                               if sec.icon and not os.path.exists(sec.icon)]
+        if missing or section_missing:
+            detail = []
+            if missing:
+                detail.append(f"联系方式图标缺失 {len(missing)} 个：{missing}")
+            if section_missing:
+                detail.append(f"节标题图标缺失的节：{section_missing}")
+            warnings.append("；".join(detail) +
+                            "（按 G.4/D2，缺图片会静默降级为留空，不影响渲染）")
+        return ValidationReport(problems=problems, warnings=warnings)
+
 
 # ============================================================================
 # 3+4. 排版构建与渲染
 # ============================================================================
+
+# 联系方式图标的真值表（模块级：允许在 class body 里被 default_factory 引用）
+DEFAULT_CONTACT_ICONS: Dict[str, str] = {
+    "telephone": r".\\Resources\\telephone.png",
+    "email": r".\\Resources\\email.png",
+    "locate": r".\\Resources\\locate.png",
+    "social": r".\\Resources\\social_media.png",
+    "address": r".\\Resources\\contact_address.png",
+    "website": r".\\Resources\\website.png",
+}
+
 
 class RenderError(RuntimeError):
     """渲染前置条件不满足（数据不足、无法产出有效版面）"""
@@ -503,7 +640,7 @@ def _fill_left_column(column: LayoutObject, resume: Resume,
                         layer=1)
         _spacer(column, "Lead_Left_Name_Contacts", spacing.name_contacts)
 
-    contacts = profile.contact_rows()
+    contacts = profile.contact_rows(theme)
     for i, (icon_path, value) in enumerate(contacts):
         # ⚠️ 联系方式用 **`add_para`（图标段落）**，不是 `add_info`。
         #    原因：`add_info` 的整行高 = max(文本最小高, 图标占高)，
@@ -789,6 +926,205 @@ def render_into(pdf: FPDF,
 # 5. 自检入口
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# 5.1 内容配置 —— 一份简历"写了什么"
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContentConfig:
+    """
+    一份简历的**全部内容**，集中在一处。
+
+    与 `RenderConfig` 分工：**本类是"写什么"（内容），那个是"怎么排"（呈现）。**
+    同一个内容可以配不同呈现渲染多次；同一个呈现也可以套不同内容批量生成。
+
+    `to_resume()` 把它落成 `Resume` 数据容器 —— 之后渲染**只读**它，不改。
+    """
+    intend_company: str = ""
+    intend_job: str = ""
+    profile: Profiles = field(default_factory=Profiles)
+    skills_awards: SkillsAwards = field(default_factory=SkillsAwards)
+    sections: List[Section] = field(default_factory=list)
+    summary: str = ""
+
+    def to_resume(self) -> Resume:
+        return Resume(
+            intend_company=self.intend_company,
+            intend_job=self.intend_job,
+            profile=self.profile,
+            skills_awards=self.skills_awards,
+            sections=self.sections,
+            summary=self.summary,
+        )
+
+    def describe(self) -> str:
+        n_details = sum(len(sec.details) for sec in self.sections)
+        blocks = len(self.skills_awards.blocks())
+        return (f"姓名={self.profile.name or '（空）'}  "
+                f"章节={len(self.sections)}（详情 {n_details} 条）  "
+                f"技能块={blocks}  总结={'有' if self.summary else '无'}")
+
+
+# ---------------------------------------------------------------------------
+# 5.2 渲染配置 —— 一份简历"怎么排"
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RenderConfig:
+    """
+    把「生成一份 PDF 需要的全部可调项」集中到一处：
+
+        内容      -> ContentConfig（另一个类，见上）
+        留白疏密  -> spacing（中层 `Spacing`）
+        呈现版式  -> theme（`Theme`）
+        输出      -> output_dir / filename
+        渲染开关  -> debug / creation_date
+
+    用法：
+
+        cfg = RenderConfig()
+        problems = cfg.validate(content)          # 一次报全所有问题
+        path = cfg.render(content)                # 或 cfg.render(resume)
+
+    **与 `build_layout` 的区别**：这里是"配置对象"，那里是"构建函数"。
+    """
+    spacing: Spacing = field(default_factory=Spacing)
+    theme: Theme = field(default_factory=Theme)
+    output_dir: str = "./output"
+    filename: Optional[str] = None
+    debug: int = 0
+    creation_date: Optional[datetime] = None
+
+    # ---- 校验 ----
+
+    def validate(self, content: Union[ContentConfig, Resume]) -> ValidationReport:
+        """返回全部问题（空 = 没问题）。一次报全，不是改一个报一个。"""
+        resume = content.to_resume() if isinstance(content, ContentConfig) \
+            else content
+        return self.theme.validate(resume)
+
+    # ---- 渲染 ----
+
+    def render(self, content: Union[ContentConfig, Resume],
+               **overrides) -> str:
+        """
+        渲染。`content` 可以是 `ContentConfig` 或已经建好的 `Resume`。
+
+        `**overrides` 透传给 `render()`（如 `spacing=` / `theme=` /
+        `creation_date=`），便于在不改配置对象的前提下临时覆盖。
+        """
+        resume = content.to_resume() if isinstance(content, ContentConfig) \
+            else content
+        kw = dict(output_dir=self.output_dir,
+                  spacing=self.spacing, theme=self.theme,
+                  debug=self.debug, creation_date=self.creation_date,
+                  filename=self.filename)
+        kw.update(overrides)
+        out_dir = kw.pop("output_dir")
+        return render(resume, out_dir, **kw)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """可序列化的快照（为阶段二的外部配置文件铺路）"""
+        return {
+            "spacing": dataclasses.asdict(self.spacing),
+            "theme": {
+                "page_width": self.theme.page_width,
+                "page_height": self.theme.page_height,
+                "page_padding": self.theme.page_padding,
+                "column_ratio": list(self.theme.column_ratio),
+                "right_column_padding_left": self.theme.right_column_padding_left,
+                "summary_title": self.theme.summary_title,
+                "skills_title": self.theme.skills_title,
+                "qualifications_title": self.theme.qualifications_title,
+                "awards_title": self.theme.awards_title,
+                "summary_icon": self.theme.summary_icon,
+                "name_icon": self.theme.name_icon,
+                "brief_ratio": list(self.theme.brief_ratio),
+                "brief_height": self.theme.brief_height,
+                "desc_mode": self.theme.desc_mode,
+                "para_icon_width": self.theme.para_icon_width,
+                "para_icon_gap": self.theme.para_icon_gap,
+                "contact_icon_width": self.theme.contact_icon_width,
+                "contact_icon_gap": self.theme.contact_icon_gap,
+                "contact_left_indent": self.theme.contact_left_indent,
+                "contact_gap": self.theme.contact_gap,
+                "skills_left_indent": self.theme.skills_left_indent,
+                "contact_icons": dict(self.theme.contact_icons),
+            },
+            "output_dir": self.output_dir,
+            "filename": self.filename,
+            "debug": self.debug,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 5.3 默认内容 —— 覆盖全部字段的一份样例
+# ---------------------------------------------------------------------------
+
+def default_content() -> ContentConfig:
+    """
+    默认内容：**故意把 Profiles / SkillsAwards / Section / Details 的每个字段都填上**，
+    这样"生成一份简历需要什么"在源码里一目了然，也顺带覆盖渲染路径。
+    """
+    me = Profiles(
+        photo=r".\Resources\woman_student.png",
+        name="利姆露",
+        telephone="138-0000-0000",
+        email="limuru@example.com",
+        locate="中央都市",
+        social_media_qq="1145141919",
+        social_media_wechat="limuru_wx",
+        contact_address="中央都市魔王大道 1 号",
+        title="后端开发工程师",
+        website="github.com/limuru",
+        summary="",
+    )
+
+    edu = Section(title="教育背景",
+                  icon=r".\Resources\icon_Education_History.png")
+    edu.add_detail(Details(
+        key="日本农业苞谷大学",
+        during_time="2020.09 - 2024.06",
+        tags="金坷垃制造与苞米发酵工程 | 本科",
+        description="主修课程：数据结构与算法、操作系统、计算机网络、数据库原理、软件工程。\n"
+                    "毕业论文：基于深度学习的图像分类算法研究。\n"
+                    "连续三年获得专业奖学金，GPA 3.8/4.0。"))
+    edu.add_detail(Details(
+        key="交换生项目",
+        during_time="2022.09 - 2023.01",
+        tags="海外交流",
+        description="赴某大学交换一学期，主修分布式系统与编译原理。"))
+
+    proj = Section(title="项目经历",
+                   icon=r".\Resources\icon_Project_History.png")
+    proj.add_detail(Details(
+        key="基于 PDF 的简历自动生成系统",
+        during_time="2025.03 - 2025.06",
+        tags="Python, FPDF, 排版引擎",
+        description="设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n"
+                    "系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能。\n"
+                    "实现了简历元件的模块化管理，支持快速生成针对不同岗位的定制化简历。"))
+    proj.add_detail(Details(
+        key="数据可视化看板",
+        during_time="2024.09 - 2024.12",
+        tags="Vue.js, ECharts, Flask",
+        description="为某电商公司开发实时数据监控看板，展示销售、流量、转化等核心指标。\n"
+                    "使用 WebSocket 实现实时更新，日活用户 200+。"))
+
+    return ContentConfig(
+        intend_company="腾讯科技",
+        intend_job="后端开发工程师",
+        profile=me,
+        skills_awards=SkillsAwards(
+            skills=["Python / Java / Go", "FPDF 排版引擎", "Vue.js / Flask"],
+            qualifications=["CET-6", "软件设计师"],
+            awards=["校级一等奖学金", "ACM 校赛二等奖"],
+        ),
+        sections=[edu, proj],
+        summary="五年全栈开发经验，关注排版可维护性与工程质量。",
+    )
+
+
 def _sample(seed: str = "甲") -> Resume:
     """构造一份覆盖全部字段的样例简历（自检与文档示例共用）"""
     me = Profiles(
@@ -848,6 +1184,89 @@ def _snapshot(resume: Resume) -> dict:
     return obj(resume)
 
 
+def main() -> int:
+    """
+    顶层整合入口：**一份简历从配置到产物，全在这里**。
+
+    结构：
+
+        5.1 ContentConfig   写什么（内容）
+        5.2 RenderConfig    怎么排（留白 + 版式 + 输出）
+        5.3 default_content 覆盖全部字段的默认内容
+        5.4 本函数          校验 -> 渲染 -> 验收断言
+
+    跑法：`py ResumeCore.py`
+    """
+    import contextlib
+    import io
+
+    print("=" * 66)
+    print("ResumeCore 顶层整合入口")
+    print("=" * 66)
+
+    # ---- 1. 配置：内容 + 呈现 ----
+    content = default_content()
+    cfg = RenderConfig()
+    print(f"\n【1. 内容】{content.describe()}")
+    print(f"【2. 留白】{cfg.spacing.describe()}")
+    print(f"【3. 版式】{cfg.theme.page_width:.0f}×{cfg.theme.page_height:.0f}mm  "
+          f"分栏比 {list(cfg.theme.column_ratio)}  "
+          f"描述体 {cfg.theme.desc_mode}  "
+          f"联系方式图标 {cfg.theme.contact_icon_width}mm/缩进 "
+          f"{cfg.theme.contact_left_indent}mm/行距 {cfg.theme.contact_gap}mm")
+
+    # ---- 2. 校验：一次报全所有问题；**警告不阻断** ----
+    report = cfg.validate(content)
+    if not report.ok:
+        print(f"\n【4. 校验】❌ 发现 {len(report.problems)} 个硬错误：")
+        for p in report.problems:
+            print(f"    - {p}")
+        return 1
+    print(f"\n【4. 校验】✅ 配置无冲突"
+          f"{f'（{len(report.warnings)} 条警告）' if report.warnings else ''}")
+    for w in report.warnings:
+        print(f"    ⚠️  {w}")
+
+    # ---- 3. 渲染 ----
+    resume = content.to_resume()
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = cfg.render(resume)
+    size = os.path.getsize(path)
+    print(f"【5. 渲染】✅ {path}  ({size} 字节)")
+
+    # ---- 4. 渲染不修改数据（整合路径也要守）----
+    check_resume = content.to_resume()
+    before = _snapshot(check_resume)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg.render(check_resume, output_dir=os.path.join(
+            os.path.dirname(path), "again"))
+    after = _snapshot(check_resume)
+    same = before == after
+    print(f"【6. 幂等】{'✅' if same else '❌'} 渲染未修改内容容器")
+
+    # ---- 5. 同一内容 × 不同留白：批量能力的演示 ----
+    print("\n【7. 同一内容 × 三种留白】")
+    for label, sp in (("compact", Spacing.compact()),
+                      ("默认", Spacing()),
+                      ("loose", Spacing.loose())):
+        sub = os.path.join(os.path.dirname(path), f"spacing_{label}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            p2 = cfg.render(content, output_dir=sub, spacing=sp)
+        print(f"    {label:<9} {os.path.getsize(p2):>7} 字节  {p2}")
+
+    print("\n【8. 配置快照（为阶段二的外部配置文件铺路）】")
+    snap = cfg.to_dict()
+    print(f"    留白 {len(snap['spacing'])} 项 / 版式 {len(snap['theme'])} 项")
+
+    print("\n" + "=" * 66)
+    if not same:
+        print("❌ 整合路径有问题（渲染修改了内容）")
+        return 1
+    print("✅ 整合入口通过；下面继续跑验收断言 V1–V10")
+    print("=" * 66)
+    return _selftest()
+
+
 def _selftest() -> int:
     """顶层验收自检（返回进程退出码）"""
     import contextlib
@@ -856,9 +1275,13 @@ def _selftest() -> int:
     import tempfile
     import dataclasses
 
-    
-    #out_root = os.path.join(tempfile.gettempdir(), "_resumecore_selftest")
-    out_root = os.path.join("./output", "_resumecore_selftest")
+    # 自检产物目录。默认写到工作区的 ./output/_resumecore_selftest/，
+    # 便于直接翻看每个断言的产物。
+    # 想不污染工作区就设环境变量：DSH_RESUME_SELFTEST_TMP=1
+    if os.environ.get("DSH_RESUME_SELFTEST_TMP") == "1":
+        out_root = os.path.join(tempfile.gettempdir(), "_resumecore_selftest")
+    else:
+        out_root = os.path.join("./output", "_resumecore_selftest")
 
     os.makedirs(out_root, exist_ok=True)
     ok = True
@@ -1126,4 +1549,4 @@ def _selftest() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(_selftest())
+    raise SystemExit(main())

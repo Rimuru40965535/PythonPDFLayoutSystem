@@ -2966,14 +2966,35 @@ box._height = content_h
    > 标准见 `SKILLS.md` 的 G.4（D1–D3）。
 4. 三个入口都会在 stdout 打印大量渲染日志（7.13），建议重定向到文件再读尾部。
 5. **产物已被 `.gitignore` 忽略**（`*.pdf` 规则），由代码可复现，不入库。
-6. 顶层自检**不写工作区产物**（用系统临时目录），`demo_top_layer.py` 才写 `output_demo/`。
+6. **产物目录**：
+   - 顶层自检默认写 `./output/_resumecore_selftest/`（便于直接翻看每个断言的产物）；
+   - `py ResumeCore.py` 的整合入口（第 1 段）写 `./output/` 与 `./output/spacing_*/`；
+   - `demo_top_layer.py` 写 `output_demo/`。
 
-### 9.3 `DSH_RESUME_SMOKE=1`（跳自检开关）
+### 9.3 环境变量
 
-两个入口都支持该环境变量：只跑"能否生成"，跳过全部自检断言。
+| 变量 | 取值 | 作用 |
+| --- | --- | --- |
+| `DSH_RESUME_SMOKE` | `1` | 两个入口都支持：只跑"能否生成"，**跳过全部自检断言**。用于 `check_degradation.py` 在"缺字体"这种**必然失败**的环境下尽快拿到第一条真实错误，而不是跑完 60+ 条连锁失败的断言 |
+| `DSH_RESUME_SELFTEST_TMP` | `1` | 顶层自检产物改写到系统临时目录，**不污染工作区**。默认写 `./output/_resumecore_selftest/` |
 
-用途：`check_degradation.py` 要在"缺字体"这种**必然失败**的环境下尽快拿到第一条真实错误，
-而不是跑完 60+ 条连锁失败的断言。默认关闭，不影响正常自检。
+两者默认关闭，不影响正常自检。
+
+### 9.4 配置校验：硬错误 vs 警告
+
+`Theme.validate(resume)` 返回 `ValidationReport`，**刻意区分两类结果**：
+
+| 类别 | 含义 | 调用方应如何对待 |
+| --- | --- | --- |
+| `problems`（硬错误） | 配置本身不成立，渲染必然失败或明显错误 | 视作失败 |
+| `warnings`（警告） | 能跑，但结果可能不是你要的 | **不阻断** |
+
+典型警告是**引用的图片不存在** —— 依据 G.4/D2，缺图片是**允许的**降级路径
+（引擎渲染时该位置留空）。把它当硬失败会让"新克隆的仓库（`Resources/` 为空）"
+完全跑不起来 —— 这个错误在本轮真的犯过一次，被 `check_degradation.py` 的 D2 抓到。
+
+`ValidationReport` 兼容旧的列表用法（`len(report)`、`for p in report` 都只遍历硬错误），
+另有 `ok` / `format()`。
 
 ## 10. 附录：模块常量速查
 

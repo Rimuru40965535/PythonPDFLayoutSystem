@@ -45,14 +45,20 @@
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
 
+from fpdf import FPDF
+
 from LayoutEngine import (
     # 构件
     LayoutObject,
     TextObject,
     ImageObject,
     RectangleObject,
-    # 样式
+    # 样式与文本片段
     Style,
+    TextRun,
+    parse_inline_markdown,
+    measure_text,
+    PT_TO_MM,
     # 枚举与常量
     AlignX,
     AlignY,
@@ -105,6 +111,142 @@ def skills_row_height(style: Optional[Style] = None) -> float:
     """技能/证书/荣誉行默认高度。默认取字号的一半（与历史行为一致）。"""
     st = STYLES["skillsawards_title"] if style is None else style
     return st.font_size * 0.5
+
+
+# ============================================================================
+# 1b. 共享测量实例
+# ============================================================================
+# "高度由内容决定"必须先知道"文本按可用宽折几行"，而这需要 pdf 实例。
+#
+# ⚠️ **不要每次测量都新建 FPDF**。实测代价（30 次测量）：
+#       复用同一实例  ：    23.56 ms
+#       每次新建实例  ：30 559.00 ms（注册字体 345 ms/次），净增内存 2.5 GB
+#   而且未注册字体的实例**测不了中文** —— fpdf 会抛
+#   `FPDFUnicodeEncodingException`（内置 helvetica 不支持 CJK），
+#   `measure_text` 内部不捕获该异常（`font_context` 的优雅降级只处理"变体缺失"）。
+#
+# 因此这里维护**一个惰性创建的共享测量实例**：只建一次，用于量字宽与折行，
+# **从不 output()**。遍历深度与它无关 —— 任何层级的模板都用同一个。
+#
+# 注：这确实是一处模块级可变状态（与引擎的 layer_manager / objectRegister 同类，
+#     见 TECHNICAL.md 7.14 / SKILLS.md D4）。为便于测试与确定性复现，提供
+#     `reset_measure_pdf()`。
+
+_MEASURE_PDF: Optional[FPDF] = None
+_MEASURE_FONTS_LOADED: bool = False
+
+# 测量实例用的小页面：只需能承载字体与 get_string_width，尺寸无关
+_MEASURE_PAGE = (50.0, 50.0)
+
+
+def reset_measure_pdf() -> None:
+    """丢弃共享测量实例（下次调用会重建）。供测试与"同进程多份文档"场景使用。"""
+    global _MEASURE_PDF, _MEASURE_FONTS_LOADED
+    _MEASURE_PDF = None
+    _MEASURE_FONTS_LOADED = False
+
+
+def _register_measure_fonts(pdf: FPDF) -> bool:
+    """
+    在测量实例上注册正文字体。返回是否注册成功。
+
+    失败时**明确告知**（静默降级是本项目的既有教训）：
+    缺字体时中文测量会抛异常、英文会得到错误字宽。
+    """
+    global _MEASURE_FONTS_LOADED
+    try:
+        pdf.add_font("LXGW", "", ".\\Resources\\LXGWWenkai-Regular.ttf")
+        pdf.add_font("LXGW", "B", ".\\Resources\\LXGWWenkai-Bold.ttf")
+        _MEASURE_FONTS_LOADED = True
+        return True
+    except Exception as exc:
+        _MEASURE_FONTS_LOADED = False
+        print(f"  >>>⚠ 测量用字体注册失败（{exc}）。")
+        print(f"       中文文本的高度测量将不可用 —— 请确认 "
+              f"Resources/LXGWWenkai-Regular.ttf 存在。")
+        return False
+
+
+def measure_pdf() -> FPDF:
+    """
+    取得共享的测量用 FPDF 实例（惰性创建，只建一次）。
+
+    该实例**只用于测量**，从不渲染、从不 output()。
+    """
+    global _MEASURE_PDF
+    if _MEASURE_PDF is None:
+        pdf = FPDF()
+        pdf.add_page()
+        _register_measure_fonts(pdf)
+        _MEASURE_PDF = pdf
+    return _MEASURE_PDF
+
+
+def _build_runs(text: str, style: Style) -> List[TextRun]:
+    """
+    按 Style 构造测量用的 TextRun 列表。
+
+    与 `TextObject(text=...)` 的行为一致：经内联 Markdown 解析，
+    因此 `**加粗**` 之类的标记会改变测得的字宽与行数。
+    """
+    base = TextRun.from_style("", style)
+    return parse_inline_markdown(text, base) if text else [base]
+
+
+def wrapped_height(text: str,
+                   style: Style,
+                   available_width: float,
+                   line_height_ratio: float = 1.2,
+                   pdf: Optional[FPDF] = None) -> float:
+    """
+    文本在给定可用宽度下折行后的**实际高度（mm）**。
+
+    这是"高度由内容决定"的基础工具：先量宽、再定高。
+
+    Args:
+        text: 文本内容（支持 \\n 硬换行与内联 Markdown）
+        style: 样式（字号/字体/粗斜体参与测量）
+        available_width: 文本可用宽度 (mm)。0 或负数表示不折行（量单行）
+        line_height_ratio: 行高系数，与引擎默认一致
+        pdf: 测量实例。None 表示用共享实例
+
+    Returns:
+        折行后的实际高度 (mm)，已换算到引擎的长度单位
+
+    Raises:
+        RuntimeError: 文本含 CJK 而测量实例没有可用字体（无法给出正确字宽）
+    """
+    engine_pdf = pdf if pdf is not None else measure_pdf()
+    runs = _build_runs(text, style)
+    if not any(r.text for r in runs):
+        return 0.0
+    try:
+        m = measure_text(engine_pdf, runs,
+                         available_width=max(available_width, 0.0),
+                         line_height_ratio=line_height_ratio)
+    except Exception as exc:
+        raise RuntimeError(
+            f"文本测量失败（{type(exc).__name__}: {exc}）。"
+            f"若文本含中文，请确认 Resources/LXGWWenkai-Regular.ttf 已就位 —— "
+            f"未注册字体时 fpdf 无法为 CJK 计算字宽。"
+        ) from exc
+    return m.total_height * PT_TO_MM
+
+
+def wrapped_lines(text: str,
+                  style: Style,
+                  available_width: float,
+                  line_height_ratio: float = 1.2,
+                  pdf: Optional[FPDF] = None) -> int:
+    """文本在给定可用宽度下折成的行数。参数语义同 wrapped_height。"""
+    engine_pdf = pdf if pdf is not None else measure_pdf()
+    runs = _build_runs(text, style)
+    if not any(r.text for r in runs):
+        return 0
+    m = measure_text(engine_pdf, runs,
+                     available_width=max(available_width, 0.0),
+                     line_height_ratio=line_height_ratio)
+    return m.line_count
 
 
 # ============================================================================
@@ -233,16 +375,33 @@ STYLES = {
 
 
 @dataclass
-class BasicHandle:
-    """基础模板（左右分栏）句柄"""
-    node: LayoutObject        # 分栏容器
-    left: LayoutObject        # 左栏（RectangleObject）
-    right: LayoutObject       # 右栏
+class SplitHandle:
+    """
+    纵向分栏子模板句柄。
+
+    `cells` 是按顺序排列的各栏。左右两栏是它的特例（cell 数 = 2），
+    为便于阅读保留了 `left` / `right` 两个便捷属性。
+    """
+    node: LayoutObject              # 分栏容器
+    cells: List[LayoutObject]       # 各栏，按从左到右排列
 
     @property
     def content(self) -> LayoutObject:
-        """兼容别名：旧 API 的返回值（content 对象）。"""
         return self.node
+
+    @property
+    def left(self) -> LayoutObject:
+        return self.cells[0]
+
+    @property
+    def right(self) -> LayoutObject:
+        return self.cells[-1]
+
+    def __len__(self) -> int:
+        return len(self.cells)
+
+    def __getitem__(self, i):
+        return self.cells[i]
 
 
 @dataclass
@@ -305,37 +464,107 @@ class TitleHandle:
 
 
 @dataclass
-class DetailsHandle:
-    """节详情模板（关键词 / 时间 / 标签 / 描述）句柄"""
+class DetailHeadHandle:
+    """详情·标题三栏子模板句柄（关键词 / 时间 / 标签）"""
     node: LayoutObject
-    brief: LayoutObject
+    band: LayoutObject
     col_key: LayoutObject
     col_time: LayoutObject
     col_tags: LayoutObject
     key: TextObject
     during_time: TextObject
     tags: TextObject
-    details: LayoutObject
+
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    def fill(self, key: str = "", during_time: str = "",
+             tags: str = "") -> 'DetailHeadHandle':
+        self.key.set_text(key)
+        self.during_time.set_text(during_time)
+        self.tags.set_text(tags)
+        return self
+
+
+@dataclass
+class DetailBodyHandle:
+    """详情·描述子模板句柄"""
+    node: LayoutObject
     description: TextObject
 
     @property
     def content(self) -> LayoutObject:
         return self.node
 
+    def fill(self, description: str = "",
+             description_height: Optional[float] = None) -> 'DetailBodyHandle':
+        """
+        就地填充描述。
+
+        description_height 为 None（默认）时由内容自动结算
+        （`SizeY.CONTENT` + 引擎真实文本测量）；给值则退回固定高度模式。
+        """
+        self.description.set_text(description)
+        set_content_height(self.description, description_height)
+        return self
+
+
+@dataclass
+class DetailsHandle:
+    """节详情模板句柄（标题三栏 + 描述），由 head / body 两个子句柄组成"""
+    node: LayoutObject
+    head: DetailHeadHandle
+    body: DetailBodyHandle
+
+    # ---- 便捷转发：保持旧的属性访问方式可用 ----
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    @property
+    def brief(self) -> LayoutObject:
+        return self.head.node
+
+    @property
+    def col_key(self) -> LayoutObject:
+        return self.head.col_key
+
+    @property
+    def col_time(self) -> LayoutObject:
+        return self.head.col_time
+
+    @property
+    def col_tags(self) -> LayoutObject:
+        return self.head.col_tags
+
+    @property
+    def key(self) -> TextObject:
+        return self.head.key
+
+    @property
+    def during_time(self) -> TextObject:
+        return self.head.during_time
+
+    @property
+    def tags(self) -> TextObject:
+        return self.head.tags
+
+    @property
+    def details(self) -> LayoutObject:
+        return self.body.node
+
+    @property
+    def description(self) -> TextObject:
+        return self.body.description
+
     def fill(self, key: str = "", during_time: str = "", tags: str = "",
              description: str = "",
              description_height: Optional[float] = None) -> 'DetailsHandle':
-        """
-        就地填充四段文字。
-
-        description_height 为 None（默认）时，描述高度由内容自动结算
-        （`SizeY.CONTENT` + 引擎真实文本测量）。给值则退回固定高度模式。
-        """
-        self.key.set_text(key)
-        self.during_time.set_text(during_time)
-        self.tags.set_text(tags)
-        self.description.set_text(description)
-        set_content_height(self.description, description_height)
+        """就地填充四段文字（转发给 head 与 body）。"""
+        self.head.fill(key=key, during_time=during_time, tags=tags)
+        self.body.fill(description=description,
+                       description_height=description_height)
         return self
 
     def apply(self, data: Any) -> 'DetailsHandle':
@@ -450,18 +679,117 @@ def _resolve_ratio(ratio: Optional[Sequence[float]],
 # 因此调用形式是 `节点.add_xxx(...)`，而不是 `add_xxx(节点, ...)`。
 
 
-def add_basic(self: LayoutObject,
+def add_split(self: LayoutObject,
               ratio: Optional[Sequence[float]] = None,
-              left_padding: Optional[Padding] = None,
-              right_padding: Optional[Padding] = None,
-              layer: int = 0) -> BasicHandle:
+              widths: Optional[Sequence[float]] = None,
+              colors: Optional[Sequence[Optional[Color]]] = None,
+              paddings: Optional[Sequence[Optional[Padding]]] = None,
+              insets: Optional[Sequence[float]] = None,
+              layer: int = 0) -> SplitHandle:
     """
-    生成基础模板 —— 左右分栏。同一份简历中只应调用一次。
+    纵向分栏子模板 —— 把挂载点的内容区横向切成 N 栏。
 
     结构：
         self
         └─ {self.name}_split_container
-             ├─ {self.name}_left_column   : RectangleObject（底色）
+             ├─ {self.name}_cell_0   （给了 colors[0] 就是 RectangleObject，否则 LayoutObject）
+             ├─ {self.name}_cell_1
+             └─ ...
+
+    宽度分配（三选一，优先级从高到低）：
+        widths   —— 直接指定各栏宽度 (mm)，总和超出则等比缩小
+        ratio    —— 按比例分配（默认 [1.0, 2.5]，即左右两栏）
+        colors   —— 都不给时按 N 等宽
+
+    Args:
+        ratio: 各栏比例。与 widths 互斥
+        widths: 各栏宽度 (mm)。与 ratio 互斥
+        colors: 各栏填充色。某栏给 None 则该栏是透明容器（LayoutObject），
+                给了颜色则是实心色块（RectangleObject）
+        paddings: 各栏内边距
+        insets: 各栏左缩进 (mm)。实现为"整栏右移 + 宽度同步收窄"，
+                等价于在栏内左侧留白且不侵占右侧
+        layer: 图层索引
+
+    Returns:
+        SplitHandle —— cells[0] 是最左栏；len(handle) 即栏数
+    """
+    if ratio is not None and widths is not None:
+        raise ValueError("add_split: ratio 与 widths 互斥，只能给一个")
+
+    _, _, content_w, content_h = self.get_content_area()
+    if content_w <= 0:
+        raise ValueError(f"add_split: 挂载点 '{self.name}' 没有可用宽度，无法分栏")
+
+    # ---- 决定栏数与各栏宽度 ----
+    if widths is not None:
+        widths = [float(w) for w in widths]
+        n = len(widths)
+        if n == 0:
+            raise ValueError("add_split: widths 不能为空")
+        total = sum(widths)
+        if total > content_w and total > 0:
+            k = content_w / total
+            widths = [w * k for w in widths]
+    else:
+        ratio = _resolve_ratio(ratio, DEFAULT_RATIO)
+        n = len(ratio)
+        total = sum(ratio)
+        widths = [content_w * r / total for r in ratio]
+
+    colors = list(colors) if colors is not None else [None] * n
+    paddings = list(paddings) if paddings is not None else [None] * n
+    insets = list(insets) if insets is not None else [0.0] * n
+    for name, seq in (("colors", colors), ("paddings", paddings), ("insets", insets)):
+        if len(seq) != n:
+            raise ValueError(f"add_split: {name} 长度必须等于栏数 {n}")
+
+    # ---- 造各栏 ----
+    cells: List[LayoutObject] = []
+    for i in range(n):
+        pad = paddings[i]
+        inset = float(insets[i] or 0.0)
+        # 缩进做成内边距：栏内容区本身收窄，子元素不会溢出
+        pad = Padding.all(0) if pad is None else pad
+        if inset:
+            pad = Padding(left=pad.left + inset, top=pad.top,
+                          right=pad.right, bottom=pad.bottom)
+        cls = RectangleObject if colors[i] is not None else LayoutObject
+        cell = cls(
+            name=f"{self.name}_cell_{i}",
+            x=0, y=0, width=widths[i], height=0,
+            color=colors[i] if colors[i] is not None else White,
+            padding=pad,
+            align_x=AlignX.NONE,
+            align_y=AlignY.NONE,
+            layer=layer,
+        )
+        cells.append(cell)
+
+    band = create_band(
+        parent=self,
+        cells=cells,
+        gap=0,
+        padding=Padding.all(0),
+        height=content_h,
+        layer=layer,
+        container_name=f"{self.name}_split_container",
+    )
+    return SplitHandle(node=band, cells=cells)
+
+
+def add_basic(self: LayoutObject,
+              ratio: Optional[Sequence[float]] = None,
+              left_padding: Optional[Padding] = None,
+              right_padding: Optional[Padding] = None,
+              layer: int = 0) -> SplitHandle:
+    """
+    基础模板 —— 左右分栏（`add_split` 的双栏预设）。
+
+    结构：
+        self
+        └─ {self.name}_split_container
+             ├─ {self.name}_left_column   : RectangleObject（底色 = STYLES["left_column"]）
              └─ {self.name}_right_column  : LayoutObject
 
     Args:
@@ -471,8 +799,12 @@ def add_basic(self: LayoutObject,
         layer: 图层索引
 
     Returns:
-        BasicHandle —— 直接给 left / right，不必再按名字查找。
+        SplitHandle —— left / right 是 cells 的便捷访问。
     """
+    _, _, content_w, content_h = self.get_content_area()
+    if content_w <= 0:
+        raise ValueError(f"add_basic: 挂载点 '{self.name}' 没有可用宽度，无法分栏")
+
     ratio = _resolve_ratio(ratio, DEFAULT_RATIO)
     left_padding = Padding.all(0) if left_padding is None else left_padding
     right_padding = Padding.left(5) if right_padding is None else right_padding
@@ -496,12 +828,7 @@ def add_basic(self: LayoutObject,
         layer=layer,
     )
 
-    _, _, content_w, content_h = self.get_content_area()
-    if content_w <= 0:
-        raise ValueError(f"add_basic: 挂载点 '{self.name}' 没有可用宽度，无法分栏")
-
     # 宽度按比例定死，再作为"已构造格子"交给 create_band 排放。
-    # （split_column_advanced 返回 parent，这里需要带容器本身，故直接用 create_band。）
     total = sum(ratio)
     left_column.width = content_w * ratio[0] / total
     right_column.width = content_w * ratio[1] / total
@@ -515,48 +842,68 @@ def add_basic(self: LayoutObject,
         layer=layer,
         container_name=f"{self.name}_split_container",
     )
-    return BasicHandle(node=band, left=left_column, right=right_column)
+    return SplitHandle(node=band, cells=[left_column, right_column])
 
 
-def add_profile(self: LayoutObject,
-                index: int = 0,
-                icon_style: Optional[Style] = None,
-                text_style: Optional[Style] = None,
-                icon_width: float = DEFAULT_ICON_WIDTH,
-                gap: float = 0,
-                content_height: Optional[float] = None,
-                row_inset: float = DEFAULT_ROW_INSET,
-                layer: int = 0) -> ProfileHandle:
+def add_info(self: LayoutObject,
+             index: int = 0,
+             variant: str = "contact",
+             text: str = "",
+             image_path: str = "",
+             icon_style: Optional[Style] = None,
+             text_style: Optional[Style] = None,
+             icon_width: Optional[float] = None,
+             gap: float = 0,
+             content_height: Optional[float] = None,
+             row_inset: float = DEFAULT_ROW_INSET,
+             layer: int = 0) -> ProfileHandle:
     """
-    生成个人信息模板（图标 + 文本），一行两格。
+    个人信息行子模板（图标 + 文本），一行两格。
+
+    **一套模板覆盖姓名行与基础信息行** —— 两者形状完全一致，差别只是默认样式：
+    用 `variant` 选择预设，任何一项都能用显式参数覆盖。
 
     结构：
         self
-        └─ {self.name}_profile_{index}_content : LayoutObject（FLOW）
+        └─ {self.name}_info_{index}_content : LayoutObject（FLOW）
              └─ ..._split : LayoutObject（横带，左侧缩进）
                   ├─ ..._icon_range → ..._icon : ImageObject
                   └─ ..._text_range → ..._text : TextObject
 
     Args:
         index: 实例索引（同一挂载点上多个实例必须互不相同）
-        icon_style: 图标样式，默认 STYLES["name_image"]
-        text_style: 文本样式，默认 STYLES["profile_text"]
-        icon_width: 左格宽度 (mm)
+        variant: 预设。`"name"` 用姓名的字号与图标尺寸；`"contact"` 用基础信息的
+        text: 文本内容。非空则在返回前直接填入（等价于再调一次 `.fill()`）
+        image_path: 图标路径。非空则直接填入
+        icon_style: 图标样式。None 时按 variant 取
+        text_style: 文本样式。None 时按 variant 取（显式给值优先于 variant）
+        icon_width: 左格宽 (mm)。None 时按 variant 取
         gap: 两格间距 (mm)
-        content_height: 整行高度。None 表示按 text_style 字号推算
-        row_inset: 行左侧缩进 (mm)，等价于旧版 split 容器的左内边距；
-                   横带宽度会同步收窄，避免右侧溢出
+        content_height: 整行高度。None 表示按"文本最小高 / 图标占高"推算
+        row_inset: 行左侧缩进 (mm)，横带宽度同步收窄
         layer: 图层索引
 
     Returns:
         ProfileHandle
     """
+    if variant not in ("name", "contact"):
+        raise ValueError(f"add_info: variant 只能是 'name' 或 'contact'，收到 {variant!r}")
+    if variant == "name":
+        default_text_style = STYLES["name_text"]
+        default_icon_width = DEFAULT_ICON_WIDTH + 2.0      # 姓名行图标用 6mm
+    else:
+        default_text_style = STYLES["profile_text"]
+        default_icon_width = DEFAULT_ICON_WIDTH
+
+    # 显式参数优先于 variant 预设
+    text_style = default_text_style if text_style is None else text_style
+    if icon_width is None:
+        icon_width = default_icon_width
     icon_style = STYLES["name_image"] if icon_style is None else icon_style
-    text_style = STYLES["profile_text"] if text_style is None else text_style
     if content_height is None:
         content_height = profile_content_height(text_style, icon_width)
 
-    prefix = f"{self.name}_profile_{index}"
+    prefix = f"{self.name}_info_{index}"
 
     content = LayoutObject(
         name=f"{prefix}_content",
@@ -580,7 +927,7 @@ def add_profile(self: LayoutObject,
         align_y=AlignY.VCENTER,
         layer=layer + 1,
     )
-    text = TextObject.from_style(
+    text_obj = TextObject.from_style(
         f"{prefix}_text", text_style,
         text="",                   # 由 fill() 填充
         width=0, height=0,
@@ -622,20 +969,25 @@ def add_profile(self: LayoutObject,
 
     icon_range, text_range = band.children[0], band.children[1]
     icon_range.add_child(icon)
-    text_range.add_child(text)
+    text_range.add_child(text_obj)
 
-    return ProfileHandle(
+    handle = ProfileHandle(
         node=content, split=band,
         icon_range=icon_range, icon=icon,
-        text_range=text_range, text=text,
+        text_range=text_range, text=text_obj,
     )
+    # text / image_path 非空时直接填入，省掉调用方再写一次 .fill(...)
+    if text or image_path:
+        handle.fill(text=text, image_path=image_path)
+    return handle
 
 
-def add_profile_photo(self: LayoutObject,
-                      index: int = 0,
-                      icon_style: Optional[Style] = None,
-                      photo_width: float = DEFAULT_PHOTO_WIDTH,
-                      layer: int = 0) -> PhotoHandle:
+def add_photo(self: LayoutObject,
+              index: int = 0,
+              icon_style: Optional[Style] = None,
+              photo_width: float = DEFAULT_PHOTO_WIDTH,
+              image_path: str = "",
+              layer: int = 0) -> PhotoHandle:
     """
     生成证件照模板。
 
@@ -679,17 +1031,22 @@ def add_profile_photo(self: LayoutObject,
     # 直接挂到 content 下（旧版构造时传 parent=self，与真实父元素不一致，易误导）
     content.add_child(photo)
 
-    return PhotoHandle(node=content, photo=photo)
+    handle = PhotoHandle(node=content, photo=photo)
+    if image_path:
+        handle.fill(image_path)
+    return handle
 
 
-def add_section_title(self: LayoutObject,
-                      index: int = 0,
-                      icon_style: Optional[Style] = None,
-                      text_style: Optional[Style] = None,
-                      icon_width: float = DEFAULT_TITLE_ICON_WIDTH,
-                      gap: float = 0,
-                      height: float = DEFAULT_TITLE_HEIGHT,
-                      layer: int = 0) -> TitleHandle:
+def add_section_heading(self: LayoutObject,
+                        index: int = 0,
+                        icon_style: Optional[Style] = None,
+                        text_style: Optional[Style] = None,
+                        icon_width: float = DEFAULT_TITLE_ICON_WIDTH,
+                        gap: float = 0,
+                        height: float = DEFAULT_TITLE_HEIGHT,
+                        title: str = "",
+                        image_path: str = "",
+                        layer: int = 0) -> TitleHandle:
     """
     生成节标题模板（图标 + 标题 + 下方分隔线）。
 
@@ -778,98 +1135,72 @@ def add_section_title(self: LayoutObject,
     )
     content.add_child(divider)
 
-    return TitleHandle(
+    handle = TitleHandle(
         node=content, split=band,
         icon_range=icon_range, icon=icon,
         text_range=text_range, text=text,
         divider=divider,
     )
+    if title or image_path:
+        handle.fill(title=title, image_path=image_path)
+    return handle
 
 
-def add_details(self: LayoutObject,
-                index: int = 0,
-                name_key: Optional[str] = None,
-                key_style: Optional[Style] = None,
-                time_style: Optional[Style] = None,
-                tags_style: Optional[Style] = None,
-                desc_style: Optional[Style] = None,
-                brief_ratio: Optional[Sequence[float]] = None,
-                brief_height: float = DEFAULT_BRIEF_HEIGHT,
-                description_height: Optional[float] = None,
-                key: str = "",
-                during_time: str = "",
-                tags: str = "",
-                description: str = "",
-                layer: int = 0) -> DetailsHandle:
+def add_detail_head(self: LayoutObject,
+                    prefix: str,
+                    key: str = "",
+                    during_time: str = "",
+                    tags: str = "",
+                    key_style: Optional[Style] = None,
+                    time_style: Optional[Style] = None,
+                    tags_style: Optional[Style] = None,
+                    ratio: Optional[Sequence[float]] = None,
+                    height: float = DEFAULT_BRIEF_HEIGHT,
+                    layer: int = 0) -> DetailHeadHandle:
     """
-    生成一条节详情（关键词 / 时间 / 标签 / 描述）。
+    详情·标题三栏子模板（关键词 / 时间 / 标签）。
 
     结构：
-        self
-        └─ {self.name}_section_details_{index}_content
-             ├─ ..._brief（三栏 2:1:2，高 brief_height）
-             │    ├─ ..._brief_col_0 → ..._key          : TextObject(LEFT/VCENTER)
-             │    ├─ ..._brief_col_1 → ..._during_time  : TextObject(CENTER/VCENTER)
-             │    └─ ..._brief_col_2 → ..._tags         : TextObject(RIGHT/VCENTER)
-             └─ ..._details
-                  └─ ..._description : TextObject(multi_line，高度自动)
-
-    描述高度不再硬编码 50，也不再由填充函数回写 `_height`：
-    `SizeY.CONTENT` 让引擎按真实行数结算（批次 5 的真实测量）。
-
-    传入 key / during_time / tags / description 即在本函数内完成填充。
+        {prefix}_brief（高 height，FLOW）
+        └─ {prefix}_brief_band : 三栏，宽按 ratio
+             ├─ {prefix}_brief_col_0 → {prefix}_key          : LEFT/VCENTER
+             ├─ {prefix}_brief_col_1 → {prefix}_during_time  : CENTER/VCENTER
+             └─ {prefix}_brief_col_2 → {prefix}_tags         : RIGHT/VCENTER
 
     Args:
-        index: 编号，出现在节点名中
-        name_key: 命名键。给定时取代 index 参与命名，用于让**跨节**的详情
-                  互不同名（如 `"{节号}_{节内序号}"`）。一个挂载点下若按
-                  相同的 index 建了多个实例，它们会同名并互相覆盖注册表条目。
+        prefix: 命名前缀（由 `add_detail` 统一给出，保证详情内命名一致）
+        key / during_time / tags: 三栏文字，构造时直接填入
+        key_style / time_style / tags_style: 三栏样式
+        ratio: 三栏宽度比例，必须恰好 3 个元素，默认 [2, 1, 2]
+        height: 三栏高度 (mm)
 
     Returns:
-        DetailsHandle
+        DetailHeadHandle
     """
     key_style = STYLES["detail_key_1"] if key_style is None else key_style
     time_style = STYLES["detail_time_1"] if time_style is None else time_style
     tags_style = STYLES["detail_tags_1"] if tags_style is None else tags_style
-    desc_style = STYLES["detail_description"] if desc_style is None else desc_style
-    brief_ratio = _resolve_ratio(brief_ratio, DEFAULT_BRIEF_RATIO)
-    if len(brief_ratio) != 3:
-        raise ValueError(f"brief_ratio 必须恰好 3 个元素，当前 {brief_ratio}")
+    ratio = _resolve_ratio(ratio, DEFAULT_BRIEF_RATIO)
+    if len(ratio) != 3:
+        raise ValueError(f"add_detail_head: ratio 必须恰好 3 个元素，当前 {ratio}")
 
-    prefix = f"{self.name}_section_details_{index if name_key is None else name_key}"
-
-    content = LayoutObject(
-        name=f"{prefix}_content",
-        x=0, y=0, width=0, height=0,
-        color=White,
-        padding=Padding.all(0),
-        align_x=AlignX.CENTER,
-        align_y=AlignY.FLOW,
-        layer=layer,
-    )
-    # 必须由内容撑高：若留在默认的 FILL，本容器会吃满整列可用高，
-    # 后随的 description（CONTENT）拿到的约束就被挤成 0。
-    content.size_y = SizeY.CONTENT
-    self.add_child(content)
-
-    # ---- 三栏（关键词 / 时间 / 标签）----
     brief = LayoutObject(
         name=f"{prefix}_brief",
-        x=0, y=0, width=0, height=brief_height,
+        x=0, y=0, width=0, height=height,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.CENTER,
         align_y=AlignY.FLOW,
         layer=layer,
     )
-    content.add_child(brief)
+    self.add_child(brief)
 
     band = create_band(
         parent=brief,
-        cells=list(brief_ratio),
+        cells=list(ratio),
         gap=0,
         padding=Padding.all(0),
-        height=brief_height,
+        height=height,
         names=[f"{prefix}_brief_col_{i}" for i in range(3)],
         layer=layer,
         container_name=f"{prefix}_brief_band",
@@ -914,7 +1245,40 @@ def add_details(self: LayoutObject,
     col_time.add_child(time_obj)
     col_tags.add_child(tags_obj)
 
-    # ---- 描述 ----
+    return DetailHeadHandle(
+        node=brief, band=band,
+        col_key=col_key, col_time=col_time, col_tags=col_tags,
+        key=key_obj, during_time=time_obj, tags=tags_obj,
+    )
+
+
+def add_detail_body(self: LayoutObject,
+                    prefix: str,
+                    description: str = "",
+                    style: Optional[Style] = None,
+                    height: Optional[float] = None,
+                    layer: int = 0) -> DetailBodyHandle:
+    """
+    详情·描述子模板（可自动换行的多行文本块）。
+
+    结构：
+        {prefix}_details（SizeY.CONTENT）
+        └─ {prefix}_description : TextObject(multi_line, LEFT/FLOW)
+
+    高度默认由内容自动结算（`SizeY.CONTENT` + 引擎真实文本测量）；
+    给 `height` 则退回固定高度模式。
+
+    Args:
+        prefix: 命名前缀（由 `add_detail` 统一给出）
+        description: 描述文字（支持 \n 硬换行与内联 Markdown）
+        style: 文本样式
+        height: 固定高度 (mm)。None 表示自动结算
+
+    Returns:
+        DetailBodyHandle
+    """
+    style = STYLES["detail_description"] if style is None else style
+
     details = LayoutObject(
         name=f"{prefix}_details",
         x=0, y=0, width=0, height=0,
@@ -924,13 +1288,13 @@ def add_details(self: LayoutObject,
         align_y=AlignY.FLOW,
         layer=layer,
     )
-    # 同样必须由内容撑高。若留在 FILL，它处于 CONTENT 父之下会走"退化规则"
+    # 必须由内容撑高。若留在 FILL，它处于 CONTENT 父之下会走"退化规则"
     # 去读子元素高度，而子元素此刻尚未测量 —— 整条详情会塌缩为 0 高。
     details.size_y = SizeY.CONTENT
-    content.add_child(details)
+    self.add_child(details)
 
     desc_obj = TextObject.from_style(
-        f"{prefix}_description", desc_style,
+        f"{prefix}_description", style,
         text=description,
         width=0, height=0,
         color=White,
@@ -938,19 +1302,87 @@ def add_details(self: LayoutObject,
         align_x=AlignX.LEFT,
         align_y=AlignY.FLOW,
         multi_line=True,
-        # line_height 不再显式传入：引擎按 line_height_ratio 推出行高
+        # line_height 不显式传入：引擎按 line_height_ratio 推出行高
         layer=layer + 1,
     )
     details.add_child(desc_obj)
 
-    handle = DetailsHandle(
-        node=content, brief=brief,
-        col_key=col_key, col_time=col_time, col_tags=col_tags,
-        key=key_obj, during_time=time_obj, tags=tags_obj,
-        details=details, description=desc_obj,
-    )
-    set_content_height(desc_obj, description_height)
+    handle = DetailBodyHandle(node=details, description=desc_obj)
+    set_content_height(desc_obj, height)
     return handle
+
+
+def add_detail(self: LayoutObject,
+               index: int = 0,
+               name_key: Optional[str] = None,
+               key_style: Optional[Style] = None,
+               time_style: Optional[Style] = None,
+               tags_style: Optional[Style] = None,
+               desc_style: Optional[Style] = None,
+               brief_ratio: Optional[Sequence[float]] = None,
+               brief_height: float = DEFAULT_BRIEF_HEIGHT,
+               description_height: Optional[float] = None,
+               key: str = "",
+               during_time: str = "",
+               tags: str = "",
+               description: str = "",
+               layer: int = 0) -> DetailsHandle:
+    """
+    节详情子模板 —— **容器**，由"标题三栏"与"描述"两个子模板组合而成。
+
+    结构：
+        self
+        └─ {p}_content（SizeY.CONTENT）
+             ├─ {p}_brief（三栏，见 add_detail_head）
+             └─ {p}_details → {p}_description（见 add_detail_body）
+
+    其中 `{p}` = `{self.name}_section_details_{index if name_key is None else name_key}`。
+
+    两个部件也可以单独使用：`add_detail_head(prefix)` / `add_detail_body(prefix)`，
+    它们的 `prefix` 由调用方给出，便于自由组合。
+
+    Args:
+        index: 编号，出现在节点名中
+        name_key: 命名键。给定时取代 index 参与命名，用于让**跨节**的详情
+                  互不同名（如 `"{节号}_{节内序号}"`）
+        key_style / time_style / tags_style / desc_style: 各部件样式
+        brief_ratio: 三栏比例，必须 3 个元素
+        brief_height: 三栏高度 (mm)
+        description_height: 描述高度。None 表示自动结算
+        key / during_time / tags / description: 四段文字，构造时直接填入
+
+    Returns:
+        DetailsHandle（`head` 与 `body` 两个子句柄都可直接取用）
+    """
+    desc_style = STYLES["detail_description"] if desc_style is None else desc_style
+    prefix = f"{self.name}_section_details_{index if name_key is None else name_key}"
+
+    content = LayoutObject(
+        name=f"{prefix}_content",
+        x=0, y=0, width=0, height=0,
+        color=White,
+        padding=Padding.all(0),
+        align_x=AlignX.CENTER,
+        align_y=AlignY.FLOW,
+        layer=layer,
+    )
+    # 必须由内容撑高：若留在默认的 FILL，本容器会吃满整列可用高，
+    # 后随的 description（CONTENT）拿到的约束就被挤成 0。
+    content.size_y = SizeY.CONTENT
+    self.add_child(content)
+
+    head = add_detail_head(
+        content, prefix,
+        key=key, during_time=during_time, tags=tags,
+        key_style=key_style, time_style=time_style, tags_style=tags_style,
+        ratio=brief_ratio, height=brief_height, layer=layer,
+    )
+    body = add_detail_body(
+        content, prefix,
+        description=description, style=desc_style,
+        height=description_height, layer=layer,
+    )
+    return DetailsHandle(node=content, head=head, body=body)
 
 
 def add_summary(self: LayoutObject,
@@ -1131,7 +1563,7 @@ def add_section(self: LayoutObject,
     if not items:
         return SectionHandle(node=None, title=None, details=[])
 
-    title_handle = self.add_section_title(
+    title_handle = self.add_section_heading(
         index=index,
         icon_style=icon_style,
         text_style=title_style,
@@ -1143,7 +1575,7 @@ def add_section(self: LayoutObject,
 
     handles: List[DetailsHandle] = []
     for i, item in enumerate(items):
-        handle = self.add_details(
+        handle = self.add_detail(
             index=i,
             name_key=f"{index}_{i}",
             brief_ratio=brief_ratio,
@@ -1179,7 +1611,7 @@ def add_details_list(self: LayoutObject,
     handles: List[DetailsHandle] = []
     for i, item in enumerate(items):
         index = start_index + i
-        handle = self.add_details(index=index, **detail_kwargs).apply(item)
+        handle = self.add_detail(index=index, **detail_kwargs).apply(item)
         handles.append(handle)
         if i < len(items) - 1 and between_gap > 0:
             self.add_spacer(f"Lead_DetailsList_{index}", between_gap)
@@ -1216,17 +1648,23 @@ BRIEF_DETAIL_STYLES = {
 # 调用形式，同时保持引擎对领域词汇零知识。
 
 _TEMPLATE_METHODS = {
+    "add_split": add_split,
     "add_basic": add_basic,
-    "add_profile": add_profile,
-    "add_profile_photo": add_profile_photo,
-    "add_section_title": add_section_title,
-    "add_details": add_details,
-    "add_details_list": add_details_list,
-    "add_summary": add_summary,
+    "add_info": add_info,
+    "add_photo": add_photo,
+    "add_section_heading": add_section_heading,
+    "add_detail": add_detail,
+    "add_detail_head": add_detail_head,
+    "add_detail_body": add_detail_body,
     "add_section": add_section,
     "add_text_row": add_text_row,
     "add_spacer": add_spacer,
 }
+
+# 已退役的模板（保留函数定义供过渡期参考，但**不再挂到 LayoutObject 上**）：
+#   add_summary      —— 用 add_detail_body(prefix=...) 取代
+#   add_details_list —— 用调用方自己的循环 + add_detail(...) 取代
+# 退役后调用 `obj.add_summary(...)` 会得到 AttributeError，这就是"新名不留旧名"。
 
 
 def _install_methods() -> None:
@@ -1275,25 +1713,25 @@ if __name__ == "__main__":
 
     # ---- 4. 基础模板：句柄直接给出左右栏 ----
     print("\n【4. 生成基础模板】", flush=True)
-    basic = root.add_basic(
+    basic = root.add_split(
         ratio=[1.0, 2.5],
-        left_padding=Padding.all(0),
-        right_padding=Padding.left(8),
+        colors=[STYLES["left_column"].fill_color, None],
+        paddings=[Padding.all(0), Padding.left(8)],
         layer=0,
     )
     left_column, right_column = basic.left, basic.right
-    print(f"  ✅ 分栏容器: {basic.node.name}", flush=True)
+    print(f"  ✅ 分栏容器: {basic.node.name}（{len(basic)} 栏）", flush=True)
     print(f"  ✅ 左栏: {left_column.name}, 右栏: {right_column.name}", flush=True)
 
     # ---- 5. 左栏：个人信息 ----
     print("\n【5. 生成个人信息模板】", flush=True)
-    profile = left_column.add_profile(
+    profile = left_column.add_info(
         index=0,
-        icon_style=STYLES["name_image"],
-        text_style=STYLES["name_text"],
-        icon_width=6,
+        variant="name",
+        text="韩 梅 梅",
+        image_path=".\\Resources\\icon_Profile_Name.png",
         layer=1,
-    ).fill(text="韩 梅 梅", image_path=".\\Resources\\icon_Profile_Name.png")
+    )
     print(f"  ✅ 个人信息: {profile.node.name} → {profile.text.get_text()}", flush=True)
 
     # 联系方式：同一个蓝图复用 N 次
@@ -1302,81 +1740,94 @@ if __name__ == "__main__":
         (".\\Resources\\email.png", "hanmeimei@example.com"),
     ]
     for i, (icon_path, value) in enumerate(contacts, start=1):
-        left_column.add_profile(
+        left_column.add_info(
             index=i,
-            content_height=profile_content_height(),
+            text=value,
+            image_path=icon_path,
             layer=1,
-        ).fill(text=value, image_path=icon_path)
+        )
     print(f"  ✅ 联系方式 {len(contacts)} 条（蓝图复用）", flush=True)
 
     # ---- 6. 右栏：节标题 + 节详情 ----
     print("\n【6. 生成右栏内容】", flush=True)
 
-    edu_title = right_column.add_section_title(
+    edu_title = right_column.add_section_heading(
         index=0,
         icon_style=STYLES["section_title_image"],
         text_style=STYLES["section_title_text"],
+        title="教育背景",
+        image_path=".\\Resources\\icon_Education_History.png",
         layer=1,
-    ).fill(title="教育背景", image_path=".\\Resources\\icon_Education_History.png")
+    )
     print(f"  ✅ 节标题: {edu_title.node.name} → {edu_title.text.get_text()}", flush=True)
 
-    # 列表入口：一次给出多条详情
-    edu_details = right_column.add_details_list(
-        [
-            {
-                "key": "日本农业苞谷大学",
-                "during_time": "2020.09 - 2024.06",
-                "tags": "金坷垃制造与苞米发酵工程 | 本科",
-                "description": "主修课程：数据结构与算法、操作系统、计算机网络、数据库原理、软件工程。\n毕业论文：基于深度学习的图像分类算法研究。",
-            },
-            {
-                "key": "XX高中",
-                "during_time": "2017.09 - 2020.06",
-                "tags": "理科实验班",
-                "description": "高考成绩：全省前 5%，数学 148/150。",
-            },
-        ],
-        between_gap=0,
-        brief_ratio=[2.0, 1.0, 2.0],
-        brief_height=DEFAULT_BRIEF_HEIGHT,
-        layer=1,
-        **BRIEF_DETAIL_STYLES,
-    )
-    print(f"  ✅ 教育经历 {len(edu_details)} 条（列表入口）", flush=True)
+    # 多条详情 = 调用方自己的循环（同一个蓝图实例化 N 次）
+    edu_items = [
+        {
+            "key": "日本农业苞谷大学",
+            "during_time": "2020.09 - 2024.06",
+            "tags": "金坷垃制造与苞米发酵工程 | 本科",
+            "description": "主修课程：数据结构与算法、操作系统、计算机网络、数据库原理、软件工程。\n毕业论文：基于深度学习的图像分类算法研究。",
+        },
+        {
+            "key": "XX高中",
+            "during_time": "2017.09 - 2020.06",
+            "tags": "理科实验班",
+            "description": "高考成绩：全省前 5%，数学 148/150。",
+        },
+    ]
+    edu_details = [
+        right_column.add_detail(
+            index=i,
+            brief_ratio=[2.0, 1.0, 2.0],
+            brief_height=DEFAULT_BRIEF_HEIGHT,
+            layer=1,
+            **item,
+            **BRIEF_DETAIL_STYLES,
+        )
+        for i, item in enumerate(edu_items)
+    ]
+    print(f"  ✅ 教育经历 {len(edu_details)} 条（调用方循环）", flush=True)
 
-    proj_title = right_column.add_section_title(
+    proj_title = right_column.add_section_heading(
         index=1,
         icon_style=STYLES["section_title_image"],
         text_style=STYLES["section_title_text"],
+        title="项目经历",
+        image_path=".\\Resources\\icon_Project_History.png",
         layer=1,
-    ).fill(title="项目经历", image_path=".\\Resources\\icon_Project_History.png")
-
-    proj_details = right_column.add_details_list(
-        [
-            {
-                "key": "基于PDF的简历自动生成系统",
-                "during_time": "2025.03 - 2025.06",
-                "tags": "Python, FPDF, 排版引擎",
-                "description": "设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能。\n实现了简历元件的模块化管理，支持快速生成针对不同岗位的定制化简历。",
-            },
-            {
-                "key": "数据可视化看板开发",
-                "during_time": "2024.09 - 2024.12",
-                "tags": "Vue.js, ECharts, Flask",
-                "description": "为某电商公司开发了实时数据监控看板，展示销售、流量、转化等核心指标。\n使用 WebSocket 实现实时数据更新，日活用户 200+。",
-            },
-        ],
-        start_index=len(edu_details),
-        brief_ratio=[2.0, 1.0, 2.0],
-        layer=1,
-        **BRIEF_DETAIL_STYLES,
     )
+
+    proj_items = [
+        {
+            "key": "基于PDF的简历自动生成系统",
+            "during_time": "2025.03 - 2025.06",
+            "tags": "Python, FPDF, 排版引擎",
+            "description": "设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n系统采用分层排版引擎，支持样式定制、多模板切换、自动分栏等高级功能。\n实现了简历元件的模块化管理，支持快速生成针对不同岗位的定制化简历。",
+        },
+        {
+            "key": "数据可视化看板开发",
+            "during_time": "2024.09 - 2024.12",
+            "tags": "Vue.js, ECharts, Flask",
+            "description": "为某电商公司开发了实时数据监控看板，展示销售、流量、转化等核心指标。\n使用 WebSocket 实现实时数据更新，日活用户 200+。",
+        },
+    ]
+    proj_details = [
+        right_column.add_detail(
+            index=len(edu_details) + i,
+            brief_ratio=[2.0, 1.0, 2.0],
+            layer=1,
+            **item,
+            **BRIEF_DETAIL_STYLES,
+        )
+        for i, item in enumerate(proj_items)
+    ]
     print(f"  ✅ 项目经历 {len(proj_details)} 条", flush=True)
 
     # ---- 7. 渲染与高度结算 ----
     print("\n【7. 渲染 PDF】", flush=True)
     root.layout(pdf=pdf, force=True)
-    root.render_debug(pdf, is_fill=False)
+    root.render(pdf, is_fill=False)
 
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)
@@ -1386,11 +1837,15 @@ if __name__ == "__main__":
     print("\n【8. 回归契约断言】", flush=True)
 
     # 8.1 方法已挂到 LayoutObject 上
-    for _m in ("add_basic", "add_profile", "add_section_title",
-               "add_details", "add_details_list", "add_summary",
+    for _m in ("add_split", "add_basic", "add_info", "add_photo",
+               "add_section_heading", "add_detail",
+               "add_detail_head", "add_detail_body",
                "add_section", "add_text_row", "add_spacer"):
         assert hasattr(LayoutObject, _m), f"LayoutObject 缺少方法 {_m}"
-    print("  ✅ 方法挂载契约通过", flush=True)
+    for _old in ("add_profile", "add_profile_photo", "add_section_title",
+                 "add_details", "add_details_list", "add_summary"):
+        assert not hasattr(LayoutObject, _old), f"旧方法 {_old} 应已退役"
+    print("  ✅ 方法挂载契约通过（并确认旧名已退役）", flush=True)
 
     # 8.2 句柄代替字符串查询：不查名字也能拿到部件
     assert edu_details[0].key.get_text() == "日本农业苞谷大学"

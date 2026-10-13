@@ -1,0 +1,982 @@
+"""
+================================================================================
+简历核心模块  (Resume Core) —— 顶层
+================================================================================
+定位：**面向使用者与开发人员的领域模型 + 无副作用渲染器**。
+
+本文件按"认识什么"分四段，靠**函数边界**分层（不是文件边界）：
+
+    1. 数据模型    Profiles / SkillsAwards / Details / Section / Resume
+                   纯数据类型与容器。**不认识 PDF、不做 I/O**。
+                   这一整段可以原样复制到别处复用。
+    2. 版式配置    Theme（样式与图标）
+                   只放**跨简历稳定**的呈现信息；能随简历变的文案属内容，不放这里。
+    3. 排版构建    build_layout(resume, theme, spacing) -> LayoutObject
+                   唯一认识中层模板词汇的地方。
+    4. 渲染        render(resume, ...) / render_many(...)
+                   **只读数据**：不改 resume、不改参数对象。
+
+分层依赖（只向下依赖，不反向）：
+    ResumeCore.py  →  ResumeTemplate.py  →  LayoutEngine.py
+
+## 快速开始
+
+    from ResumeCore import Profiles, Section, Details, Resume, render
+
+    me = Profiles(name="张三", telephone="138-0000-0000", email="a@b.com")
+    edu = Section(title="教育背景")
+    edu.add_detail(Details(key="某大学", during_time="2020-2024",
+                           tags="计算机 | 本科", description="主修课程：…\\n绩点 3.8。"))
+    resume = Resume(profile=me, sections=[edu], summary="五年后端开发经验。")
+
+    render(resume, output_dir="output")                  # 生成 PDF
+    render(resume, output_dir="out2")                    # 同一容器可反复渲染
+
+## 复用与批量
+
+    # 同一份数据可以渲染成多种留白松紧，或反复渲染互不影响
+    render(resume, spacing=Spacing.compact(), output_dir="tight")
+    render(resume, spacing=Spacing.loose(),   output_dir="loose")
+
+    # 一个 PDF 装多份（pdf= 传入同一个文档对象）
+    pdf = make_pdf()
+    for r in resumes:
+        render(r, pdf=pdf)
+    pdf.output("合集.pdf")
+
+## 确定性
+
+    render(resume, creation_date="D:20260101000000Z")     # 同数据 → 逐字节相同
+
+================================================================================
+"""
+
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence
+
+from fpdf import FPDF
+
+from LayoutEngine import (
+    AlignX,
+    AlignY,
+    LayoutObject,
+    Padding,
+    Style,
+    White,
+)
+
+from ResumeTemplate import (
+    BRIEF_DETAIL_STYLES,
+    DEFAULT_BRIEF_HEIGHT,
+    STYLES,
+    Spacing,
+    skills_row_height,
+)
+
+
+# ============================================================================
+# 1. 数据模型（纯数据：不认识 PDF、不做 I/O）
+# ============================================================================
+
+@dataclass
+class Profiles:
+    """
+    个人信息。
+
+    只存"这个人是谁、怎么联系他"。**不含任何版式信息**
+    （"个人总结"标题怎么写属版式，见 `Theme.summary_title`）。
+    """
+    photo: str = ""                     # 证件照资源路径
+    name: str = ""
+    telephone: str = ""
+    locate: str = ""                    # 现居城市
+    email: str = ""
+    social_media_qq: str = ""
+    social_media_wechat: str = ""
+    contact_address: str = ""
+    title: str = ""                     # 求职头衔
+    website: str = ""                   # 个人网站 / GitHub
+    summary: str = ""                   # 个人简介正文（内容，不是标题）
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "photo": self.photo,
+            "name": self.name,
+            "telephone": self.telephone,
+            "locate": self.locate,
+            "email": self.email,
+            "social_media_qq": self.social_media_qq,
+            "social_media_wechat": self.social_media_wechat,
+            "contact_address": self.contact_address,
+            "title": self.title,
+            "website": self.website,
+            "summary": self.summary,
+        }
+
+    def is_empty(self) -> bool:
+        """姓名与全部联系方式都为空才算空"""
+        return not any([self.name, self.telephone, self.email,
+                        self.social_media_qq, self.social_media_wechat,
+                        self.contact_address, self.website])
+
+    def contact_rows(self) -> List[tuple]:
+        """
+        产出 `[(图标路径, 文本), ...]` —— 按固定顺序排列的**非空**联系方式。
+
+        顺序：电话 → 邮箱 → 城市 → QQ → 微信 → 地址 → 网站
+        """
+        rows: List[tuple] = []
+        if self.telephone:
+            rows.append((Theme.ICON_TELEPHONE, self.telephone))
+        if self.email:
+            rows.append((Theme.ICON_EMAIL, self.email))
+        if self.locate:
+            rows.append((Theme.ICON_LOCATE, self.locate))
+        if self.social_media_qq:
+            rows.append((Theme.ICON_SOCIAL, f"QQ：{self.social_media_qq}"))
+        if self.social_media_wechat:
+            rows.append((Theme.ICON_SOCIAL, f"微信：{self.social_media_wechat}"))
+        if self.contact_address:
+            rows.append((Theme.ICON_ADDRESS, self.contact_address))
+        if self.website:
+            rows.append((Theme.ICON_WEBSITE, self.website))
+        return rows
+
+
+class SkillsAwards:
+    """
+    技能 / 证书 / 荣誉。
+
+    三块的**条目**是内容；三块的**标题文案**默认在这里（便于按简历定制），
+    但 `Theme` 里的同名标题优先，用来做全局统一（见 `Theme.skills_title` 等）。
+
+    ⚠️ 刻意**不**把每个条目做成一个模板实例：中层 `measure_text` 会按 `\\n`
+       硬换行 + 逐字断行，单块多行文本更省空间也更省布局开销。
+    """
+
+    def __init__(
+        self,
+        skills: Optional[List[str]] = None,
+        qualifications: Optional[List[str]] = None,
+        awards: Optional[List[str]] = None,
+        skills_title: Optional[str] = None,
+        qualifications_title: Optional[str] = None,
+        awards_title: Optional[str] = None,
+    ):
+        self.skills: List[str] = list(skills) if skills else []
+        self.qualifications: List[str] = list(qualifications) if qualifications else []
+        self.awards: List[str] = list(awards) if awards else []
+        # None = "不表态"，由 Theme 决定标题；给了就用它（逐简历定制）
+        self.skills_title = skills_title
+        self.qualifications_title = qualifications_title
+        self.awards_title = awards_title
+
+    def is_empty(self) -> bool:
+        return not (self.skills or self.qualifications or self.awards)
+
+    def blocks(self, theme: Optional['Theme'] = None) -> List[tuple]:
+        """
+        产出 `[(块名, 标题, 条目列表), ...]`，只含非空块。
+
+        标题取值优先级：**本对象显式给的** > `theme` 的 > 内置默认。
+        """
+        th = theme if theme is not None else Theme()
+        candidates = [
+            ("skills", self.skills_title or th.skills_title, self.skills),
+            ("qualifications",
+             self.qualifications_title or th.qualifications_title, self.qualifications),
+            ("awards", self.awards_title or th.awards_title, self.awards),
+        ]
+        return [(n, t, v) for (n, t, v) in candidates if v]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "skills": list(self.skills),
+            "qualifications": list(self.qualifications),
+            "awards": list(self.awards),
+            "skills_title": self.skills_title,
+            "qualifications_title": self.qualifications_title,
+            "awards_title": self.awards_title,
+        }
+
+
+@dataclass
+class Details:
+    """单条详情，对应中层 `add_detail` 子模板。"""
+    key: str = ""                       # 关键词（学校 / 项目 / 公司）
+    during_time: str = ""               # 起讫时间
+    tags: str = ""                      # 补充信息（专业 / 技术栈）
+    description: str = ""               # 详情描述（支持 \\n 分段与内联 Markdown）
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "key": self.key,
+            "during_time": self.during_time,
+            "tags": self.tags,
+            "description": self.description,
+        }
+
+    def is_empty(self) -> bool:
+        return not any([self.key, self.during_time, self.tags, self.description])
+
+
+@dataclass
+class Section:
+    """
+    一节 = 节标题 + N 条详情。
+
+    `icon` / `title` / `details` 三个字段**正好就是中层 `add_section` 的鸭子契约**
+    （它用 `_field_getter` 读这三个名字），所以本对象可以整个交给它。
+    """
+    title: str = ""
+    icon: str = ""                      # 节标题图标（逐节可变 → 属内容侧）
+    details: List[Details] = field(default_factory=list)
+
+    def add_detail(self, detail: Details) -> 'Section':
+        self.details.append(detail)
+        return self
+
+    def remove_detail(self, index: int) -> bool:
+        if 0 <= index < len(self.details):
+            self.details.pop(index)
+            return True
+        return False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "title": self.title,
+            "icon": self.icon,
+            "details": [d.to_dict() for d in self.details],
+        }
+
+    def is_empty(self) -> bool:
+        return not self.title and not self.details
+
+
+class Resume:
+    """
+    整份简历 —— **纯数据容器**。
+
+    刻意不提供任何渲染方法：渲染是 `render()` 的事。
+    这样同一个实例可以被反复渲染、被不同留白配置渲染、被批量填充，
+    而不会被写入任何"上一次渲染"的残留状态（旧实现会写 `_root` / `_pdf_path`）。
+    """
+
+    def __init__(
+        self,
+        intend_company: str = "",
+        intend_job: str = "",
+        profile: Optional[Profiles] = None,
+        skills_awards: Optional[SkillsAwards] = None,
+        sections: Optional[List[Section]] = None,
+        summary: str = "",
+    ):
+        self.intend_company = intend_company
+        self.intend_job = intend_job
+        self.profile: Profiles = profile if profile is not None else Profiles()
+        self.skills_awards: SkillsAwards = (
+            skills_awards if skills_awards is not None else SkillsAwards())
+        self.sections: List[Section] = list(sections) if sections else []
+        self.summary = summary
+
+    # ---- 章节管理 ----
+
+    def add_section(self, section: Section) -> 'Resume':
+        self.sections.append(section)
+        return self
+
+    def remove_section(self, index: int) -> bool:
+        if 0 <= index < len(self.sections):
+            self.sections.pop(index)
+            return True
+        return False
+
+    # ---- 纯函数：从数据算文件名（不涉及渲染）----
+
+    def get_file_name(self) -> str:
+        """`{姓名}_{职位}_{公司}.pdf`，非法字符替换为下划线"""
+        def clean(text: str) -> str:
+            for ch in '\\/:*?"<>|':
+                text = text.replace(ch, "_")
+            return text.strip() or "Unknown"
+
+        return (f"{clean(self.profile.name)}_{clean(self.intend_job)}"
+                f"_{clean(self.intend_company)}.pdf")
+
+    def is_empty(self) -> bool:
+        """没有任何可渲染的内容"""
+        return (self.profile.is_empty()
+                and not self.sections
+                and self.skills_awards.is_empty()
+                and not self.summary)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "intend_company": self.intend_company,
+            "intend_job": self.intend_job,
+            "profile": self.profile.to_dict(),
+            "skills_awards": self.skills_awards.to_dict(),
+            "sections": [s.to_dict() for s in self.sections],
+            "summary": self.summary,
+        }
+
+
+# ============================================================================
+# 2. 版式配置（跨简历稳定的呈现信息）
+# ============================================================================
+
+@dataclass
+class Theme:
+    """
+    版式配置：**跨简历稳定**的呈现信息。
+
+    分界原则：**能随简历变的是内容（放数据类），跨简历稳定的是呈现（放这里）。**
+    所以这里只有样式与图标，以及那三个"版面标签"文案
+    （`summary_title` / `skills_title` / ...）—— 它们的默认值就是历史文案，
+    逐简历要改时给 `SkillsAwards(skills_title=...)` 即可，那个优先级更高。
+
+    ## 版面结构常量
+
+    这些是"版面骨架"，改动会移动所有元素，所以集中在这里而不是散在函数体里。
+    """
+    # ---- 纸张与分栏骨架 ----
+    page_width: float = 210.0
+    page_height: float = 297.0
+    page_padding: float = 10.0
+    column_ratio: Sequence[float] = (1.0, 2.5)   # 左 : 右
+    right_column_padding_left: float = 8.0
+
+    # ---- 样式 ----
+    section_title_style: Optional[Style] = None
+    section_title_icon_style: Optional[Style] = None
+    detail_styles: Optional[dict] = None
+    summary_style: Optional[Style] = None
+    skills_title_style: Optional[Style] = None
+    skills_text_style: Optional[Style] = None
+    name_icon_style: Optional[Style] = None
+    name_text_style: Optional[Style] = None
+    contact_icon_style: Optional[Style] = None
+    contact_text_style: Optional[Style] = None
+    photo_style: Optional[Style] = None
+
+    # ---- 版面标签文案（逐简历可被数据类覆盖）----
+    summary_title: str = "个人总结"
+    skills_title: str = "掌握技能"
+    qualifications_title: str = "获得证书"
+    awards_title: str = "获得荣誉"
+
+    # ---- 图标（空串 = 该位置留空）----
+    summary_icon: str = ""
+    name_icon: str = r".\Resources\woman_student.png"
+    section_icon_fallback: str = ""
+
+    # ---- 详情区的排版参数 ----
+    brief_ratio: Sequence[float] = (2.0, 1.0, 2.0)
+    brief_height: float = DEFAULT_BRIEF_HEIGHT
+    desc_mode: str = "para"             # "para" 图标段落 / "inline" 整段文本
+    para_icon_width: float = 4.0
+    para_icon_gap: float = 2.0
+    # 描述体自身内边距。None = 用中层默认（Padding.all(2)）；
+    # 传 Padding.all(0) 可关闭，让盒高等于纯文本高（调试对齐时有用）
+    body_inner_padding: Optional[Padding] = None
+
+    # ---- 联系方式图标（Profiles.contact_rows 用）----
+    ICON_TELEPHONE: str = field(default=r".\Resources\telephone.png", init=False)
+    ICON_EMAIL: str = field(default=r".\Resources\email.png", init=False)
+    ICON_LOCATE: str = field(default=r".\Resources\locate.png", init=False)
+    ICON_SOCIAL: str = field(default=r".\Resources\social_media.png", init=False)
+    ICON_ADDRESS: str = field(default=r".\Resources\contact_address.png", init=False)
+    ICON_WEBSITE: str = field(default=r".\Resources\website.png", init=False)
+
+    def __post_init__(self):
+        # 样式默认值从 STYLES 取 —— 这样中层的样式改动会自动跟过来
+        if self.section_title_style is None:
+            self.section_title_style = STYLES["section_title_text"]
+        if self.section_title_icon_style is None:
+            self.section_title_icon_style = STYLES["section_title_image"]
+        if self.detail_styles is None:
+            self.detail_styles = dict(BRIEF_DETAIL_STYLES)
+        if self.summary_style is None:
+            self.summary_style = STYLES["summary_text"]
+        if self.skills_title_style is None:
+            self.skills_title_style = STYLES["skillsawards_title"]
+        if self.skills_text_style is None:
+            self.skills_text_style = STYLES["skillsawards_text"]
+        if self.name_icon_style is None:
+            self.name_icon_style = STYLES["name_image"]
+        if self.name_text_style is None:
+            self.name_text_style = STYLES["name_text"]
+        if self.contact_icon_style is None:
+            self.contact_icon_style = STYLES["profile_text"]
+        if self.contact_text_style is None:
+            self.contact_text_style = STYLES["contact_text"]
+        if self.photo_style is None:
+            self.photo_style = STYLES["profile_photo"]
+
+
+# ============================================================================
+# 3+4. 排版构建与渲染
+# ============================================================================
+
+class RenderError(RuntimeError):
+    """渲染前置条件不满足（数据不足、无法产出有效版面）"""
+
+
+def make_pdf(theme: Optional[Theme] = None) -> FPDF:
+    """建一个空白 PDF 并注册中文字体（缺字体时退回内置字体，不抛异常）"""
+    th = theme if theme is not None else Theme()
+    pdf = FPDF()
+    pdf.add_page()
+    for style in ("", "B"):
+        path = (r".\Resources\LXGWWenkai-Regular.ttf" if style == ""
+                else r".\Resources\LXGWWenkai-Bold.ttf")
+        try:
+            pdf.add_font("LXGW", style, path)
+        except Exception:
+            try:
+                pdf.add_font("LXGW", style, path, subset=False)
+            except Exception:
+                pass  # 缺字体：让上层报错（见 check_degradation.py 的 D3）
+    return pdf
+
+
+def _spacer(root: LayoutObject, name: str, height: float, layer: int = 1) -> None:
+    """值 <= 0 时不留白（与中层 add_spacer 的约定一致）"""
+    if height > 0:
+        root.add_spacer(name, height, layer=layer)
+
+
+def _fill_left_column(column: LayoutObject, resume: Resume,
+                      theme: Theme, spacing: Spacing) -> None:
+    """左栏：证件照 / 姓名 / 联系方式 / 技能证书荣誉"""
+    profile = resume.profile
+
+    _spacer(column, "Lead_Left_Above_All", spacing.left_top)
+
+    if profile.photo:
+        column.add_photo(index=0, image_path=profile.photo,
+                         icon_style=theme.photo_style, layer=1)
+        _spacer(column, "Lead_Left_Photo_Name", spacing.photo_name)
+
+    if profile.name:
+        column.add_info(index=0, variant="name", text=profile.name,
+                        image_path=theme.name_icon,
+                        icon_style=theme.name_icon_style,
+                        text_style=theme.name_text_style,
+                        layer=1)
+        _spacer(column, "Lead_Left_Name_Contacts", spacing.name_contacts)
+
+    contacts = profile.contact_rows()
+    first_index = 1 if profile.name else 0
+    for i, (icon_path, value) in enumerate(contacts):
+        column.add_info(index=first_index + i, text=value,
+                        icon_style=theme.contact_icon_style,
+                        text_style=theme.contact_text_style,
+                        layer=1)
+        # N 条之间只应有 N-1 个留白
+        if i < len(contacts) - 1:
+            _spacer(column, f"Lead_Left_Contact_{i}", spacing.between_contacts)
+
+    if contacts:
+        _spacer(column, "Lead_Left_Contacts_Skills", spacing.contacts_skills)
+
+    _fill_skills_awards(column, resume, theme, spacing)
+    _spacer(column, "Lead_Left_Below_All", spacing.left_bottom)
+
+
+def _fill_skills_awards(column: LayoutObject, resume: Resume,
+                        theme: Theme, spacing: Spacing) -> None:
+    """
+    技能 / 证书 / 荣誉：每块 = 标题行 + 正文行。
+
+    ⚠️ 正文用 `add_detail_body(height=None)` 让它**按内容自动结算**，
+    不再用历史上那个 `高度 = 条目数 × 6` 的硬编码估算 ——
+    那个估算在条目文字较长（折行）时会算少，导致文字溢出或与下一块重叠。
+    """
+    if resume.skills_awards.is_empty():
+        return
+
+    blocks = resume.skills_awards.blocks(theme)
+    for i, (block_name, block_title, items) in enumerate(blocks):
+        column.add_text_row(
+            name=f"{column.name}_{block_name}_title",
+            text=block_title,
+            style=theme.skills_title_style,
+            height=skills_row_height(theme.skills_title_style),
+            row_padding=Padding.left(2),
+            text_padding=Padding.all(0),
+            align_x=AlignX.LEFT, align_y=AlignY.VCENTER, layer=1,
+        )
+        column.add_detail_body(
+            prefix=f"{column.name}_{block_name}",
+            description="\n".join(items),
+            style=theme.skills_text_style,
+            height=None,                       # ← 由内容结算
+            inner_padding=theme.body_inner_padding,
+            layer=1,
+        )
+        if i < len(blocks) - 1:
+            _spacer(column, f"Lead_Left_SkillsBlock_{i+1}", spacing.between_skills)
+
+
+def _fill_right_column(column: LayoutObject, resume: Resume,
+                       theme: Theme, spacing: Spacing) -> None:
+    """右栏：各章节（节标题 + 详情）+ 个人总结"""
+    _spacer(column, "Lead_Right_Above_All", spacing.right_top)
+
+    rendered = 0
+    for section in resume.sections:
+        if not section.details:
+            continue
+        column.add_section(
+            section,
+            index=rendered,
+            title_style=theme.section_title_style,
+            icon_style=theme.section_title_icon_style,
+            detail_styles=theme.detail_styles,
+            brief_ratio=theme.brief_ratio,
+            brief_height=theme.brief_height,
+            desc_mode=theme.desc_mode,
+            para_gap=spacing.between_paras,
+            para_kwargs={
+                "icon_width": theme.para_icon_width,
+                "indent": 0.0,
+                "gap": theme.para_icon_gap,
+            },
+            title_detail_gap=spacing.section_title_to_body,
+            between_details_gap=spacing.between_details,
+            layer=1,
+        )
+        _spacer(column, f"Lead_Right_Section_{rendered}", spacing.between_sections)
+        rendered += 1
+
+    if resume.summary:
+        # 节标题 + 总结正文；用 title_detail_gap 承载"标题↔正文"的留白
+        column.add_section_heading(
+            index=rendered,
+            icon_style=theme.section_title_icon_style,
+            text_style=theme.section_title_style,
+            title=theme.summary_title,
+            image_path=theme.summary_icon,
+            gap_after=spacing.section_title_to_body,
+            layer=1,
+        )
+        column.add_detail_body(
+            prefix=f"{column.name}_summary_body_0",
+            description=resume.summary,
+            style=theme.summary_style,
+            height=None,
+            inner_padding=theme.body_inner_padding,
+            layer=1,
+        )
+
+    _spacer(column, "Lead_Right_Below_All", spacing.right_bottom)
+
+
+def build_layout(resume: Resume,
+                 theme: Optional[Theme] = None,
+                 spacing: Optional[Spacing] = None) -> LayoutObject:
+    """
+    把一份 `Resume` 落成排版树。**只读 `resume`，绝不写它。**
+
+    这是唯一认识中层模板词汇的地方；数据模型与 Theme 都不认识渲染。
+
+    Args:
+        resume: 简历数据（渲染过程不会修改它）
+        theme: 版式配置，None 用默认
+        spacing: 留白配置（中层 `Spacing`），None 用默认
+
+    Returns:
+        已 `layout()` 结算过的 `LayoutObject` 根节点（**尚未渲染**）
+    """
+    th = theme if theme is not None else Theme()
+    sp = spacing if spacing is not None else Spacing()
+
+    root = LayoutObject(
+        name="Root",
+        x=0, y=0,
+        width=th.page_width, height=th.page_height,
+        color=White,
+        padding=Padding.all(th.page_padding),
+        layer=0,
+    )
+    basic = root.add_basic(
+        ratio=list(th.column_ratio),
+        left_padding=Padding.all(0),
+        right_padding=Padding.left(th.right_column_padding_left),
+        layer=0,
+    )
+    _fill_left_column(basic.left, resume, th, sp)
+    _fill_right_column(basic.right, resume, th, sp)
+    return root
+
+
+def _validate(resume: Resume) -> None:
+    """渲染前置校验。数据不足时明确报错，而不是产出空页或异常版面"""
+    if not resume.profile.name:
+        raise RenderError(
+            "个人信息缺少姓名（profile.name）。姓名用于文件名与左栏标题，必需。")
+    if not resume.sections and not resume.summary:
+        raise RenderError(
+            "没有任何可渲染的章节或总结：请给 sections 或 summary 至少一项。")
+
+
+def render(resume: Resume,
+           output_dir: str = "./output",
+           *,
+           spacing: Optional[Spacing] = None,
+           theme: Optional[Theme] = None,
+           debug: int = 0,
+           creation_date: Optional[datetime] = None,
+           filename: Optional[str] = None,
+           pdf: Optional[FPDF] = None) -> str:
+    """
+    把一份简历渲染成 PDF。**无副作用：不修改 `resume` / `spacing` / `theme`。**
+
+    Args:
+        resume: 简历数据
+        output_dir: 输出目录
+        spacing: 留白配置（`ResumeTemplate.Spacing`）。想整体调松紧就传
+                 `Spacing.compact()` / `Spacing.loose()` / `Spacing().scaled(k)`
+        theme: 版式配置
+        debug: 0 只渲染内容；1 只渲染调试框；其他值两者都渲染
+        creation_date: PDF 创建时间，须为 `datetime` 对象。
+                       **给了就能逐字节复现**（批量与回归比对用）。
+                       ⚠️ 必须传 `datetime`，传字符串 fpdf 会抛 `TypeError`
+                       （见下面的显式校验 —— 早前用 `except: pass` 吞掉过它，
+                       导致"固定时间"静默失效）
+        filename: 覆盖输出文件名（默认由 `resume.get_file_name()` 推出）
+        pdf: 传入现成的 PDF 文档对象，可把多份简历装进同一个 PDF
+
+    Returns:
+        str: 生成的 PDF 文件路径（`pdf=` 为传入对象时返回 ""）
+
+    Raises:
+        RenderError: 数据不足（缺姓名、无章节且无总结）
+        TypeError: `creation_date` 不是 `datetime`
+    """
+    th = theme if theme is not None else Theme()
+    sp = spacing if spacing is not None else Spacing()
+    _validate(resume)
+
+    # 显式校验，不用 except 吞掉 —— 否则"固定时间"会静默失效
+    if creation_date is not None and not isinstance(creation_date, datetime):
+        raise TypeError(
+            f"creation_date 应为 datetime 对象，收到 {type(creation_date).__name__}。"
+            f"例如 datetime(2026, 1, 1, tzinfo=timezone.utc)")
+
+    own_pdf = pdf is None
+    doc = make_pdf(th) if own_pdf else pdf
+
+    if creation_date is not None:
+        doc.set_creation_date(creation_date)
+
+    root = build_layout(resume, th, sp)
+    # 传 pdf 才能用真实行数测量文本（CONTENT 高度必须在这里定下来）
+    root.layout(pdf=doc, force=True)
+
+    if debug == 1:
+        root.render_debug(doc, is_fill=True, has_border=True,
+                          show_name=True, show_bounds=True)
+    elif debug == 0:
+        root.render(doc, is_fill=False)
+    else:
+        root.render_debug(doc, is_fill=True, has_border=True,
+                          show_name=True, show_bounds=True)
+        root.render(doc, is_fill=False)
+
+    if not own_pdf:
+        return ""       # 调用方管输出（一个 PDF 装多份的场景）
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_name = filename if filename else resume.get_file_name()
+    out_path = os.path.join(output_dir, out_name)
+    doc.output(out_path)
+    return out_path
+
+
+def render_many(resumes: Sequence[Resume],
+                output_dir: str = "./output",
+                *,
+                spacing: Optional[Spacing] = None,
+                theme: Optional[Theme] = None,
+                creation_date: Optional[str] = None,
+                **kwargs) -> List[str]:
+    """
+    批量渲染。**每个 Resume 用同一个 `spacing` / `theme`，互不影响。**
+
+    这正是"同一个数据容器被复用多次"的落地形式：`spacing` / `theme`
+    在多次渲染之间共享且不被修改。
+
+    Returns:
+        生成的文件路径列表（按输入顺序）
+    """
+    return [render(r, output_dir, spacing=spacing, theme=theme,
+                   creation_date=creation_date, **kwargs)
+            for r in resumes]
+
+
+def render_into(pdf: FPDF,
+                resumes: Sequence[Resume],
+                *,
+                spacing: Optional[Spacing] = None,
+                theme: Optional[Theme] = None) -> FPDF:
+    """
+    把多份简历渲染进**同一个** PDF，每份占一页；返回该 PDF（调用方负责 output）。
+
+    ⚠️ 每份之前会 `add_page()` —— 调用方只需给一个已 `add_page()` 的空文档
+    （`make_pdf()` 返回的就是），本函数负责后续分页。
+    """
+    for i, r in enumerate(resumes):
+        if i > 0:
+            pdf.add_page()
+        render(r, spacing=spacing, theme=theme, pdf=pdf)
+    return pdf
+
+
+# ============================================================================
+# 5. 自检入口
+# ============================================================================
+
+def _sample(seed: str = "甲") -> Resume:
+    """构造一份覆盖全部字段的样例简历（自检与文档示例共用）"""
+    me = Profiles(
+        photo="",                      # 不依赖证件照素材
+        name=f"测试{seed}",
+        telephone="138-0000-0000",
+        email="a@b.com",
+        locate="某市",
+        social_media_qq="123456",
+        social_media_wechat="wx_id",
+        contact_address="某路 1 号",
+        title="后端开发",
+        website="github.com/x",
+        summary="",
+    )
+    edu = Section(title="教育背景",
+                  icon=r".\Resources\icon_Education_History.png")
+    edu.add_detail(Details(
+        key="日本农业苞谷大学", during_time="2020.09 - 2024.06",
+        tags="本科 | 计算机",
+        description="主修课程：数据结构与算法、操作系统、计算机网络。\n"
+                    "毕业论文：基于深度学习的图像分类算法研究。"))
+    proj = Section(title="项目经历",
+                   icon=r".\Resources\icon_Project_History.png")
+    proj.add_detail(Details(
+        key="Python 简历生成系统", during_time="2025.03 - 2025.06",
+        tags="Python, FPDF",
+        description="设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n"
+                    "系统采用分层排版引擎，支持多模板切换、自动分栏。"))
+    return Resume(
+        intend_company="腾讯", intend_job="后端开发工程师", profile=me,
+        skills_awards=SkillsAwards(
+            skills=["Python / Java / Go", "FPDF 排版引擎"],
+            qualifications=["CET-6"], awards=["一等奖学金"]),
+        sections=[edu, proj],
+        summary="五年全栈开发经验，关注排版可维护性。",
+    )
+
+
+def _snapshot(resume: Resume) -> dict:
+    """
+    数据容器快照 —— 用于证明"渲染不修改数据"。
+
+    用 `vars()` 而不是 `dataclasses.asdict()`：要能发现**新增的属性**
+    （旧实现的缺陷正是渲染时往 Resume 上写 `_root` / `_pdf_path`）。
+    """
+    def obj(o):
+        out = {}
+        for k, v in vars(o).items():
+            if isinstance(v, (list, tuple)):
+                out[k] = [obj(x) if hasattr(x, "__dict__") else x for x in v]
+            elif hasattr(v, "__dict__"):
+                out[k] = obj(v)
+            else:
+                out[k] = v
+        return out
+    return obj(resume)
+
+
+def _selftest() -> int:
+    """顶层验收自检（返回进程退出码）"""
+    import contextlib
+    import hashlib
+    import io
+    import tempfile
+    import dataclasses
+
+    out_root = os.path.join(tempfile.gettempdir(), "_resumecore_selftest")
+    os.makedirs(out_root, exist_ok=True)
+    ok = True
+
+    def check(tag: str, cond: bool, msg: str = "") -> None:
+        nonlocal ok
+        print(f"  {'✅' if cond else '❌'} {tag}" + (f" —— {msg}" if msg else ""))
+        if not cond:
+            ok = False
+
+    def quiet(fn, *a, **k):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(*a, **k)
+
+    def digest(path: str) -> str:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    print("=" * 66)
+    print("ResumeCore 顶层自检")
+    print("=" * 66)
+    from datetime import timezone
+    DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)   # 固定创建时间 → 才可能逐字节复现
+
+    # ---- V1 渲染不修改数据（含不新增属性）----
+    print("\n【V1】渲染不得修改数据容器")
+    r = _sample("甲")
+    before = _snapshot(r)
+    p1 = quiet(render, r, out_root, creation_date=DATE, filename="v1.pdf")
+    after = _snapshot(r)
+    check("vars(resume) 渲染前后完全一致", before == after,
+          "渲染写回了数据" if before != after else "")
+    if before != after:
+        extra = set(after) - set(before)
+        if extra:
+            print(f"      多出的属性：{sorted(extra)}")
+        for k in set(before) & set(after):
+            if before[k] != after[k]:
+                print(f"      变化的属性：{k}")
+    check("未新增 _root / _pdf_path 之类的渲染残留",
+          not hasattr(r, "_root") and not hasattr(r, "_pdf_path"))
+
+    # ---- V8 creation_date 生效：同数据逐字节相同 ----
+    print("\n【V8】固定创建时间 → 逐字节可复现")
+    r2 = _sample("甲")
+    pa = quiet(render, r2, out_root, creation_date=DATE, filename="v8a.pdf")
+    pb = quiet(render, r2, out_root, creation_date=DATE, filename="v8b.pdf")
+    check("同一对象两次渲染逐字节相同", digest(pa) == digest(pb),
+          f"{digest(pa)[:12]} vs {digest(pb)[:12]}")
+
+    # ---- V2/V3 幂等与无跨实例污染 ----
+    print("\n【V2/V3】幂等性与跨实例隔离")
+    outs = [quiet(render, _sample("甲"), out_root, creation_date=DATE,
+                  filename=f"v3_{i}.pdf") for i in range(3)]
+    ds = {digest(p) for p in outs}
+    check("三个独立对象渲三次结果一致", len(ds) == 1, f"得到 {len(ds)} 种结果")
+
+    # ---- V4 空字段降级 ----
+    print("\n【V4】空字段不产出异常版面、不抛异常")
+    lean = Resume(intend_job="工程师",
+                  profile=Profiles(name="只有名字"),
+                  sections=[Section(title="教育背景", details=[
+                      Details(key="某校", description="")])])
+    try:
+        quiet(render, lean, out_root, creation_date=DATE, filename="v4.pdf")
+        check("只有姓名 + 一条空描述：可渲染", True)
+    except Exception as e:
+        check("只有姓名 + 一条空描述：可渲染", False, f"{type(e).__name__}: {e}")
+    try:
+        quiet(render, Resume(profile=Profiles(name="X")), out_root)
+        check("无章节且无总结：应明确报错", False, "没有报错")
+    except RenderError:
+        check("无章节且无总结：明确报错", True)
+    except Exception as e:
+        check("无章节且无总结：明确报错", False, f"报错类型不对：{type(e).__name__}")
+    try:
+        quiet(render, Resume(profile=Profiles(telephone="1"),
+                             summary="x"), out_root)
+        check("缺姓名：应明确报错", False, "没有报错")
+    except RenderError:
+        check("缺姓名：明确报错", True)
+    except Exception as e:
+        check("缺姓名：明确报错", False, f"报错类型不对：{type(e).__name__}")
+
+    # ---- V5 不溢出 ----
+    # ⚠️ 两层检查都要做：
+    #   ① 页面边界 —— 元素绝对框不得越出纸面
+    #   ② 父内容区包含 —— 子元素不得越出父的**内容区**（去掉 padding）
+    #   只做①会漏掉"父没撑够高、子溢到父外但仍在纸内"这类缺陷。
+    print("\n【V5】元素不得溢出（页面边界 + 父内容区包含）")
+    root = quiet(build_layout, _sample("甲"))
+    th0 = Theme()
+    page_r = th0.page_width
+    page_b = th0.page_height
+
+    worst = {"x": (0.0, ""), "y": (0.0, "")}
+    contain = {"r": (0.0, ""), "b": (0.0, "")}
+
+    def scan(o, parent=None):
+        i = o.get_layout_info()["effective"]
+        ox, oy = i["x"] + i["w"], i["y"] + i["h"]
+        if ox - page_r > worst["x"][0]:
+            worst["x"] = (ox - page_r, o.name)
+        if oy - page_b > worst["y"][0]:
+            worst["y"] = (oy - page_b, o.name)
+        if parent is not None:
+            pi = parent.get_layout_info()["effective"]
+            pp = parent.padding
+            pr = pi["x"] + pi["w"] - pp.right      # 父内容区右界
+            pb = pi["y"] + pi["h"] - pp.bottom     # 父内容区下界
+            if ox - pr > contain["r"][0]:
+                contain["r"] = (ox - pr, f"{o.name} ⊄ {parent.name}")
+            if oy - pb > contain["b"][0]:
+                contain["b"] = (oy - pb, f"{o.name} ⊄ {parent.name}")
+        for c in o.children:
+            scan(c, o)
+
+    scan(root)
+    check("不越出纸面（右/下）",
+          worst["x"][0] <= 0.01 and worst["y"][0] <= 0.01,
+          f"右 {worst['x'][0]:+.2f}（{worst['x'][1]}）"
+          f" 下 {worst['y'][0]:+.2f}（{worst['y'][1]}）"
+          if max(worst["x"][0], worst["y"][0]) > 0.01 else "")
+    check("子元素被父内容区包含",
+          contain["r"][0] <= 0.01 and contain["b"][0] <= 0.01,
+          f"右 {contain['r'][0]:+.2f}（{contain['r'][1]}）"
+          f" 下 {contain['b'][0]:+.2f}（{contain['b'][1]}）"
+          if max(contain["r"][0], contain["b"][0]) > 0.01 else "")
+
+    # ---- V6 数据模型段零引擎依赖 ----
+    print("\n【V6】数据模型不认识引擎/PDF")
+    banned = (LayoutObject, Style, Padding, FPDF)
+    offenders = []
+    for cls in (Profiles, SkillsAwards, Details, Section, Resume):
+        for k, v in vars(cls()).items() if not dataclasses.is_dataclass(cls) else []:
+            if isinstance(v, banned):
+                offenders.append(f"{cls.__name__}.{k}")
+        for f_ in dataclasses.fields(cls) if dataclasses.is_dataclass(cls) else []:
+            if f_.type in ("LayoutObject", "Style", "Padding", "FPDF"):
+                offenders.append(f"{cls.__name__}.{f_.name}")
+    check("数据类的字段里没有排版对象", not offenders, ", ".join(offenders))
+    check("Resume 上没有渲染方法",
+          not any(hasattr(Resume, n) for n in
+                  ("Generate", "render", "_fill_left_column", "get_root")))
+
+    # ---- V7 一个 PDF 装多份 ----
+    print("\n【V7】一个 PDF 可装多份简历")
+    doc = make_pdf()
+    render_into(doc, [_sample("甲"), _sample("乙")])
+    multi = os.path.join(out_root, "v7.pdf")
+    doc.output(multi)
+    n_pages = open(multi, "rb").read().count(b"/Type /Page") - \
+        open(multi, "rb").read().count(b"/Type /Pages")
+    check("两份简历 → 2 页", n_pages == 2, f"实际 {n_pages} 页")
+
+    # ---- 附加：批量渲染互不影响 ----
+    print("\n【附加】render_many 批量：共享 spacing 不被修改")
+    sp = Spacing()
+    sp_before = dataclasses.asdict(sp)
+    paths = quiet(render_many, [_sample("甲"), _sample("乙"), _sample("丙")],
+                  out_root, spacing=sp, creation_date=DATE)
+    check("批量产出 3 份", len(paths) == 3)
+    check("共享的 spacing 未被修改", dataclasses.asdict(sp) == sp_before)
+    check("批量各份互不相同", len({digest(p) for p in paths}) == 3)
+
+    print("\n" + "=" * 66)
+    print("✅ 顶层验收自检全部通过" if ok else "❌ 顶层验收自检有失败项")
+    print(f"   产物目录：{out_root}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_selftest())

@@ -184,4 +184,35 @@ fpdf 又把文字**垂直居中**在格子里，于是基线落到格子中央�
 
 ---
 
+#### **11：18 资源策略与分支卫生：`Resources/` 全部素材不入库**
+
+- `.gitignore` 从 `Resources/*.ttf` 改为 `Resources/*` + `!Resources/.gitkeep`，
+  目录本身用 `.gitkeep` 保留，并在其中写明素材的获取方式；
+- 决定理由：素材体积小但数量持续变动、随时可能被换成自己的素材，需要时未来再补齐；
+- 后果是**静默降级**而非崩溃 —— 缺字体则中文变空白（退回内置 helvetica），
+  缺图标则该位置留空，两个测试入口在没有素材时仍退出码 0；
+- 补 `TECHNICAL.md` 4.8「资源清单」：逐个列出文件名与引用它的地方；
+- `SKILLS.md` 的 A1 标为**已完成**（`.pyproj` 早已含 `ResumeTemplate.py`，
+  且**刻意不含** `ResumeCore.py`，符合分支策略）；A2 由"应入库"改为"不入库"，
+  附完整说明；E 节补一行结论。
+
+> 核实结论：**中层不依赖任何图标文件**。`ResumeTemplate.py` 里 5 处图片引用
+> 全在 `__main__` 内，`add_profile` / `add_section_title` 只收参数，
+> `STYLES` 的 `image_path` 都是空串 —— 素材是顶层与测试的事。
+
+#### **11：25 修正失效的图标引用**
+
+- `ResumeTemplate.py` 测试入口引用的 `icon.png` 并不存在，
+  改为实际存在的 `icon_Profile_Name.png`（169KB 的主图标）。
+
+#### **11：26 修正 `.pyproj` 的过期注释**
+
+- 注释原先写"入口与启动文件均指向 LayoutEngine"，与实际的
+  `StartupFile=ResumeTemplate.py` 不符；已改正并注明顶层文件为何不列入。
+
+> `.pyproj` 的实质修改（补 `ResumeTemplate.py` 编译项、切换启动文件）
+> 已随提交 `cfc2ea5` 入库，本次只剩注释行。
+
+---
+
 ---

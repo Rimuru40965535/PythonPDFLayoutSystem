@@ -552,6 +552,13 @@ class TextMetrics:
     total_height: float = 0.0
     max_line_width: float = 0.0
     line_height_ratio: float = 1.2
+    # 每行"悬挂出界"的宽度（标点悬挂）。0 表示该行没有悬挂。
+    # 悬挂只影响绘制（标点可略微越过右边界），**不影响** total_height / max_line_width。
+    line_hang: List[float] = field(default_factory=list)
+
+    def hang_of(self, index: int) -> float:
+        """第 index 行悬挂出界的宽度（mm）"""
+        return self.line_hang[index] if index < len(self.line_hang) else 0.0
 
     def iter_pieces(self):
         """按行产出 (行号, run 下标, 文字, x 偏移, 宽度, 该行行高)"""
@@ -570,18 +577,21 @@ class TextMetrics:
 
 
 def measure_text(pdf, runs: List[TextRun], available_width: float,
-                 line_height_ratio: float = 1.2) -> TextMetrics:
+                 line_height_ratio: float = 1.2,
+                 policy: Optional['BreakPolicy'] = None) -> TextMetrics:
     """
     用真实 pdf 测量文本：逐段量宽、按可用宽断行
 
-    **断行复用 fpdf2 自己的逻辑**（`pdf.multi_cell(dry_run=True, output="LINES")`），
-    而不是自写一套 —— 这样"测量出的行数"与"渲染时的行数"必然一致（缺陷 7.7 的根治）。
+    **自写贪心装行**（批次 5 起）：先把 runs 摊平成一维"可断行单元"，再顺序装入行内。
+    这样"测量出的行数"与"渲染时的行数"必然一致 —— 因为 `render` 复用的就是这里
+    算出的 `lines`（缺陷 7.7 的根治）。
 
-    ⚠️ 两个必须显式指定的参数：
-        - `align="L"`：multi_cell 的 align **默认是 'J'（两端对齐）**，
-          两端对齐会改变断行结果，必须与渲染时保持一致；
-        - `wrapmode`：默认 `"WORD"`（按词断行，超长单词退化）。
-          CJK 文本在 WORD 模式下也能正确断行（实测）。
+    > 更正：本函数此前的 docstring 声称"复用 fpdf2 的 `multi_cell`"，
+    > 那是批次 5 之前的实现；现在不再调用 `multi_cell`，也不再需要
+    > `align="L"` / `wrapmode` 那两个 workaround。
+
+    **断行禁则**（`policy`）在"摊平"这一步施加：把违反"行首/行尾禁则"的相邻单元
+    合并成一个不可分单元。`None` 表示使用引擎默认 `DEFAULT_BREAK_POLICY`（启用禁则）。
 
     对多个 run 的处理：**逐 run 断行，然后按行拼接**。
     因此同一行的片段必然来自各自的 run，天然支持分段样式。
@@ -604,7 +614,7 @@ def measure_text(pdf, runs: List[TextRun], available_width: float,
 
     # ---- 1. 把 runs 摊平成"可断行单元"序列 ----
     # 每个单元带自己的 run 下标与字体，因此分段样式天然可用。
-    units = _flatten_runs_to_units(pdf, runs)
+    units = _flatten_runs_to_units(pdf, runs, policy)
     if not units:
         return metrics
 
@@ -616,9 +626,11 @@ def measure_text(pdf, runs: List[TextRun], available_width: float,
     #     独占一行并允许溢出，避免死循环。
     lines: List[List[Tuple[int, str, float, float]]] = []
     heights: List[float] = []
+    hang: List[float] = []
     cur: List[Tuple[int, str, float, float]] = []
     cur_w = 0.0
     cur_max_size = 0.0
+    pending_hang = [0.0]        # 当前行已累计的悬挂宽度
 
     def flush_line():
         nonlocal cur, cur_w, cur_max_size
@@ -641,9 +653,11 @@ def measure_text(pdf, runs: List[TextRun], available_width: float,
         heights.append((cur_max_size or (runs[0].font_size if runs else 12))
                        * line_height_ratio)
         metrics.max_line_width = max(metrics.max_line_width, cur_w)
+        hang.append(pending_hang[0])
         cur = []
         cur_w = 0.0
         cur_max_size = 0.0
+        pending_hang[0] = 0.0
 
     for u in units:
         if u.is_break:
@@ -652,7 +666,31 @@ def measure_text(pdf, runs: List[TextRun], available_width: float,
         w = u.width
         if (available_width and available_width > 0
                 and cur and cur_w + w > available_width + 1e-9):
-            flush_line()
+            # 标点悬挂：本单元放不下时，若它的**尾部是"不得出现在行首"的标点**，
+            # 就允许这部分标点略微悬挂出界，而不是把整个单元挤到下一行。
+            # 理由：禁则会把收尾标点粘到前一个字上（单元变成「能。」这样的形式），
+            # 于是满行时整个「能。」被推到下一行，出现"只含标点的孤行"
+            # —— 实测出现过 4 行变 5 行、末行只剩「。」。
+            # 悬挂是中文排版的通行做法，也是既有"超长单元允许溢出"的自然延伸。
+            hang_w = 0.0
+            if policy is not None and policy.hang_punctuation and u.text:
+                tail = u.text
+                while tail and tail[-1] in policy.no_line_start:
+                    tail = tail[:-1]
+                hang_chars = u.text[len(tail):]
+                if hang_chars:
+                    hang_w = pdf.get_string_width(hang_chars)
+            can_hang = (hang_w > 0.0
+                        and (cur_w + w - available_width)
+                        <= u.font_size * policy.hang_ratio)
+            if not can_hang:
+                flush_line()
+            else:
+                cur.append((u.run_index, u.text, cur_w, w))
+                cur_w += w
+                cur_max_size = max(cur_max_size, u.font_size)
+                pending_hang[0] = max(pending_hang[0], hang_w)
+                continue
         cur.append((u.run_index, u.text, cur_w, w))
         cur_w += w
         cur_max_size = max(cur_max_size, u.font_size)
@@ -663,6 +701,7 @@ def measure_text(pdf, runs: List[TextRun], available_width: float,
     metrics.line_heights = heights
     metrics.line_count = len(lines)
     metrics.total_height = sum(heights)
+    metrics.line_hang = hang
     return metrics
 
 
@@ -678,6 +717,120 @@ class _TextUnit:
 
 # 摊平用的切分正则：
 #   空白段 | 连续非 CJK 非空白（一个"词"） | 单个 CJK 字符 | 其它单字符
+# ============================================================================
+# 3. 断行禁则
+# ============================================================================
+#
+# 中文排版最基本的行首/行尾禁则：
+#   · 收尾类标点（。，、）】》…）**不得出现在行首**；
+#   · 起始类标点（（【《…）**不得出现在行尾**；
+#   · 成对符号（（）《》「」…）应当**整体不断开**。
+#
+# 实现方式：在"摊平成断行单元"这一层把违规的相邻单元**合并**成一个不可分单元。
+# 这样 `measure_text` 与 `render` 共用同一份 `lines`，
+# "量出的行数"与"画出的行数"必然一致 —— 一致性由构造保证。
+
+NO_LINE_START = (
+    "，。、；：？！）】》」』〕｝〗〙〛”’"          # 中文全角
+    "\u3001\u3002\uff0c\uff0e\uff1b\uff1a\uff01\uff1f"   # 逗顿句分冒问叹
+    ",.;:?!)]}>%‰°"                              # 半角
+)
+NO_LINE_END = "（【《「『〔｛〖〘〚“‘([{<"
+PAIR_OPEN = "（【《「『〔｛〖〘〚“‘([{<"
+PAIR_CLOSE = "）】》」』〕｝〗〙〛”’)]}>"
+
+
+@dataclass(frozen=True)
+class BreakPolicy:
+    """
+    断行禁则策略
+
+    默认值即"规范"档；`loose()` 可退回本功能引入前的行为。
+
+    属性：
+        no_line_start: 不得出现在**行首**的字符集合
+        no_line_end:   不得出现在**行尾**的字符集合
+        pair_brackets: 是否把成对符号整体粘住（默认 True）
+        hang_punctuation: 是否允许"纯标点单元"略微悬挂出界（默认 True）
+        hang_ratio: 悬挂上限 = 字号 × 此系数（默认 1.5）。单位与字号同为 pt
+    """
+    no_line_start: str = NO_LINE_START
+    no_line_end: str = NO_LINE_END
+    pair_brackets: bool = True
+    hang_punctuation: bool = True
+    hang_ratio: float = 1.5
+
+    @classmethod
+    def loose(cls) -> 'BreakPolicy':
+        """不做任何禁则（等价于本功能引入前的行为）"""
+        return cls(no_line_start="", no_line_end="", pair_brackets=False,
+                   hang_punctuation=False)
+
+    def is_active(self) -> bool:
+        return bool(self.no_line_start or self.no_line_end or self.pair_brackets)
+
+
+DEFAULT_BREAK_POLICY = BreakPolicy()
+
+# CJK 判定（与 _UNIT_RE 的字符范围保持一致）
+_CJK_RE = re.compile(
+    r"[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]"
+)
+
+
+def _is_blank(text: str) -> bool:
+    return not text.strip()
+
+
+def _apply_break_policy(units: list, policy: 'BreakPolicy') -> list:
+    """
+    把违反禁则的相邻单元合并成不可分单元。
+
+    先做成对符号的整体粘合，再做行首/行尾禁则的合并；
+    重复扫描到稳定（合并可能产生新的违规），带次数上限兜底。
+    """
+    if not policy.is_active() or len(units) < 2:
+        return units
+
+    # ---- 1) 成对符号整体粘住 ----
+    if policy.pair_brackets:
+        merged = []
+        for u in units:
+            if (merged and not merged[-1].is_break and not u.is_break
+                    and not _is_blank(u.text) and not _is_blank(merged[-1].text)
+                    and ((merged[-1].text[-1] in PAIR_OPEN and u.text[0] in PAIR_CLOSE)
+                         or (merged[-1].text[-1] in PAIR_CLOSE and u.text[0] in PAIR_OPEN))):
+                p = merged[-1]
+                merged[-1] = _TextUnit(p.run_index, p.text + u.text,
+                                       max(p.font_size, u.font_size),
+                                       p.width + u.width)
+                continue
+            merged.append(u)
+        units = merged
+
+    # ---- 2) 行首/行尾禁则 ----
+    for _ in range(8):
+        changed = False
+        out = []
+        for u in units:
+            if out:
+                p = out[-1]
+                ok = (not p.is_break and not u.is_break
+                      and not _is_blank(p.text) and not _is_blank(u.text))
+                if ok and (u.text[0] in policy.no_line_start
+                           or p.text[-1] in policy.no_line_end):
+                    out[-1] = _TextUnit(p.run_index, p.text + u.text,
+                                        max(p.font_size, u.font_size),
+                                        p.width + u.width)
+                    changed = True
+                    continue
+            out.append(u)
+        units = out
+        if not changed:
+            break
+    return units
+
+
 _UNIT_RE = re.compile(
     r"(\s+|"
     r"[\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]"
@@ -689,7 +842,8 @@ _UNIT_RE = re.compile(
 )
 
 
-def _flatten_runs_to_units(pdf, runs: List[TextRun]) -> List['_TextUnit']:
+def _flatten_runs_to_units(pdf, runs: List[TextRun],
+                           policy: Optional['BreakPolicy'] = None) -> List['_TextUnit']:
     """
     把 runs 摊平成可断行单元序列
 
@@ -699,7 +853,15 @@ def _flatten_runs_to_units(pdf, runs: List[TextRun]) -> List['_TextUnit']:
         - 空白单独成段，便于行尾丢弃
         - `\\n` 变成硬换行单元
 
+    随后按 `policy` 施加**断行禁则**（标点不得落在行首/行尾、成对符号整体粘住），
+    做法是把违规的相邻单元合并成一个不可分单元。
+
     宽度在**各自的字体**下测量 —— 这正是分段样式的关键。
+
+    Args:
+        pdf: FPDF 实例
+        runs: 文本片段列表
+        policy: 断行禁则。None 表示使用 `DEFAULT_BREAK_POLICY`
     """
     units: List[_TextUnit] = []
     for ri, r in enumerate(runs):
@@ -713,7 +875,8 @@ def _flatten_runs_to_units(pdf, runs: List[TextRun]) -> List['_TextUnit']:
                     piece = m.group(0)
                     units.append(_TextUnit(
                         ri, piece, r.font_size, pdf.get_string_width(piece)))
-    return units
+    return _apply_break_policy(
+        units, DEFAULT_BREAK_POLICY if policy is None else policy)
 
 
 # ============================================================================
@@ -1889,6 +2052,7 @@ class TextObject(LayoutObject):
         markdown: bool = True,
         line_height_ratio: float = 1.2,
         mono_font: Optional[str] = None,
+        break_policy: Optional['BreakPolicy'] = None,
     ):
         super().__init__(
             name=name, x=x, y=y, width=width, height=height,
@@ -1906,6 +2070,8 @@ class TextObject(LayoutObject):
         self.markdown = markdown
         self.line_height_ratio = line_height_ratio
         self.mono_font = mono_font
+        # 断行禁则。None 表示使用引擎默认（DEFAULT_BREAK_POLICY，启用禁则）
+        self.break_policy = break_policy
         
         # ---- 分段样式：runs 是唯一真相 ----
         if runs is not None:
@@ -2076,7 +2242,8 @@ class TextObject(LayoutObject):
             _, _, w, _ = self._content_rect_local()
             available_width = w
         return measure_text(pdf, self._runs, available_width,
-                            line_height_ratio=self.line_height_ratio)
+                            line_height_ratio=self.line_height_ratio,
+                            policy=self.break_policy)
     
     def _source_w(self, pdf=None) -> float:
         """
@@ -2092,7 +2259,8 @@ class TextObject(LayoutObject):
             return pad
         if pdf is None:
             return self._estimate_runs_width(self._runs) + pad
-        return measure_text(pdf, self._runs, available_width=0).max_line_width + pad
+        return measure_text(pdf, self._runs, available_width=0,
+                            policy=self.break_policy).max_line_width + pad
     
     def _estimate_runs_width(self, runs: List[TextRun]) -> float:
         """按字符类别估算 runs 的总宽度（无 pdf 时的回退）"""
@@ -2146,13 +2314,15 @@ class TextObject(LayoutObject):
             # 断行宽度取"父能提供的宽度"（self._constraint_w 由 _measure 传入）
             m = measure_text(pdf, self._runs,
                              available_width=max(self._constraint_w, 0.0),
-                             line_height_ratio=self.line_height_ratio)
+                             line_height_ratio=self.line_height_ratio,
+                             policy=self.break_policy)
             return m.total_height + pad
         
         # 不换行，或没有 pdf：按单行处理
         if pdf is not None:
             m = measure_text(pdf, self._runs, available_width=0,
-                             line_height_ratio=self.line_height_ratio)
+                             line_height_ratio=self.line_height_ratio,
+                             policy=self.break_policy)
             return m.total_height + pad
         single = max((r.font_size for r in self._runs), default=self.font_size)
         return single * self.line_height_ratio + pad
@@ -2184,7 +2354,8 @@ class TextObject(LayoutObject):
         
         # 逐 run 测量：断行宽度 = 有效宽
         m = measure_text(pdf, self._runs, available_width=eff_w,
-                         line_height_ratio=self.line_height_ratio)
+                         line_height_ratio=self.line_height_ratio,
+                         policy=self.break_policy)
         if m.line_count == 0:
             return abs_y
         
@@ -4341,5 +4512,102 @@ if __name__ == "__main__":
           f"{ {k: round(v, 2) for k, v in _lp_off.items()} }，"
           f"文字实高 {_lp_text_h['Land_top']:.2f}mm）")
     print(f"    ✅ 文字落在盒内通过（最大偏移 {max(_lp_off.values()):.2f}mm）")
+
+    # 14. 断行禁则（CJK 行首/行尾禁则）
+    #     中文排版的基本规则：收尾类标点不得出现在行首（。，、）】》…），
+    #     起始类标点不得出现在行尾（（【《…），成对符号应整体不断开。
+    #     实测动机：默认策略引入前，宽 60/90mm 下都出现过「）」或「。」落到行首。
+    print("\n【14. 断行禁则】")
+    _bp_text = ("这是一段用于测试断行的中文文本，其中包含逗号、句号。"
+                "还有括号（像这样）以及书名号《示例》。")
+    _bp_runs = [TextRun(text=_bp_text, font_name=font_name, font_size=10)]
+    _bp_bad_start = "，。、；：？！）】》」』〕｝〗〙〛”’"
+    _bp_bad_end = "（【《「『〔｛〖〘〚“‘"
+
+    # 14.1 启用禁则：任何宽度下都不得出现行首/行尾违规
+    _bp_viol = []
+    for _w in (40, 50, 60, 75, 90, 120):
+        _m = measure_text(_lp_pdf, _bp_runs, available_width=_w,
+                          line_height_ratio=1.2, policy=BreakPolicy())
+        for _ln in _m.lines:
+            _s = "".join(p[1] for p in _ln)
+            if not _s:
+                continue
+            if _s[0] in _bp_bad_start:
+                _bp_viol.append((_w, "行首", _s))
+            if _s[-1] in _bp_bad_end:
+                _bp_viol.append((_w, "行尾", _s))
+    assert not _bp_viol, f"启用禁则后仍有行首/行尾违规：{_bp_viol[:3]}"
+    print(f"    ✅ 行首/行尾禁则通过（6 种宽度 × 全部行，零违规）")
+
+    # 14.1b 标点悬挂：禁则会制造"只含标点的孤行"，悬挂应把它消掉。
+    #       判据：开启悬挂后的行数不得多于关闭时，且悬挂量不超过策略上限。
+    _bp_hang_text = ("设计并实现了一套基于 Python 的 PDF 简历自动生成系统。\n"
+                     "系统采用分层排版引擎，支持样式定制、多模板切换、"
+                     "自动分栏等高级功能。")
+    _bp_hang_runs = [TextRun(text=_bp_hang_text, font_name=font_name, font_size=10)]
+    _bp_worse = []
+    for _w in (40, 50, 60, 75, 90, 120):
+        _on = measure_text(_lp_pdf, _bp_hang_runs, available_width=_w,
+                           line_height_ratio=1.2,
+                           policy=BreakPolicy(hang_punctuation=True))
+        _off = measure_text(_lp_pdf, _bp_hang_runs, available_width=_w,
+                            line_height_ratio=1.2,
+                            policy=BreakPolicy(hang_punctuation=False))
+        if _on.line_count > _off.line_count:
+            _bp_worse.append((_w, _on.line_count, _off.line_count))
+        for _h in _on.line_hang:
+            # 悬挂上限 = 字号 × hang_ratio（此处 10pt × 1.5 = 15）
+            assert _h <= 10 * BreakPolicy().hang_ratio + 1e-6, \
+                f"悬挂量 {_h:.2f} 超出策略上限"
+    assert not _bp_worse, f"开启悬挂后行数不应变多，实际：{_bp_worse}"
+    _bp_helped = 0
+    for _w in (40, 50, 60, 75, 90, 120):
+        _on = measure_text(_lp_pdf, _bp_hang_runs, available_width=_w,
+                           line_height_ratio=1.2,
+                           policy=BreakPolicy(hang_punctuation=True))
+        _off = measure_text(_lp_pdf, _bp_hang_runs, available_width=_w,
+                            line_height_ratio=1.2,
+                            policy=BreakPolicy(hang_punctuation=False))
+        if _on.line_count < _off.line_count:
+            _bp_helped += 1
+    assert _bp_helped > 0, "至少应有一个宽度体现悬挂减少行数（否则该用例没有区分度）"
+    print(f"    ✅ 标点悬挂通过（{_bp_helped}/6 种宽度下行数减少，无一处变多）")
+
+    # 14.2 对照：loose 策略下确实会出现违规 —— 证明这个断言有区分度
+    _bp_loose_bad = 0
+    for _w in (40, 50, 60, 75, 90, 120):
+        _m = measure_text(_lp_pdf, _bp_runs, available_width=_w,
+                          line_height_ratio=1.2, policy=BreakPolicy.loose())
+        for _ln in _m.lines:
+            _s = "".join(p[1] for p in _ln)
+            if _s and _s[0] in _bp_bad_start:
+                _bp_loose_bad += 1
+    assert _bp_loose_bad > 0, \
+        "loose 策略下本应能复现行首违规（否则该用例没有区分度）"
+    print(f"    ✅ 对照通过（loose 策略复现行首违规 {_bp_loose_bad} 处）")
+
+    # 14.3 成对符号整体不断开：不得出现"（"在行尾而"）"在下一行行首的孤立情形
+    for _w in (40, 50, 60, 75, 90, 120):
+        _m = measure_text(_lp_pdf, _bp_runs, available_width=_w,
+                          line_height_ratio=1.2, policy=BreakPolicy())
+        _flat = ["".join(p[1] for p in _ln) for _ln in _m.lines]
+        for _i, _s in enumerate(_flat[:-1]):
+            if _s.endswith("（"):
+                raise AssertionError(f"宽度 {_w} 下「（」被留在行尾：{_flat}")
+    print("    ✅ 成对符号整体不断开通过")
+
+    # 14.4 禁则不应破坏"填满到接近可用宽"（别为了禁则留出大空洞）
+    _bp_max_gap = 0.0
+    for _w in (60, 90, 120):
+        _m = measure_text(_lp_pdf, _bp_runs, available_width=_w,
+                          line_height_ratio=1.2, policy=BreakPolicy())
+        for _ln in _m.lines[:-1]:            # 末行本就不满
+            if _ln:
+                _gap = _w - (_ln[-1][2] + _ln[-1][3])
+                _bp_max_gap = max(_bp_max_gap, _gap)
+    assert _bp_max_gap < 15.0, \
+        f"非末行的剩余空白不应过大（最大 {_bp_max_gap:.2f}mm），禁则可能引入了大空洞"
+    print(f"    ✅ 填满度通过（非末行最大剩余空白 {_bp_max_gap:.2f}mm）")
 
     print("\n✅ 回归契约断言全部通过")

@@ -1647,6 +1647,7 @@ def add_detail_body(self: LayoutObject,
                     description: str = "",
                     style: Optional[Style] = None,
                     height: Optional[float] = None,
+                    inner_padding: Optional[Padding] = None,
                     break_policy: Optional[BreakPolicy] = None,
                     text_cfg: Optional[TextConfig] = None,
                     layer: int = 0) -> DetailBodyHandle:
@@ -1662,14 +1663,20 @@ def add_detail_body(self: LayoutObject,
 
     Args:
         prefix: 命名前缀（由 `add_detail` 统一给出）
-        description: 描述文字（支持 \n 硬换行与内联 Markdown）
+        description: 描述文字（支持 \\n 硬换行与内联 Markdown）
         style: 文本样式
         height: 固定高度 (mm)。None 表示自动结算
+        inner_padding: 文本块**自身的内边距**，默认 `Padding.all(2)`（= 历史行为）。
+                       ⚠️ 它会计入 CONTENT 高度，所以文字顶部与底部各留出该空白 ——
+                       单行文本时表现就是"文字略微偏下"（盒高 = 文本高 + 上下内边距）。
+                       要紧凑排版或调试对齐时传 `Padding.all(0)` 关闭。
 
     Returns:
         DetailBodyHandle
     """
     style = STYLES["detail_description"] if style is None else style
+    if inner_padding is None:
+        inner_padding = Padding.all(2)
 
     details = LayoutObject(
         name=f"{prefix}_details",
@@ -1690,7 +1697,7 @@ def add_detail_body(self: LayoutObject,
         text=description,
         width=0, height=0,
         color=White,
-        padding=Padding.all(2),
+        padding=inner_padding,
         align_x=AlignX.LEFT,
         align_y=AlignY.FLOW,
         multi_line=True,

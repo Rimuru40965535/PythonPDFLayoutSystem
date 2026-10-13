@@ -2436,7 +2436,7 @@ class TextObject(LayoutObject):
     
     def _source_h(self, pdf=None) -> float:
         """
-        文本的内容固有高度（不含对父约束的夹紧）
+        文本的内容固有高度（不含对父约束的夹紧）—— **单位一律 mm**
 
         批次 4.2 起由 _measure 的退出方向调用。
         注意：这里**不**做任何对父可用空间的裁剪 —— 裁剪发生在测量退出方向（夹紧）
@@ -2445,31 +2445,45 @@ class TextObject(LayoutObject):
         批次 5 起：
             有 pdf 且启用 multi_line -> **真实断行测量**（缺陷 7.7 的根治）
             其余情况                 -> 退回单行/估算
+
+        ⚠️ **单位（批次 10 修复）**：本函数是 `SizeY.CONTENT` 结算高度的唯一依据，
+        而它的返回值会与 `padding`（**mm**）相加、并写进 `_laid_out_h`（**mm**）。
+        但 `measure_text` 返回的 `total_height` 是 **pt**。
+        旧实现把 pt 直接当 mm 返回，于是**所有 CONTENT 文本块的高度都放大约 2.83 倍**
+        （1/PT_TO_MM）：两行 10pt 文本 + 4mm 内边距本该 12.47mm，实测 28.00mm。
+
+        判别性证据：给文本块加 10mm 内边距，高度只增 20.00mm（= 2×10，mm 空间一致），
+        而 padding=0 时高度是 24.000（= 2 行 × 12pt 的 pt 数值）—— 两者不同空间。
+
+        这也解释了历史遗留：旧顶层为何需要 `description_height=50` 这种手调旋钮 ——
+        因为 CONTENT 结算一直偏大，不硬编码就没法用。
         """
         if self.children:
             # 有子元素时按容器处理
             return super()._source_h(pdf)
-        
+
         pad = self.padding.top + self.padding.bottom
         if not self._runs:
             return pad
-        
+
         if pdf is not None and self.multi_line:
             # 断行宽度取"父能提供的宽度"（self._constraint_w 由 _measure 传入）
             m = measure_text(pdf, self._runs,
                              available_width=max(self._constraint_w, 0.0),
                              line_height_ratio=self.line_height_ratio,
                              policy=self.break_policy)
-            return m.total_height + pad
-        
+            # measure_text 的 total_height 是 pt，必须换算到 mm 才能与 pad 相加
+            return m.total_height * PT_TO_MM + pad
+
         # 不换行，或没有 pdf：按单行处理
         if pdf is not None:
             m = measure_text(pdf, self._runs, available_width=0,
                              line_height_ratio=self.line_height_ratio,
                              policy=self.break_policy)
-            return m.total_height + pad
+            return m.total_height * PT_TO_MM + pad
+        # 无 pdf 的估算路径：字号 × 系数 是 pt 数值，同样要换算
         single = max((r.font_size for r in self._runs), default=self.font_size)
-        return single * self.line_height_ratio + pad
+        return single * self.line_height_ratio * PT_TO_MM + pad
     
     
     @timer

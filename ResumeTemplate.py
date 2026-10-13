@@ -44,6 +44,7 @@
 
 import contextlib
 import io
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Sequence
 
@@ -870,6 +871,109 @@ class TextConfig:
 
 
 # ============================================================================
+# 3c. 留白（纵向间距）集中定义
+# ============================================================================
+
+@dataclass(frozen=True)
+class Spacing:
+    """
+    简历的**全部纵向留白**集中在一处，像宏一样可改、可整体缩放。
+
+    **为什么需要它**：留白此前散在三处 ——
+      · 各模板的参数（`title_detail_gap` / `between_details_gap` / `para_gap` / `gap`）
+      · 顶层的 `Lead` 字典
+      · 以及若干"谁都没加"的缺口（如节标题与直挂内容之间实测 0.00mm）
+    同一概念两处命名，改一处不知道另一处要不要改。
+
+    现在：**这里定义，各层取用**。
+
+    命名规则：`<区域>_<上元素>_<下元素>`，或 `between_<同类>`。
+    单位一律 mm；**0 表示不留白**（模板会跳过 spacer 的创建）。
+
+    ## 整体缩放（对应"内容多少"的宏观取舍）
+
+        Spacing().scaled(0.8)     # 全部留白 × 0.8 —— 内容多时塞得下
+        Spacing().scaled(1.3)     # 内容少时排布更均匀
+        Spacing.compact()/loose() # 常用档位（0.7 / 1.3）
+
+    例：
+        >>> res = Resume(..., spacing=Spacing.loose())
+        >>> res.Generate(spacing=Spacing().scaled(0.85))
+    """
+
+    # ---- 左栏 ----
+    left_top: float = 10.0                  # 左栏顶部
+    photo_name: float = 5.0                 # 证件照 ↔ 姓名
+    name_contacts: float = 5.0              # 姓名 ↔ 联系方式
+    between_contacts: float = 5.0           # 联系方式之间
+    contacts_skills: float = 5.0            # 联系方式 ↔ 技能/证书/荣誉
+    between_skills: float = 5.0             # 技能/证书/荣誉三块之间
+    left_bottom: float = 5.0                # 左栏底部
+
+    # ---- 右栏 ----
+    right_top: float = 10.0                 # 右栏顶部
+    section_title_to_body: float = 3.0      # 节标题 ↔ 该节首个内容
+                                            # （= 顶层 Lead 的历史默认值 3）
+                                            # ⚠️ 直挂内容的调用方（不走 add_section）
+                                            #    需自行用它留白，见 add_section_heading
+                                            #    的 gap_after；否则实测为 0.00mm
+    between_paras: float = 1.0              # 图标段落之间
+    detail_head_to_body: float = 0.0        # 详情三栏（关键词/时间/标签）↔ 描述体
+    between_details: float = 5.0            # 节内相邻详情之间
+    between_sections: float = 5.0           # 节之间
+    right_bottom: float = 5.0               # 右栏底部
+
+    # ---- 分条目 ----
+    between_bullets: float = 0.0            # 分条目之间（0 = 紧贴）
+
+    # ---- 派生值 ----
+    def scaled(self, factor: float) -> 'Spacing':
+        """全部留白乘以 factor —— 用于按内容多少整体调松紧"""
+        return dataclasses.replace(
+            self, **{f.name: getattr(self, f.name) * factor
+                     for f in dataclasses.fields(self)})
+
+    @classmethod
+    def compact(cls) -> 'Spacing':
+        """紧凑档：内容多、要往一页里塞"""
+        return cls().scaled(0.7)
+
+    @classmethod
+    def loose(cls) -> 'Spacing':
+        """宽松档：内容少、要排布均匀"""
+        return cls().scaled(1.3)
+
+    def as_lead(self) -> Dict[str, float]:
+        """
+        导出为顶层 `Lead` 字典的键（历史命名）。
+
+        用途：`Resume` 的间距设置仍以 `Lead` 为对外形式（已入库的调用点不动），
+        内部改由本对象供值，从而"一处定义、整体可缩放"。
+        """
+        return {
+            "Left_Column_Above_All": self.left_top,
+            "Left_Column_Below_Photo_Avove_Name": self.photo_name,
+            "Left_Column_Below_Name_Above_Contacts": self.name_contacts,
+            "Left_Column_Between_Contacs": self.between_contacts,
+            "Left_Column_Below_Contacts_Above_Skills&Awards": self.contacts_skills,
+            "Left_Column_Between_Skills&Awards": self.between_skills,
+            "Left_Column_Below_All": self.left_bottom,
+            "Right_Column_Above_All": self.right_top,
+            "Right_Column_Between_SectionTitle_SectionDetails":
+                self.section_title_to_body,
+            "Right_Column_Between_Sections": self.between_sections,
+            "Right_Column_Between_Details": self.between_details,
+            "Right_Column_Below_All": self.right_bottom,
+        }
+
+    def describe(self) -> str:
+        """一行摘要，便于在日志里确认当前档位"""
+        vals = [getattr(self, f.name) for f in dataclasses.fields(self)]
+        return (f"Spacing(共 {len(vals)} 项，合计 {sum(vals):.1f}mm，"
+                f"非零 {sum(1 for v in vals if v > 0)} 项)")
+
+
+# ============================================================================
 # 4. 内部工具
 # ============================================================================
 
@@ -1301,6 +1405,7 @@ def add_section_heading(self: LayoutObject,
                         title: str = "",
                         image_path: str = "",
                         text_cfg: Optional[TextConfig] = None,
+                        gap_after: float = 0.0,
                         layer: int = 0) -> TitleHandle:
     """
     生成节标题模板（图标 + 标题 + 下方分隔线）。
@@ -1401,6 +1506,12 @@ def add_section_heading(self: LayoutObject,
     )
     if title or image_path:
         handle.fill(title=title, image_path=image_path)
+    # 分隔线之下的留白。默认 0（与历史行为一致）；
+    # **直挂内容**的调用方（不走 add_section）应当传
+    # `gap_after=Spacing().section_title_to_body`，否则标题与内容会贴在一起
+    # ——实测为 0.00mm，是"技能亮点"那节看起来没有边距的原因。
+    if gap_after > 0:
+        self.add_spacer(f"{prefix}_below_gap", gap_after, layer=layer)
     return handle
 
 
@@ -2475,11 +2586,11 @@ def add_section(self: LayoutObject,
         index=index,
         icon_style=icon_style,
         text_style=title_style,
+        # 留白统一由 add_section_heading 的 gap_after 负责（与直挂内容的调用方同一机制），
+        # 这样"节标题到该节内容"的间距只有一个实现，不会再出现某条路径漏加。
+        gap_after=title_detail_gap,
         layer=layer,
     ).fill(title=title_text, image_path=icon_path)
-
-    if title_detail_gap > 0:
-        self.add_spacer(f"Lead_Section_{index}_Title_Details", title_detail_gap)
 
     handles: List[DetailsHandle] = []
     for i, item in enumerate(items):
@@ -2666,9 +2777,13 @@ if __name__ == "__main__":
     # ---- 6. 右栏：节标题 + 节详情 ----
     print("\n【6. 生成右栏内容】", flush=True)
 
+    # 留白统一取自 Spacing（中层唯一真相源）。
+    # 想整体调松紧：换成 Spacing.compact() / Spacing.loose() / Spacing().scaled(k)
+    _SP = Spacing()
     # 图标分段的公共参数：左栏宽 = 图标宽、整行不额外缩进（右栏本身有内边距）
-    _PARA_KW_ARGS = {"icon_width": 4.0, "icon_align": AlignY.VCENTER,
-                     "indent": 0.0, "gap": 2.0}
+    # 不传 icon_align —— 图标默认按 first_line 锚定（对齐正文首行），
+    # icon_align 只在 icon_anchor="cell" 时生效。
+    _PARA_KW_ARGS = {"icon_width": 4.0, "indent": 0.0, "gap": 2.0}
 
     edu_title = right_column.add_section_heading(
         index=0,
@@ -2676,6 +2791,8 @@ if __name__ == "__main__":
         text_style=STYLES["section_title_text"],
         title="教育背景",
         image_path=".\\Resources\\icon_Education_History.png",
+        # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
+        gap_after=_SP.section_title_to_body,
         layer=1,
     )
     print(f"  ✅ 节标题: {edu_title.node.name} → {edu_title.text.get_text()}", flush=True)
@@ -2719,6 +2836,8 @@ if __name__ == "__main__":
         text_style=STYLES["section_title_text"],
         title="项目经历",
         image_path=".\\Resources\\icon_Project_History.png",
+        # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
+        gap_after=_SP.section_title_to_body,
         layer=1,
     )
 
@@ -2763,6 +2882,8 @@ if __name__ == "__main__":
         text_style=STYLES["section_title_text"],
         title="技能亮点",
         image_path=".\\Resources\\icon_Project_History.png",
+        # 标题分隔线之下的留白 —— 直挂内容的节必须自己给，否则实测 0.00mm
+        gap_after=_SP.section_title_to_body,
         layer=1,
     )
     print(f"  ✅ 节标题: {demo_title.text.get_text()}", flush=True)
@@ -3228,6 +3349,40 @@ if __name__ == "__main__":
         "多行时行高应由正文折行实高决定，居中无副作用"
     print(f"  ✅ 图标段落垂直对齐通过（单行+大图标 行高{_rowh:.2f}/文字{_th:.2f}"
           f" → 居中量 {_expect_dy:.2f}mm；多行时行高仍由正文决定）", flush=True)
+
+    # ---- 9b. 留白：Spacing 对象与节标题的 gap_after ----
+    # 起因（用户目视发现）：直挂内容的节，标题分隔线与首个内容之间实测 0.00mm
+    # —— 因为留白只在 add_section 那条路径上加，直挂的调用方没人加。
+    print("\n【9b. 留白 Spacing 与 gap_after】", flush=True)
+    assert Spacing().section_title_to_body > 0, "节标题↔内容的默认留白应 > 0"
+    # scaled 必须等比缩放全部字段
+    _sp0, _sp5 = Spacing(), Spacing().scaled(0.5)
+    _flds = [f.name for f in dataclasses.fields(Spacing)]
+    for _fn in _flds:
+        assert abs(getattr(_sp5, _fn) - getattr(_sp0, _fn) * 0.5) < 1e-9, \
+            f"scaled(0.5) 应把 {_fn} 减半"
+    assert len(Spacing.compact().as_lead()) == 12, "as_lead 应导出 12 个 Lead 键"
+    # gap_after 必须精确落到"分隔线之下"
+    _g_probe = {}
+    for _gap in (0.0, Spacing().section_title_to_body, 6.0):
+        _gr = LayoutObject(name=f"Gap_{_gap}", width=135.0, height=200,
+                           padding=Padding.all(0), layer=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _gh = _gr.add_section_heading(
+                index=0, text_style=STYLES["section_title_text"],
+                icon_style=STYLES["section_title_image"],
+                title="技能亮点", gap_after=_gap, layer=0)
+            _gp = _gr.add_para(text="内容", icon_width=4.0, indent=0.0, gap=2.0)
+            _gr.layout(pdf=pdf, force=True)
+        _db = _gh.divider.get_absolute_y() + _gh.divider.get_effective_height()
+        _g_probe[_gap] = _gp.node.get_absolute_y() - _db
+    for _gap, _got in _g_probe.items():
+        assert abs(_got - _gap) < 0.01, \
+            f"gap_after={_gap} 时实际留白应为 {_gap}，实测 {_got:.3f}"
+    print(f"  ✅ gap_after 精确生效（0/3/6 → "
+          f"{_g_probe[0.0]:.2f}/{_g_probe[3.0]:.2f}/{_g_probe[6.0]:.2f}mm）", flush=True)
+    print(f"  ✅ Spacing 通过（{Spacing().describe()}；"
+          f"scaled(0.5) 等比、as_lead 导出 12 键）", flush=True)
 
     # ---- 10. 详情标题三栏的**基线对齐**（渲染级断言）----
     # ⚠️ 这条断言存在的理由：这三栏的"文字盒几何"完全相同（都是 FILL，随容器），

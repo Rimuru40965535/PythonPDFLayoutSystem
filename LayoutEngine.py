@@ -3279,7 +3279,9 @@ def create_text_block(
         style: 样式对象。None 表示 Style() 的全默认值
         height: 文本块高度 (mm)。0 表示取父容器可用高
         multi_line: 是否自动换行（pdf.multi_cell）
-        line_height: 行高。None 表示由字号推出（font_size * 0.6）
+        line_height: 行高。**当前为保留参数** —— 它只被写入 TextObject._line_height，
+                     全库从不读取；实际行高由 line_height_ratio（默认 1.2）决定。
+                     历史文档曾误写为 "None 表示由字号推出（font_size * 0.6）"
         align_x: 水平对齐，默认 LEFT
         align_y: 垂直对齐，默认 FLOW（接在流式序列的下一个位置）
         padding: 内边距。None 表示沿用 style.padding

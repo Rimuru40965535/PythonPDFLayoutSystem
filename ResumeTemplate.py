@@ -593,13 +593,19 @@ def add_profile(self: LayoutObject,
     )
 
     # 横带：左格定宽图标、右格占满剩余。
-    # 横带的 x 已经右移了 row_inset，宽度必须同步收窄，否则右侧会溢出。
-    band_w = max(content.get_content_area()[2] - row_inset, 0.0)
+    #
+    # 缩进**必须做成行容器的内边距**，不能靠"把横带右移 + 手动收窄"：
+    # create_band 会按"父内容区宽"重算自己的宽度与各格位置，与手动定的值打架，
+    # 结果是横带按住户外框宽 54.29 铺开、文本右溢出 23mm。
+    # 做成内边距后，行内容区本身就是 51.29，"图标 4 + 文本 47.29" 自然落在界内，
+    # 且与旧版（split 容器带 Padding.left(3)）的几何逐项一致。
+    #
+    # content_height 是 FIXED，给容器加内边距不会改变它的外框高，
+    # 撑不住的是"内边距 + 内容"，而这里内容（图标 6mm / 文本 7mm）本来就够小。
+    content.padding = Padding(left=row_inset)
+    row_inner_w = max(content.get_content_area()[2], 0.0)
     cell_w = icon_width + gap
-    if band_w > cell_w > 0:
-        ratio = [cell_w, band_w - cell_w]
-    else:
-        ratio = [1.0, 1.0]
+    ratio = [cell_w, row_inner_w - cell_w] if row_inner_w > cell_w > 0 else [1.0, 1.0]
 
     band = create_band(
         parent=content,
@@ -611,9 +617,8 @@ def add_profile(self: LayoutObject,
         layer=layer,
         container_name=f"{prefix}_split",
     )
-    # 旧版 split 容器带 Padding.left(3)：改为整条横带右移同样的量
-    band.x = row_inset
-    band.width = band_w
+    # 旧版 split 容器居中于 content，故横带 x 恒为 0
+    band.x = 0
 
     icon_range, text_range = band.children[0], band.children[1]
     icon_range.add_child(icon)
@@ -1371,7 +1376,7 @@ if __name__ == "__main__":
     # ---- 7. 渲染与高度结算 ----
     print("\n【7. 渲染 PDF】", flush=True)
     root.layout(pdf=pdf, force=True)
-    root.render(pdf, is_fill=False)
+    root.render_debug(pdf, is_fill=False)
 
     output_path = "resume_template_v2_test.pdf"
     pdf.output(output_path)

@@ -41,6 +41,7 @@ from typing import Optional, Union, List, Tuple, Dict, Any, Callable
 from collections import defaultdict
 from dataclasses import dataclass, field, replace as dataclasses_replace
 import contextlib
+import copy
 import dataclasses
 import inspect
 import os
@@ -278,7 +279,16 @@ class Style:
         fill_color: 填充颜色 (Color)
         image_path: 图片路径 (str)
         padding: 内边距 (Padding)
+        align_x: 文字水平对齐 (AlignX)。默认 NONE = 不指定，用 TextObject 的默认
+        align_y: 文字盒内垂直对齐 (AlignY)。默认 NONE = 不指定
+        line_height_ratio: 行高系数 (float)。行高 = 字号 × 此值
+        break_policy: 断行禁则 (BreakPolicy)。None = 用引擎默认
         fit_mode: 图片适配模式 (str) — 仅 ImageObject 使用
+
+    `align_x` / `align_y` / `line_height_ratio` / `break_policy` 是"文字在框里
+    怎么摆"的属性，由 `TextObject.from_style` 使用；`ImageObject.from_style` 忽略它们。
+    它们**只影响渲染与测量，不影响布局几何**（对齐不参与 measure），
+    因此调它们不会挪动盒子。
 
     注意：
         `padding` 的默认值曾是 `Padding.all(0)` 这一**可变对象**（缺陷 7.10），
@@ -296,6 +306,10 @@ class Style:
         fill_color: Color = White,
         image_path: str = "",
         padding: Optional[Padding] = None,
+        align_x: Optional[AlignX] = None,
+        align_y: Optional[AlignY] = None,
+        line_height_ratio: Optional[float] = None,
+        break_policy: Optional['BreakPolicy'] = None,
         fit_mode="cover"
     ):
         """
@@ -310,6 +324,10 @@ class Style:
             fill_color: 填充颜色
             image_path: 图片路径 (仅用于 ImageObject)
             padding: 内边距。None 表示新建 Padding.all(0)（**每次新建**，不共享）
+            align_x: 文字水平对齐。None 表示"样式不表态"，由 TextObject 的默认决定
+            align_y: 文字盒内垂直对齐。None 表示"样式不表态"
+            line_height_ratio: 行高系数。None 表示"样式不表态"（引擎默认 1.2）
+            break_policy: 断行禁则。None 表示"样式不表态"（用引擎默认策略）
             fit_mode: 图片适配模式 (仅用于 ImageObject)
         """
         self.font_name = font_name
@@ -320,7 +338,32 @@ class Style:
         self.fill_color = fill_color
         self.image_path = image_path
         self.padding = Padding.all(0) if padding is None else padding
+        # "文字在框里怎么摆"—— 由 TextObject.from_style 使用
+        self.align_x = align_x
+        self.align_y = align_y
+        self.line_height_ratio = line_height_ratio
+        self.break_policy = break_policy
         self.fit_mode = fit_mode
+
+    def replace(self, **overrides) -> 'Style':
+        """
+        返回按 overrides 覆盖后的**新** Style（原实例不变）
+
+        用途：想调整某一处而不污染共用样式。
+        `STYLES` 里的样式对象是被多处共享的，直接改它的属性会影响所有使用者；
+        正确做法是 `STYLES["x"].replace(align_y=AlignY.VCENTER)` 得到一份私有副本。
+
+        Example:
+            >>> mine = STYLES["detail_time_1"].replace(align_y=AlignY.VCENTER)
+            >>> STYLES["detail_time_1"].align_y is None   # 原样式未被改动
+            True
+        """
+        new = copy.copy(self)
+        for k, v in overrides.items():
+            if not hasattr(self, k):
+                raise AttributeError(f"Style 没有属性 {k!r}，无法覆盖")
+            setattr(new, k, v)
+        return new
 
     def get_font_style(self) -> str:
         """
@@ -337,8 +380,15 @@ class Style:
         return style
 
     def __repr__(self) -> str:
+        extra = ''
+        if self.align_x is not None:
+            extra += f", align_x={self.align_x.name}"
+        if self.align_y is not None:
+            extra += f", align_y={self.align_y.name}"
+        if self.line_height_ratio is not None:
+            extra += f", lhr={self.line_height_ratio}"
         return (f"Style(font='{self.font_name}', size={self.font_size}, "
-                f"bold={self.bold}, italic={self.italic})")
+                f"bold={self.bold}, italic={self.italic}{extra})")
 
 
 # ============================================================================
@@ -2137,6 +2187,16 @@ class TextObject(LayoutObject):
         name: str,
         style: Optional[Style] = None,
         text: str = "",
+        font_name: Optional[str] = None,
+        font_size: Optional[float] = None,
+        font_style: Optional[str] = None,
+        text_color: Optional[Color] = None,
+        color: Optional[Color] = None,
+        padding: Optional[Padding] = None,
+        align_x: Optional[AlignX] = None,
+        align_y: Optional[AlignY] = None,
+        line_height_ratio: Optional[float] = None,
+        break_policy: Optional['BreakPolicy'] = None,
         **overrides,
     ) -> 'TextObject':
         """
@@ -2145,24 +2205,37 @@ class TextObject(LayoutObject):
         把"样式 → 渲染参数"的翻译集中在此处，避免调用点反复手抄
         font_name / font_size / font_style / text_color / padding 等参数。
 
-        字段映射：
-            Style.font_name   -> font_name
-            Style.font_size   -> font_size
-            Style.bold+italic -> font_style（经 get_font_style()，得 "B"/"I"/"BI"/""）
-            Style.color       -> **text_color**（文字颜色）
-            Style.fill_color  -> color（背景填充色）
-            Style.padding     -> padding
-            Style.image_path  -> 忽略（仅 ImageObject 使用）
-            Style.fit_mode    -> 忽略（仅 ImageObject 使用）
+        **三态继承**（本批新增）：每个字段按
+            **显式实参 > 样式字段 > 构造默认值**
+        依次取值。因此"样式不表态"时行为与从前完全一致，
+        而 `Style(align_y=…)` 这类设置在调用方不覆盖时会生效。
 
-        其余参数（align_x / align_y / multi_line / line_height / width / height /
-        parent / layer / size_x / size_y 等）通过 overrides 传入。
+        ⚠️ 这里没有用哨兵对象，而是把已知参数写进签名、默认值设为 `None`：
+        `from_style` 本来就没人会显式传 `None` 表示"我要 None"（`Style` 对
+        align_x/align_y 用的也是 None 表示"不表态"），语义一致且签名自带文档。
+
+        字段映射：
+            Style.font_name    -> font_name
+            Style.font_size    -> font_size
+            Style.bold+italic  -> font_style（经 get_font_style()，得 "B"/"I"/"BI"/""）
+            Style.color        -> **text_color**（文字颜色）
+            Style.fill_color   -> color（背景填充色）
+            Style.padding      -> padding
+            Style.align_x      -> align_x
+            Style.align_y      -> align_y
+            Style.line_height_ratio -> line_height_ratio
+            Style.break_policy -> break_policy
+            Style.image_path   -> 忽略（仅 ImageObject 使用）
+            Style.fit_mode     -> 忽略（仅 ImageObject 使用）
+
+        其余参数（multi_line / line_height / width / height / parent / layer /
+        size_x / size_y 等）通过 overrides 传入，优先级最高。
 
         Args:
             name: 对象名称
             style: 样式对象。None 表示使用 Style() 的全默认值
             text: 文本内容
-            **overrides: 覆盖或补充其它构造参数，**优先级高于 style**
+            **overrides: 覆盖或补充其它构造参数，**优先级最高**
 
         Returns:
             TextObject: 新建的文本对象（未挂载到任何父元素）
@@ -2170,18 +2243,54 @@ class TextObject(LayoutObject):
         Example:
             >>> t = TextObject.from_style("Title", STYLES["name_text"],
             ...                           text="张三", align_x=AlignX.CENTER)
+            >>> # 让样式统一表态，调用点就不必每次都写
+            >>> st = STYLES["detail_time_1"].replace(align_y=AlignY.VCENTER)
+            >>> TextObject.from_style("Time", st).align_y
+            AlignY.VCENTER
         """
         st = style if style is not None else Style()
 
-        params = {
-            "text": text,
-            "font_name": st.font_name,
-            "font_size": st.font_size,
-            "font_style": st.get_font_style(),
-            "text_color": st.color,
-            "color": st.fill_color,
-            "padding": st.padding,
+        # (形参名, 样式字段名, 构造默认值)
+        #   样式字段名为 None 表示"样式里没有对应字段"（如 font_style 由 bold/italic 合成）
+        _inherit = (
+            ("font_name",         "font_name",         "helvetica"),
+            ("font_size",         "font_size",         12),
+            ("font_style",        None,                None),
+            ("text_color",        "color",             Black),
+            ("color",             "fill_color",        White),
+            ("padding",           "padding",           None),
+            ("align_x",           "align_x",           AlignX.NONE),
+            ("align_y",           "align_y",           AlignY.NONE),
+            ("line_height_ratio", "line_height_ratio", 1.2),
+            ("break_policy",      "break_policy",      None),
+        )
+        given = {
+            "font_name": font_name,
+            "font_size": font_size,
+            "font_style": font_style,
+            "text_color": text_color,
+            "color": color,
+            "padding": padding,
+            "align_x": align_x,
+            "align_y": align_y,
+            "line_height_ratio": line_height_ratio,
+            "break_policy": break_policy,
         }
+
+        params = {"text": text}
+        for key, style_attr, ctor_default in _inherit:
+            val = given[key]
+            if val is None and style_attr is not None:
+                # 样式里是 None 表示"样式不表态"，此时仍回落到构造默认
+                val = getattr(st, style_attr, None)
+            if val is not None:
+                params[key] = val
+            elif ctor_default is not None:
+                params[key] = ctor_default
+            # ctor_default 为 None 且样式也没表态 -> 不放进 params，用仓库构造默认
+        # font_style 没有样式字段，统一由 bold/italic 合成（与旧行为一致）
+        params.setdefault("font_style", st.get_font_style())
+
         params.update(overrides)
         return cls(name=name, **params)
     
@@ -3819,14 +3928,20 @@ if __name__ == "__main__":
     # 6) Style 与 from_style 工厂（批次 3）
     print("  --- Style / from_style ---")
     # 6.1 Style 字段名与默认值快照。Style 从模板层搬运而来，这里固化"搬运无损"。
+    #     批次 8 新增 4 个"文字在框里怎么摆"的字段（对齐/行距/断行禁则），
+    #     默认全部为 None = "样式不表态"，因此对既有行为零影响。
     _style_names = [n for n in inspect.signature(Style.__init__).parameters if n != "self"]
     assert _style_names == ["font_name", "font_size", "bold", "italic", "color",
-                            "fill_color", "image_path", "padding", "fit_mode"], \
+                            "fill_color", "image_path", "padding",
+                            "align_x", "align_y", "line_height_ratio", "break_policy",
+                            "fit_mode"], \
         f"Style 字段名或顺序变了: {_style_names}"
     _d = Style()
     assert (_d.font_name, _d.font_size, _d.bold, _d.italic) == ("helvetica", 12, False, False)
     assert _d.color is Black and _d.fill_color is White
     assert _d.image_path == "" and _d.fit_mode == "cover"
+    assert (_d.align_x, _d.align_y, _d.line_height_ratio, _d.break_policy) == \
+        (None, None, None, None), "新增的对齐/行距/禁则字段默认应为 None（样式不表态）"
     print("    ✅ Style 字段快照通过")
     # 6.2 get_font_style 四种组合
     for _b, _i, _exp in ((True, True, "BI"), (True, False, "B"),
@@ -3874,6 +3989,38 @@ if __name__ == "__main__":
     _i2 = ImageObject.from_style("I2", _ist, image_path="b.png")
     assert _i2.get_image() == "b.png", "image_path 实参应覆盖 style.image_path"
     print("    ✅ ImageObject.from_style 字段映射通过")
+
+    # 6.8 三态继承：显式实参 > 样式字段 > 构造默认
+    #     目的：模板可以"样式统一表态"，调用点不必每次都手写对齐/行距。
+    _inh = Style(font_size=10, align_y=AlignY.VCENTER, align_x=AlignX.RIGHT,
+                 line_height_ratio=1.5)
+    _i = TextObject.from_style("INH", _inh)
+    assert _i.align_y == AlignY.VCENTER, f"样式表态时应生效，实际 {_i.align_y}"
+    assert _i.align_x == AlignX.RIGHT and _i.line_height_ratio == 1.5
+    _i2 = TextObject.from_style("INH2", _inh, align_y=AlignY.BOTTOM)
+    assert _i2.align_y == AlignY.BOTTOM, "显式实参应压过样式"
+    assert _i2.align_x == AlignX.RIGHT, "未被显式覆盖的字段仍应来自样式"
+    # 样式"不表态"（None）时必须回落构造默认，否则会回归既有行为
+    _plain = Style(font_size=10)
+    _p = TextObject.from_style("PLAIN", _plain)
+    assert _p.align_x == AlignX.NONE and _p.align_y == AlignY.NONE, \
+        f"样式不表态时应为构造默认，实际 {_p.align_x}/{_p.align_y}"
+    assert _p.line_height_ratio == 1.2 and _p.break_policy is None
+    print("    ✅ 三态继承通过（显式 > 样式 > 构造默认）")
+
+    # 6.9 Style.replace 不改动原实例（防止污染共用的 STYLES 字典）
+    _orig = Style(font_size=10)
+    _copy_st = _orig.replace(align_y=AlignY.VCENTER, line_height_ratio=1.4)
+    assert _copy_st is not _orig, "replace 应返回新实例"
+    assert _copy_st.align_y == AlignY.VCENTER and _copy_st.line_height_ratio == 1.4
+    assert _orig.align_y is None and _orig.line_height_ratio is None, \
+        "replace 不得改动原实例"
+    try:
+        _orig.replace(no_such_field=1)
+        raise AssertionError("覆盖不存在的字段应当报错")
+    except AttributeError:
+        pass
+    print("    ✅ Style.replace 通过（不改原实例、非法字段报错）")
     
     # 7) create_text_block（批次 3）
     print("  --- create_text_block ---")

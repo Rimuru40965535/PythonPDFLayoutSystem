@@ -21,9 +21,11 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <!-- 底层：排版引擎。入口与启动文件均指向它（此前指向已删除的 PythonPDFLayoutSystem.py）。 -->
+    <!-- 底层：排版引擎（master 内容）。 -->
     <Compile Include="LayoutEngine.py" />
+    <!-- 中层：简历模板层（本分支内容）。启动文件指向它 —— 它自带回归契约断言。 -->
     <Compile Include="ResumeTemplate.py" />
+    <!-- 顶层 ResumeCore.py 刻意不在此处：它属另一个分支，见 SKILLS.md 的分支策略。 -->
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

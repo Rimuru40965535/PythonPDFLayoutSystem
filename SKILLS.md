@@ -204,6 +204,13 @@ Resources/*
 >
 > 另：缺省图标 `DEFAULT_PARA_ICON` 只是**占位值** —— `Resources/` 里 11 个 png
 > 全是语义化的，没有通用的"重点标记"符号。
+>
+> 另：正文 `align_y` 默认 **VCENTER**（两栏都满高，顶对齐会让单行文字浮在上面）。
+> 想贴顶传 `AlignY.TOP`。
+>
+> ⚠️ 核对居中量要用 `wrapped_height()` 算**文字实高** ——
+> `TextObject.get_effective_height()` 返回的是**盒子高**，本模板下等于行高
+> （写断言时踩过这个坑）。
 
 > ⚠️ **教训（`add_bullets` 的行高）**：本模板的行高是**量出来的**，
 > 所以行高系数必须在**量之前**定好。曾经 `text_cfg` 是事后才 apply 到

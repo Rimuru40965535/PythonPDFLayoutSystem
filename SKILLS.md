@@ -173,45 +173,52 @@ Resources/*
 | D4 | 全局单例可重入 | `layer_manager` / `objectRegister` 是模块级全局（7.14），同进程生成多份文档会互相污染。**仍未排期** |
 | D5 | 边框 / `is_fill`（缺陷 7.9） | `RectangleObject.render()` 永远实心填充，忽略 `is_fill`。**仍未排期** |
 | D6 | `line_height` 死参数 | 构造参数 `line_height` 只写入 `self._line_height`，**全库从不读取**；实际行高由 `line_height_ratio=1.2` 决定。`create_text_block` 的 docstring 曾误写 `font_size * 0.6`，已于 2026-10-13 就地更正 |
-| **D7** | **文本渲染的两处缺陷（已实装验证，待回 `master`）** | 见下方专项。**这是当前最该先做的引擎修复** —— 它直接影响每一份产物的文字位置 |
+| **D7** | **文本渲染的两处缺陷** | ✅ **已在 `master` 落地**（提交 `7056a69`，批次 7）。详见 TECHNICAL.md 3.4d 与 master 自检第 13 节 |
 
-#### D7 专项：`pdf.cell` 的格子高漏换算单位 + `align_y` 从未生效
+#### D7 专项：`pdf.cell` 的格子高漏换算单位 + `align_y` 从未生效 —— ✅ 已完成
 
-**状态**：已在功能分支的 `LayoutEngine.py` 上实现并验证（三个入口自检全过、
-文字落点全部回到盒内），**验证后已还原**，等待在 `master` 上重新落地。
+**状态**：已在功能分支上诊断、实装并验证，随后**在 `master` 上正式落地**
+（提交 `7056a69`「批次 7：修复文本落点与盒内对齐」）。
+本分支已 rebase 到该提交之上，`master` 是本分支的祖先。
 
 **① 格子高单位错（主因）**
 
 `TextObject.render()` 用 `pdf.cell(_w, own_h, txt)` 绘制，其中
 `own_h = 字号 × line_height_ratio`。但 fpdf 的 `cell(w, h)` 的 `w/h` 是
-**用户空间单位（mm）**，而字号是 **pt** —— pt 数值被当 mm，格子高虚高 2.8346 倍。
+**用户空间单位（mm）**，而字号是 **pt** —— pt 当 mm 用，格子高虚高 2.8346 倍。
 fpdf 又把文字**垂直居中**在格子里，于是基线落到格子中央：
 
 ```
 22pt 的文字 -> own_h = 26.4（当 mm）-> 基线相对盒顶下移 15.53mm
-而节标题的盒子只有 14.5mm 高 -> 文字基线直接跑到盒外
+而节标题的盒子只有 14.5mm 高        -> 文字基线直接跑到盒外
 ```
 
-**修法**：`pdf.cell(_w, own_h * PT_TO_MM, txt)`，并新增模块常量
+**修法**：`pdf.cell(_w, own_h * PT_TO_MM, txt)`，模块常量
 `PT_TO_MM = 25.4 / 72.0`。
 
-> 注意区分：`py = cy + line_top + (line_h - own_h)` 这一项**不需要换算** ——
-> `line_top` / `line_h` 来自 `measure_text`，与 `own_h` 同为 pt 数值，相减自洽。
+> 同一处的 `py = cy + line_top + (line_h - own_h)` **不需要换算** ——
+> `line_top` / `line_h` 来自 `measure_text`，与 `own_h` 同为 pt 数值，
+> 相减得到的行内偏移自洽。
 
 **② `align_y` 从未被渲染读取**
 
-`_place()` 用 `align_y` 决定"盒子摆在哪"，但 `render()` 从不读它，文字一律
-贴内容区顶边 —— 所以 `VCENTER` / `BOTTOM` 对文字落点**完全没有作用**。
+`_place()` 用 `align_y` 决定"盒子摆在哪"，而 `render()` 完全不读它，
+文字一律贴内容区顶边 —— `VCENTER` / `BOTTOM` 对文字落点毫无作用。
 
-**修法**：在 `render()` 里按 `align_y` 计算盒内偏移
+**修法**：`render()` 里按同一条对齐规则分配盒内剩余空间：
 
 ```
-text_h_mm = m.total_height * PT_TO_MM
-inner_h   = 盒高 − padding.top − padding.bottom
-dy_align  = VCENTER → (inner_h − text_h_mm) / 2
-            BOTTOM  →  inner_h − text_h_mm
-            TOP / NONE / FLOW → 0
-py = cy + dy_align + line_top + (line_h − own_h_pt)
+dy_align = VCENTER → (盒内高 − 文字实高) / 2
+           BOTTOM  →  盒内高 − 文字实高
+           TOP / NONE / FLOW → 0
+           文字比盒子高时一律 0
+```
+
+**标定公式**（受控实验，六个字号误差 0.00）：
+
+```
+文字基线 = 盒顶 + padding.top + dy_align
+           + (字号 × line_height_ratio × PT_TO_MM) / 2 + 0.10583 × 字号
 ```
 
 **落地后的效果（实测核算，9 个文本块）**
@@ -222,28 +229,18 @@ py = cy + dy_align + line_top + (line_h − own_h_pt)
 | 联系方式行 | 12 | 7.00 | 8.47 | 3.81 | ❌ 越出盒底 |
 | 技能标题 | 14 | 7.00 | 9.88 | 4.45 | ❌ 越出盒底 |
 | 节标题 | 22 | 14.50 | 15.53 | 6.99 | ❌ 越出盒底 |
-| 详情关键词 | 13 | 10.00 | 9.18 | 4.13 | 盒内 |
-| 详情描述 | 10 | 28.00 | 9.06 | 5.18 | 盒内 |
 
-合计消除 **45.82mm** 的纵向虚位移；4 个原本跑到盒外的文本块全部回到盒内。
+合计消除 **45.82mm** 的纵向虚位移。
 
-**标定公式**（受控实验，六个字号误差 0.00）：
+**⚠️ 对本分支的影响（已完成处置）**
 
-```
-文字基线 = 盒顶 + padding.top + dy_align
-           + (字号 × 1.2 × 0.3528) / 2 + 0.10583 × 字号
-                                     ↑ 该字体的下降部（LXGW 实测）
-```
-
-**⚠️ 落地注意事项**
-
-1. **所有产物的文字位置都会变**，必须重建基线（`verify_pdfs.py`）。
-2. **功能分支的参数是针对旧行为调过的** —— 修复后文字回到盒内居中/贴底，
-   原来为了"抓住文字"而设的盒高需要重新校一遍。核心数值表见 TECHNICAL.md **11.4b**。
-3. `align_y` 修复后成为**可用的版面旋钮**（"让文字在某范围内居中或任意对齐"），
-   这也正是中层需要的能力。
-4. 中层 `add_details` / `add_text_row` 已经大量使用 `VCENTER`，
-   落地后行为会**变好**而不是变坏；但节标题用的是 `BOTTOM`，需确认视觉是否符合预期。
+1. **本分支的参数需要重校**：此前为了"抓住偏低的文字"而调过的盒高，
+   现在文字回到盒内居中/贴底，这些值需要重新校一遍。
+   落点表与"贴合盒高"表见 TECHNICAL.md **11.4b**；
+2. 本分支的 `add_details` / `add_text_row` / `add_profile` 早已大量使用
+   `VCENTER`，落地后行为**自动变好**；
+3. 中层自检的断言（描述高度、分栏尺寸、无同名兄弟等）在修复后**全部仍通过**；
+4. `align_y` 现在成为**可用的版面旋钮** —— 可以指定文字在盒内居中/贴底/贴顶。
 
 ### E. 已决定不做 / 暂缓
 

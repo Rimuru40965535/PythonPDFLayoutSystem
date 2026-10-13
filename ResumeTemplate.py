@@ -44,7 +44,7 @@
 
 import contextlib
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Sequence
 
 from fpdf import FPDF
@@ -645,6 +645,74 @@ class SummaryHandle:
             description=get("description", ""),
             description_height=get("description_height", None),
         )
+
+
+@dataclass
+class ParaDeferredHandle(DetailsHandle):
+    """
+    `add_detail(desc_mode="para")` 专用的句柄。
+
+    **为什么需要它**：`add_detail` 的 `description` 参数只是"顺手填入"的便利，
+    真正的数据通路是 `add_detail(...).apply(item)` / `.fill(...)` ——
+    也就是说建模板时正文往往还是空的。若在构造时就按 `description` 拆段，
+    后到的 `apply` 只能改写那个占位文本对象，**一段都建不出来**。
+    （实测症状：body 下只剩占位 `_description`，总高从 25.5 变成 46。）
+
+    因此这里把"拆段建段落"延后到 `fill()`：谁先拿到正文谁来建，
+    之后重复 fill 则就地更新已有段落。
+
+    `body.description` 不再放一个空的占位文本对象，而是**指向第一段的正文**
+    （没有段落时为 None）。这样"描述"这个语义仍指得到真实文字，
+    也不会在树里多出一个高度为 0、会误导高度断言的空节点。
+    """
+    _body_node: Optional[LayoutObject] = None
+    _para_gap: float = 1.0
+    _para_kwargs: Optional[dict] = None
+    _layer: int = 0
+    _paras: List['ParaHandle'] = field(default_factory=list)
+    _first_prefix: Optional[str] = None
+
+    @property
+    def description(self) -> Optional[TextObject]:
+        return self._paras[0].text if self._paras else None
+
+    def fill(self, key: str = "", during_time: str = "", tags: str = "",
+             description: str = "",
+             description_height: Optional[float] = None) -> 'ParaDeferredHandle':
+        self.head.fill(key=key, during_time=during_time, tags=tags)
+        self._build_paras(description or "")
+        return self
+
+    def _build_paras(self, description: str) -> None:
+        lines = [s for s in description.split("\n") if s.strip()]
+        if not lines:
+            return
+        # 数量一致就地更新（幂等），否则重建
+        if len(lines) == len(self._paras):
+            for h, ln in zip(self._paras, lines):
+                h.fill(text=ln)
+            return
+        for h in self._paras:
+            if h.node.parent is not None:
+                h.node.parent.remove_child(h.node)
+        self._paras = []
+        gap_name = f"{self._body_node.name}_para_gap"
+        for old in list(self._body_node.children):
+            if old.name.startswith(gap_name):
+                self._body_node.remove_child(old)
+        for k, ln in enumerate(lines):
+            # 第一段沿用 {prefix}_description（与 inline 模式的主描述节点同名），
+            # 这样顶层的命名式断言在两种模式下都成立。
+            if k == 0 and self._first_prefix:
+                _nm, _sfx = self._first_prefix, "description"
+            else:
+                _nm, _sfx = f"{self._body_node.name}_para_{k}", "content"
+            self._paras.append(
+                self._body_node.add_para(text=ln, layer=self._layer, name=_nm,
+                                         name_suffix=_sfx,
+                                         **(self._para_kwargs or {})))
+            if self._para_gap > 0 and k < len(lines) - 1:
+                self._body_node.add_spacer(f"{gap_name}_{k}", self._para_gap)
 
 
 @dataclass
@@ -1285,7 +1353,7 @@ def add_section_heading(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.LEFT,
-        align_y=AlignY.VCENTER,
+        align_y=AlignY.BOTTOM,
         multi_line=False,
         layer=layer + 1,
     )
@@ -1546,6 +1614,9 @@ def add_detail(self: LayoutObject,
                key_align: Optional[TextConfig] = None,
                time_align: Optional[TextConfig] = None,
                tags_align: Optional[TextConfig] = None,
+               desc_mode: str = "inline",
+               para_gap: float = 1.0,
+               para_kwargs: Optional[dict] = None,
                layer: int = 0) -> DetailsHandle:
     """
     节详情子模板 —— **容器**，由"标题三栏"与"描述"两个子模板组合而成。
@@ -1599,6 +1670,47 @@ def add_detail(self: LayoutObject,
         text_cfg=text_cfg, key_align=key_align, time_align=time_align,
         tags_align=tags_align, layer=layer,
     )
+
+    if desc_mode == "para":
+        # 描述体改用**图标段落**：先建一个与 add_detail_body 同形的空容器
+        # （SizeY.CONTENT，挂着不掉队），再按 \n 逐段 add_para。
+        # ⚠️ 这里**不能**先调 add_detail_body 再追加段落 —— 那样原描述节点
+        #    仍会占满一段高度（实测白占 40mm），等于两套描述同时存在。
+        body_node = LayoutObject(
+            name=f"{prefix}_details",
+            x=0, y=0, width=0, height=0,
+            color=White,
+            padding=Padding.all(0),
+            align_x=AlignX.CENTER,
+            align_y=AlignY.FLOW,
+            layer=layer,
+        )
+        body_node.size_y = SizeY.CONTENT
+        content.add_child(body_node)
+
+        _lines = [s for s in (description or "").split("\n") if s.strip()]
+        _paras = []
+        _pk = dict(para_kwargs or {})
+        # 若构造时就给了正文，立刻建段落；否则留给 ParaDeferredHandle.fill() 建
+        if _lines:
+            for _k, _ln in enumerate(_lines):
+                _nm = f"{prefix}" if _k == 0 else f"{prefix}_details_para_{_k}"
+                _sfx = "description" if _k == 0 else "content"
+                _paras.append(body_node.add_para(text=_ln, layer=layer, name=_nm,
+                                                 name_suffix=_sfx, **_pk))
+                if para_gap > 0 and _k < len(_lines) - 1:
+                    body_node.add_spacer(f"{prefix}_para_gap_{_k}", para_gap)
+        # 不放占位文本对象：description 由 ParaDeferredHandle 转发到第一段正文。
+        # 位置占位（若构造时就给了正文）也要让 description 指得到它。
+        _first = _paras[0].text if _paras else None
+        return ParaDeferredHandle(
+            node=content, head=head,
+            body=DetailBodyHandle(node=body_node, description=_first),
+            _body_node=body_node, _para_gap=para_gap,
+            _para_kwargs=_pk, _layer=layer, _paras=_paras,
+            _first_prefix=prefix,
+        )
+
     body = add_detail_body(
         content, prefix,
         description=description, style=desc_style,
@@ -1606,7 +1718,6 @@ def add_detail(self: LayoutObject,
         text_cfg=text_cfg, layer=layer,
     )
     return DetailsHandle(node=content, head=head, body=body)
-
 
 def add_summary(self: LayoutObject,
                 index: int = 0,
@@ -2083,6 +2194,8 @@ def add_para(self: LayoutObject,
              padding: Optional[Padding] = None,
              align_x: AlignX = AlignX.LEFT,
              align_y: AlignY = AlignY.VCENTER,
+             name: Optional[str] = None,
+             name_suffix: str = "content",
              layer: int = 0) -> ParaHandle:
     """
     图标段落子模板 —— **左栏图标 + 右栏文本**，用于在大片密集信息里标出重点。
@@ -2131,6 +2244,8 @@ def add_para(self: LayoutObject,
         text_cfg: 正文的对齐 / 行距 / 断行禁则配置
         padding: 正文格内边距
         align_x: 正文水平对齐
+        name: 整行的命名前缀。None 表示自动 {self.name}_para_{n}
+        name_suffix: 整行容器的后缀名，默认 content
         align_y: **正文在行内的垂直对齐**，默认 VCENTER（盒内居中）。
                 两个格子都是满高，所以文字比格子矮时会居中而不是浮在顶部；
                 多行正文比图标高时行高由正文决定，居中无副作用。
@@ -2174,11 +2289,15 @@ def add_para(self: LayoutObject,
     row_h = max(text_h, icon_need)
 
     n = sum(1 for c in self.children if "_para_" in c.name)
-    prefix = f"{self.name}_para_{n}"
+    prefix = name if name else f"{self.name}_para_{n}"
 
     # ---- 3) 行容器：缩进做成 padding；高度显式算好 ----
+    # ---- 3) 行容器：缩进做成 padding；高度显式算好 ----
+    # name_suffix 让调用方能给整行指定后缀。默认 content；
+    # add_detail(desc_mode="para") 用 description，使第一段的主节点
+    # 与 inline 模式的 {prefix}_description 同名，命名式断言两模式通用。
     row = LayoutObject(
-        name=f"{prefix}_content",
+        name=f"{prefix}_{name_suffix}",
         x=0, y=0, width=0, height=row_h,
         color=White,
         padding=Padding(left=indent),
@@ -2269,6 +2388,9 @@ def add_section(self: LayoutObject,
                 detail_styles: Optional[dict] = None,
                 brief_ratio: Optional[Sequence[float]] = None,
                 brief_height: float = DEFAULT_BRIEF_HEIGHT,
+                desc_mode: str = "inline",
+                para_gap: float = 1.0,
+                para_kwargs: Optional[dict] = None,
                 title_detail_gap: float = 0.0,
                 between_details_gap: float = 0.0,
                 layer: int = 0) -> SectionHandle:
@@ -2286,6 +2408,13 @@ def add_section(self: LayoutObject,
         detail_styles: 传给 add_details 的样式字典，键为
                        key_style / time_style / tags_style / desc_style
         brief_ratio / brief_height: 详情三栏比例与高度
+        desc_mode: **描述体的渲染方式**
+                   `"inline"`（默认）—— 整段文本，与原行为逐字节一致；
+                   `"para"` —— 按 `\\n` 拆成多段，每条用**图标段落**（`add_para`）排版。
+                   两种模式都保留上方的三栏标题（关键词/时间/标签）。
+        para_gap: `desc_mode="para"` 时相邻段落之间的留白 (mm)
+        para_kwargs: `desc_mode="para"` 时透传给 `add_para` 的参数
+                     （如 `icon_width` / `icon_align` / `gap` / `left_pad`）
         title_detail_gap: 节标题与第一条详情之间的留白 (mm)
         between_details_gap: 相邻详情之间的留白 (mm)
         layer: 图层索引
@@ -2293,6 +2422,10 @@ def add_section(self: LayoutObject,
     Returns:
         SectionHandle —— title 与 details 都是句柄，可直接改
     """
+    if desc_mode not in ("inline", "para"):
+        raise ValueError(
+            f"add_section: desc_mode 只能是 'inline' 或 'para'，收到 {desc_mode!r}")
+
     get = _field_getter(section)
     title_text = get("title", "")
     icon_path = get("icon", "")
@@ -2319,6 +2452,9 @@ def add_section(self: LayoutObject,
             name_key=f"{index}_{i}",
             brief_ratio=brief_ratio,
             brief_height=brief_height,
+            desc_mode=desc_mode,
+            para_gap=para_gap,
+            para_kwargs=para_kwargs,
             layer=layer,
             **detail_styles,
         ).apply(item)

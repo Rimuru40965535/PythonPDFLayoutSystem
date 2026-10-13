@@ -1,64 +1,54 @@
-# PythonPDFLayoutSystem
+# 分支：feature_resume_sub_templates
 
-利用 fpdf2 库实现 PDF 文件的排版喵~  
+这个分支基于主分支，面向简历自动化排版对主分支实现的功能做一些封装喵~  
 
-是对已有库的重构喵~  
-
----
----
-
-## 如何使用？
-
-现在项目处于开发阶段，预期的使用方式有两种：
-
-- 开发者将这个库下载下来，并在源文件中import
-- 源文件读取排版文档组和 .md 文件（或者其它通用格式）的文本文档，自动排版
+`ResumeTemplate.py` 是本分支的**中层**（对底层构件的调用与便捷封装），
+`ResumeCore.py` 是**顶层**（面向使用者与开发人员的领域模型与流程编排）。
 
 ---
+
 ---
 
-## 资源获取
+## 中层 API 速览
 
-### 字体（必需）
+子模板一律以**方法**形式挂在任意节点上调用，返回**结果句柄**：
 
-`Resources/` 下的字体文件**不入库**（约 117 MB），需要自行下载。
-缺少字体会导致中文渲染为空白，且**不会报错** —— 引擎会静默降级到内置的 helvetica。
+```python
+basic   = root.add_basic(ratio=[1.0, 2.5], right_padding=Padding.left(8))
+left, right = basic.left, basic.right          # 直接拿到两栏，不再按名字查
 
-需要的是**霞鹜文楷（LXGW WenKai）**，作者 LXGW，采用 SIL Open Font License 1.1，可免费商用。
+profile = left.add_profile(index=0, icon_width=6).fill("韩 梅 梅", icon_path)
+title   = right.add_section_title(index=0).fill("教育背景", icon_path)
 
-- 项目主页：<https://github.com/lxgw/LxgwWenKai>
-- 发布页（选最新 Release）：<https://github.com/lxgw/LxgwWenKai/releases>
-- 等宽版本（可选，`LXGWWenKaiMono*`）：<https://github.com/lxgw/LxgwWenKaiMono>
+detail  = right.add_details(index=0, key="...", during_time="...",
+                            tags="...", description="...")   # 建好即填好
+detail.description.set_text("改一下")           # 句柄随时可取子部件
 
-下载后按下列**文件名**放入 `Resources/`（代码按这些名字引用）：
-
-| 文件名 | 用途 |
-| --- | --- |
-| `LXGWWenKai-Regular.ttf` | 正文（注册为 `LXGW` 的常规体） |
-| `LXGWWenKai-Bold.ttf` | 粗体（注册为 `LXGW` 的 `B` 风格） |
-| `LXGWWenKai-Light.ttf` | 可选 |
-| `LXGWWenKaiMono-Regular.ttf` | 可选，等宽 |
-| `LXGWWenKaiMono-Bold.ttf` | 可选，等宽 |
-| `LXGWWenKaiMono-Light.ttf` | 可选，等宽 |
-
-> 最少只需要 `Regular` 与 `Bold` 两个，其余四个可以不下。
-> 若解压后的文件名与上表不同，请重命名。
-
-### 图标与照片（中层/顶层使用，可选）
-
-`ResumeCore.py` / `ResumeTemplate.py` 引用了若干图标与照片，**这些资源尚未入库**。
-它们只在中层与顶层使用，底层排版引擎不依赖它们。涉及的文件名：
-
-```
-icon.png  icon_Education_History.png  icon_Project_History.png
-woman_student.png  photo_1.png
-telephone.png  email.png  locate.png
-social_media.png  contact_address.png  website.png
+right.add_details_list(section.details)         # 列表入口：同一蓝图复用 N 次
+right.add_section(section)                      # 组合模板：节标题 + 该节全部详情
+left.add_text_row(name="...", text="...")       # 一行文本（技能/证书/荣誉共用）
 ```
 
-**这些文件缺失不会导致报错** —— `ImageObject` 会静默跳过绘制，
-所以生成的 PDF 里看不到图标，但其余内容排版正常。
-排查「图标不见了」一类问题时，先确认这些文件是否存在。
+| 方法 | 返回句柄 | 主要部件 |
+| --- | --- | --- |
+| `add_basic` | `BasicHandle` | `node` / `left` / `right` |
+| `add_profile` | `ProfileHandle` | `icon` / `text` / `split` / `icon_range` / `text_range` |
+| `add_profile_photo` | `PhotoHandle` | `photo` |
+| `add_section_title` | `TitleHandle` | `icon` / `text` / `divider` |
+| `add_details` | `DetailsHandle` | `key` / `during_time` / `tags` / `description` / `brief` / 三个 col |
+| `add_summary` | `SummaryHandle` | `description` |
+| `add_section` | `SectionHandle` | `title` + `details`（句柄列表） |
+| `add_details_list` | `List[DetailsHandle]` | 与传入数据一一对应 |
+| `add_text_row` | `TextObject` | 容器可按 `{name}_content` 查找 |
+| `add_spacer` | `LayoutObject` | 流式留白 |
+
+句柄都带 `fill(...)` / `apply(data)`（就地填充，返回 self 以便链式），
+`apply` 同时接受 dict 与 dataclass。
+
+### 尺寸与高度
+
+容器高度交给引擎的 `SizeY.CONTENT` **自动结算**，本层不再手算 `_height`。
+若某个部件需要固定高度，显式传 `description_height=12` / `content_height=13` 即可。
 
 ---
 
@@ -66,589 +56,69 @@ social_media.png  contact_address.png  website.png
 
 ## 开发日志
 
-### 2026-10-11
+### 2026-10-13
 
-#### **20：52** 
+#### **10：35 中层重构：子模板方法风格化 + 句柄化 + 高度自动结算**
 
-第一次提交
+**一、新 API：子模板成为节点上的方法**
 
-- 建立 main 并测试 fpdf2 库引用
-- 建立资源和模块文件夹
+旧接口 `generate_*` / `fill_*` 共 11 个符号**全部移除**，改为挂在 `LayoutObject`
+上的 10 个方法：
 
-#### **批次 0：修复阻断性缺陷 + 建立技术文档**
-
-
-**新增技术文档**
-
-- `TECHNICAL.md`：完整 API 参考（函数签名 / 参数 / 返回值）、分层结构、依赖图、
-  坐标系与三层缓存机制、命名约定、**18 条已知缺陷**、10 个重构方向与 6 个批次划分、
-  测试入口说明。
-- 顺带记录：`Resources/` 实际只有 6 个字体文件，代码引用的 11 个图标/照片**全部不存在**；
-  图片缺失时引擎静默降级，所以 PDF 能生成但看不到图标 —— 排查视觉问题前必须先确认这一点。
-
-**修复的缺陷**（`ResumeCore.py`）
-
-- **导入断裂（阻断级）**：`from ResumeTemplateV2` → `from ResumeTemplate`。
-  该导入此前直接抛 `ModuleNotFoundError`，`Resume.Generate` 完全不可用。
-- **`SkillsAwards.get_char_*` 末尾多余换行**：三个方法的 `if i < len(...)` 恒为真，
-  改为 `'\n'.join(...)`。
-- **联系方式模板重复挂载**：`generate_profile_template` 内部已挂载，
-  外层循环又调了一次 `root.add_child(a)`，导致每条联系方式占两段纵向空间。
-  左栏内容高度由约 108mm 回落到 90mm。
-- **联系方式末尾多一个间距**：`if i == len(contacts_text)` 恒为假（死代码），
-  改为 `len(contacts_text) - 1`，去掉末条下方多余的 5mm 间距。
-
-**清理**
-
-- 删除死目录 `Module_PythonPDFLayoutSystem/`（仅含已无源码的历史 `.pyc`）。
-
-**测试**
-
-- 三个测试入口（`LayoutEngine.py` / `ResumeTemplate.py` / `ResumeCore.py`）均加入回归契约断言，
-  全部退出码 0。
-- 建立 PDF 规范化比对基线：剥离 `CreationDate` / `ModDate` / `ID` / `Producer` 后，
-  `test_layout_engine_cached.pdf` 与 `resume_template_v2_test.pdf` **逐字节未变**，
-  `output/利姆露_*.pdf` 仅因上述两处修复变化 5 字节。
-
-**本次提交的分层归属**
-
-- 入 `master`（底层）：`LayoutEngine.py`、`TECHNICAL.md`、`README.md`、`SKILLS.md`，
-  以及删除旧入口 `PythonPDFLayoutSystem.py`。
-- 留在功能分支（顶层）：`ResumeTemplate.py`、`ResumeCore.py` —— 见下节"分支策略"。
-
-
-#### **批次 1：抽出留白构件 `create_spacer`**
-
-
-**新增构件**
-
-- `LayoutEngine.py` 新增 `create_spacer(name, height, parent=None, layer=0)` ——
-  创建纯留白对象（垂直间距）。等价于 `width=0`、`align_x=CENTER`、`align_y=FLOW` 的
-  `LayoutObject`；`parent` 非空时自动挂载（走 `add_child`，缓存失效正确触发）。
-- 刻意**不暴露** `color` / `padding` / `align_y` 三个参数，依据是实测：
-  `LayoutObject.render()` 在 `is_fill=False` 时不绘制内容，留白的颜色对输出无影响；
-  留白 `_height > 0` 时 `get_effective_height()` 走 `min(_height, avail_h)` 分支，
-  padding 不参与计算（实测 `Padding.all(0)` 与 `Padding.all(10)` 的有效高/宽/绝对 y 完全相同）。
-
-**替换**
-
-- `ResumeCore.py` 的 **14 处** `Lead_*` 留白字面量全部改为 `create_spacer(...)` 调用，
-  每处从 11 行缩到 4 行；替换后文件中已无裸的留白对象字面量。
-- 抽取前这 14 处的 `color` 用了 `White`/`Black`/`Blue`/`Green`/`Yellow` 五种、
-  `padding` 在 `all(0)` 与 `all(10)` 之间摇摆，都是复制粘贴残留，现已一并消除。
-
-**澄清了一处文档中的存疑推断**
-
-- 技术文档 8.2 原先推测"`Padding.all(10)` 会让 FLOW 间距变成 `10 + height`"。
-  **实测证明该推断不成立**，padding 不参与有效高度计算。文档已更正。
-
-**测试**
-
-- `LayoutEngine.py` 测试入口新增 `create_spacer` 构件契约断言：构造高度、`align` 取值、
-  自动挂载与父指针、游离态，以及"padding 不影响有效高度"。
-- 三个入口退出码 0。
-- **规范化比对：三个产物全部逐字节一致**（`19316` / `61370` / `68478` 字节）。
-  批次 1 是纯粹的等价重构，只抽构件、不改行为，这正是它追求的结果。
-
-#### **基础设施：仓库卫生与程序入口**
-
-- **生成物不入库**：`.gitignore` 追加 `*.pdf`（测试 PDF）与 `output/`（简历输出目录）。
-  两者都可由测试入口复现。
-- **字体不入库**：`.gitignore` 追加 `Resources/*.ttf`（约 117 MB）。
-  只忽略字体本身，未来补充的图标/照片仍应正常入库。
-- **README 新增「资源获取」章节**：写明霞鹜文楷（LXGW WenKai）的下载来源、
-  许可（SIL OFL 1.1，可免费商用）、所需文件名与放置路径；
-  并列出中层/顶层引用但尚未入库的图标与照片。
-- **程序入口改指 `LayoutEngine.py`**：`PythonPDFLayoutSystem.pyproj` 的
-  `<StartupFile>` 与 `<Compile Include>` 此前指向已删除的 `PythonPDFLayoutSystem.py`，
-  在 Visual Studio 中打开会看到失联的启动文件。
-
-### 2026-10-12
-
-#### **批次 2：抽出横向带构件 `create_band`**
-
-- `LayoutEngine.py` 新增 `create_band(parent, cells, gap, padding, height, names, colors, layer, container_name)` ——
-  横向布局的基础构件。`cells` 元素既可以是比例权重（`float`，新建空格子），
-  也可以是已构造对象（`LayoutObject`，直接复用并保留其自身宽度）。
-- `create_band` **只做严格按比例**；`create_columns` 的"宽度不足时把剩余量按栏数均分"
-  是它独有的语义，留在 `create_columns` 里（两趟实现：先算宽度，再交给 `create_band` 排放）。
-- `split_column_advanced` **从 `ResumeTemplate.py` 移入引擎**，改为 `create_band` 的包装。
-  分层违规消除：`ResumeCore.py` 此前为了分栏必须 `import ResumeTemplate`。
-
-**顺带修掉的两个缺陷**
-
-- **缺陷 7.4**：`create_columns` 里 `parent.children = []` 会静默丢弃父元素既有子元素，
-  且绕过 `remove_child` 使被丢弃子元素的父指针悬空。已删除该行。
-  测试入口的断言从"固化现状"**反转**为"既有子元素被保留"。
-- **缺陷 7.3**：`split_column_advanced` 绕过 `add_child` 直接改 `children` 列表，
-  不触发缓存失效（几何缓存尤其没失效）。移入引擎后统一走 `add_child`。
-
-**返回值变更（需注意）**
-
-`create_columns` 与 `create_columns_balanced` 现在返回**新建的带容器**，
-此前返回传入的 `parent`。仓库内无调用方依赖该返回值，但这是破坏性变更，已写入技术文档。
-`split_column_advanced` 为保持链式调用兼容，**仍返回 `parent`**。
-
-**测试**
-
-- 引擎测试入口新增 `create_band` 断言 11 项：比例分宽、`gap` 累加 x、
-  `height=0` 取父内容区高、复用已构造对象（保留宽度、接管位置与高度）、
-  4 条错误路径、包装函数返回值、`split_column_advanced` 包装。
-- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**。
-
-**过程中的一次真实踩坑（值得记住）**
-
-`create_columns` 改为走 `create_band` 后，各栏从"`parent` 的直接子元素"变成
-"带容器的子元素"，多出一层。而引擎测试入口原先用 `container.get_child("Column_0")` 取栏，
-`get_child` 只看直接子元素，于是拿到 `None`，两段文本根本没被创建 ——
-引擎 PDF 从 `19316` 字节掉到 `18071`。
-
-**这不是引擎的问题，是测试的假设失效了。** 改用 `find_by_name`（深度优先）后恢复一致。
-结论：**包装层会改变树形，所有按名字取对象的地方都要检查该用 `get_child` 还是 `find_by_name`。**
-逐字节比对把这个错误挡在了提交之前。
-
-#### **缺陷 7.11(a)：`render_debug()` 补齐返回值**
-
-起因：把测试入口的 `root.render(...)` 换成 `root.render_debug(...)` 后，
-返回值断言以 `AssertionError: ... 实际返回 NoneType` 炸掉。
-
-- **根因**：四个 `render_debug` 实现（`LayoutObject` / `TextObject` / `ImageObject` /
-  `RectangleObject`）末尾**都没有 `return` 语句**，一律隐式返回 `None`。
-  它们内部明明有子元素递归，却不冒泡任何值。这个报错与 `render()` 的契约毫无关系，
-  极易误判为回归。
-- **修复**：四个实现补上返回值，语义与各自的 `render()` 对齐 ——
-  `LayoutObject` / `TextObject` 返回值 y；`ImageObject` / `RectangleObject` 返回 `(宽, 高)`；
-  `pdf=None` 或有效尺寸非正时显式返回 `None`。
-- **顺带修掉一个被掩盖的崩溃**：`ImageObject` / `RectangleObject` 的 `eff_w` / `eff_h`
-  原先只在 `if show_name:` 分支内赋值。因为末尾没有 `return`，这两变量在
-  `show_name=False` 时从未被读取，问题一直没暴露；补返回值后直接引用就会
-  `UnboundLocalError`。已把取尺寸提到分支之外。
-- 测试入口的断言相应放宽为「接受数值 y 或 `(宽, 高)` 二元组，但**拒绝 `None`**」，
-  这样能同时守住 `render` 与 `render_debug` 两条路径。
-- 验证：`show_name=True/False`、`is_fill=True` 三种调试配置端到端均无异常；
-  三个入口退出码 0；**三个产物恢复逐字节一致**（`19316` / `61370` / `68478`）。
-
-> 排查中还确认了一件事：调试渲染的产物与正式渲染**本就不同** ——
-> `render_debug` 会用 helvetica 画边框与名称/尺寸标签，
-> 所以产物里会多出 `Helvetica` 字体，而 LXGW 子集反而变小
-> （只画标签、不画正文，用到的字形更少）。
-> 基线 19316 字节 → 调试产物 6098 字节，是预期差异而非回归。
-
-技术文档 7.11 已拆成 (a) 已修 / (b) 待批次 4 两节。
-
-#### **批次 4 的前置分析（矩形包围内容）**
-
-- 实测确认 `wrap_height=True` 会让高度**塌缩为 padding**（同一结构 49.00 → 4.00），
-  根因是父子高度的循环依赖：子元素有效高度被父可用高度裁剪，而父可用高度又来自父的有效高度。
-  此项记为缺陷 7.19。
-- 实测确认 `invalidate_wrap_cache()` 不清 `_height`，导致 wrap 结果一旦算错便永久卡死，
-  连 `wrap_content(force=True)` 也无法重算。此项记为缺陷 7.20。
-- 实测确认 `wrap_width` 三条路径全部返回 0，原理上自相矛盾（收窄要求子宽自主，
-  而 `_width == 0` 的语义是"撑满父宽"）。此项记为缺陷 7.21。
-- 结论：**"矩形包围内容"不单独占一批，与"几何属性改 property"合并为批次 4，并排在其最前面。**
-  两者是同一件事的两半 —— property 化解决"何时知道要重算"，
-  修 7.19/7.20 解决"重算能不能算对"。批次表已拆出 4a（包围固定高度内容）与
-  4b（修 `wrap_width`）；包围自动换行的长文本依赖批次 5 的真实行数测量。
-- 技术文档新增 8.11 节完整记录该分析。
-
-#### **批次 4.1：四轴设计（尺寸轴与对齐轴分离）**
-
-
-**设计动机**：`wrap` 只改变元素**大小**，`flow` 只改变元素**位置** ——
-两者本就不该共用一条枚举轴。旧实现把尺寸（`wrap_width` / `wrap_height` 两个布尔量）
-与位置（`align_y == FLOW`）混在一起，`get_effective_height()` 里那段
-「用前驱位置算自身截断高度」正是 7.19 的温床。
-
-**新增**：
-
-- `SizeX` / `SizeY` 两个尺寸枚举（`FILL` / `FIXED` / `CONTENT`），与
-  `AlignX` / `AlignY` 并列，构成四轴。**对齐枚举不新增成员** ——
-  测试入口有断言固化这一点，防止 `wrap` 又被塞回对齐轴。
-- `LayoutCycleError`：布局循环依赖的专门异常类型（旧代码用裸 `RuntimeError`，
-  测试无法区分错误种类）。两种情形：结构循环、`CONTENT` 父 + 直接 `FILL` 子。
-
-**兼容映射**（保持旧行为，构造时自动完成）：
-
-| 旧写法 | 新枚举 |
+| 旧写法 | 新写法 |
 | --- | --- |
-| `wrap_width=True` | `SizeX.CONTENT` |
-| `wrap_width=False` + `width > 0` | `SizeX.FIXED` |
-| `wrap_width=False` + `width <= 0` | `SizeX.FILL` |
+| `generate_section_details_template(root=col, index=2)` + `fill_section_details_data(...)` | `col.add_details(index=2, key=..., description=...)` |
+| `root.find_by_name(f"{col.name}_section_details_2_key")` | 句柄属性 `handle.key` |
+| 循环调用 `generate_*` 造多条详情 | `col.add_details_list(items)` |
+| 顶层手写"节标题 + N 条详情"循环 | `col.add_section(section)` |
+| 顶层手抄 6 份技能/证书/荣誉构造代码 | `col.add_text_row(name, text, style)` |
 
-`wrap_height` 同理。解析优先级为「显式 `size_*` > `wrap_*` > 由 `width`/`height` 推断」。
-`wrap_width` / `wrap_height` 改为**派生 property**，不再是独立真相。
+方法之所以不定义在 `LayoutEngine.py`，是因为模板必须知道 `Style` / `STYLES` /
+章节 / 详情这些**简历词汇**，而引擎对领域词汇保持零知识；方法在导入
+`ResumeTemplate` 时挂载，并由断言守住"不覆盖既有成员"。
 
-**为后续步骤埋下的一个关键区分**：
+**二、高度：手动调参 → 引擎自动结算**
 
-> **`width == 0` 不再等价于 `FILL`。** 旧实现里 `_width == 0` 一个值同时承担
-> 「没给」和「要撑满」两种含义，导致 `CONTENT` 无法表达 —— 这正是 7.21
-> （`wrap_width` 三条路径全返回 0）的根源。迁移后 `width` 是纯数值，`FILL` 是显式枚举值。
+| 项 | 旧 | 新 |
+| --- | --- | --- |
+| 详情描述 | 构造时 `height=50`，再由填充函数回写 `content._height` 与 `description._height` | `SizeY.CONTENT`，按真实行数结算 |
+| 个人总结 | 同上 | 同上 |
+| 详情容器 | `fill` + 手算总高 | `SizeY.CONTENT` |
 
-**另一处按决策记录的行为变化**（将在后续步骤兑现）：
+**三、行高：改用引擎默认**
 
-> 旧实现里 `FIXED` 会被父可用空间夹紧（`min(_width, avail_w)`）。
-> 按「代码里定死的尺寸不动、不另行计算」的原则，**这个夹紧要去掉** ——
-> 定死就是定死，装不下是**溢出**问题，不是改尺寸的理由。
+旧代码两处传 `line_height=font_size * 0.6`。实测该参数是**死参数**
+（只被写入 `_line_height`，全库从不读取），实际行高一律走 `line_height_ratio=1.2`。
+因此这一项是**零产出差异**的清理；顺手改正了 `create_text_block` 文档里
+"`None` 表示 `font_size * 0.6`"的错误说明（引擎侧，属底层）。
 
-**测试**
+**四、新发现并修复的缺陷**
 
-- 三个入口退出码 0；
-- **规范化比对：三个产物全部逐字节一致** —— 4.1 是**纯门面变更**
-  （新增枚举 + 兼容映射 + 派生 property），必须无行为变化，逐字节基线因此仍是有效验收手段；
-- 引擎测试入口新增 7 组断言：枚举成员集合、旧写法→新枚举映射（8 例）、
-  显式 `size_*` 优先级、`wrap_*` 派生属性读写往返、`size_*` setter 触发失效、
-  尺寸轴类型校验（按轴分开，`size_y` 传 `SizeX` 必须报错）、`LayoutCycleError` 类型。
-
-#### **批次 3：`Style` 下沉与内容构件**
-
-- **`Style` 移入 `LayoutEngine.py`**（放在 `Padding` 之后，与 `Color`/`Padding`
-  同属底层纯数据构件）。它原先住在 `ResumeTemplate.py`，属分层违规 ——
-  样式与"简历"无关，而"样式 → 渲染参数"的翻译本来就是引擎职责。
-  **迁移是纯搬运**：字段名、顺序、默认值逐项一致，测试入口有字段快照断言固化这一点。
-  连 `padding` 的可变默认参数（缺陷 7.10）也**原样保留**，以维持"输出不变"的验收前提，
-  修正归入批次 4。
-- **新增 `TextObject.from_style` / `ImageObject.from_style`**：把
-  `font_name / font_size / bold+italic → font_style / color → text_color /
-  fill_color → color / padding` 这套翻译集中一处，
-  避免调用点反复手抄 7 个参数。`**overrides` 优先级高于 `style`；`style=None` 用全默认值。
-  `RectangleObject.from_style` **刻意不做**（只映射一个字段，负收益）。
-- **新增 `create_text_block`**：`height` 成为**显式参数**，引擎里不再有硬编码 `50`
-  （缺陷 7.8 的成因消除）。
-  注意 **`height=0` 的语义是"取父可用高"，不是"按内容自动撑高"** ——
-  后者要等批次 5 的真实行数测量。
-
-**关于 `Style` 同名冲突**
-
-`master` 的 `LayoutEngine.py` 与功能分支的 `ResumeTemplate.py` 各有一个 `Style`。
-它们不会在同一工作树里被同时导入（`ResumeTemplate.py` 不在 `master` 上），
-因此不是运行时冲突，而是合并时的语义问题。**按方案 A 处理**：
-`ResumeTemplate.py` 将来删掉本地 `Style`，改为 `from LayoutEngine import Style`，
-单一来源、不留别名。中层顶层的迁移**留到功能分支再处理**。
-
-**新增：`SKILLS.md` 的「只在功能分支处理的事项」**
-
-有一类改动**无法在 `master` 完成**（目标文件不在 `master` 上）。新增一节集中记录，
-格式为「来源批次 → 事项 → 为什么不能在 master 做」。当前已记录：
-
-- 来自批次 3：删本地 `Style`、改导入、约 25 处调用换 `from_style`、
-  两处 `height=50` 改为显式传参（**必须传 50**）、`ResumeCore` 技能三段收敛。
-- 来自批次 4：上层对 `_height` / `_x` / `_width` 的直接改写改为走新接口。
-- 通用：`Resources/` 的图标照片入库、`.pyproj` 补编译项。
-
-**测试**
-
-- 引擎测试入口新增 13 项断言：`Style` 字段快照、`get_font_style` 四种组合、
-  两个 `from_style` 的字段映射、`overrides` 优先级、`style=None`、
-  链式调用、`create_text_block` 的 `height=0` / 显式 `height` / 参数透传 /
-  `padding=None` 沿用样式 / 挂载唯一性。
-- 排查中发现并固化了一条引擎既有语义：**同一流式父容器里，一个 `height=0` 的块
-  会占满全部可用高，把后随的 `FLOW` 兄弟挤成 0 高**（并置 `_flow_clipped`）。
-  这不是 `create_text_block` 的问题，但用 `height=0` 时必须意识到。
-- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**
-  （批次 3 是"只增不改"，没有修改任何既有函数体，因此这是它唯一需要的验收手段）。
-
-#### **批次 4.2：两趟遍历（几何核心重写）**
-
-
-**把尺寸计算从「惰性求值 + 父子互相递归」改成「两趟遍历」。**
-
-旧实现的子元素在测量阶段会回头问父容器（`get_parent_available_area()` →
-`parent.get_effective_height()`），而父的尺寸正要靠子元素算出来 —— **自指**，
-于是 `wrap_height=True` 只能塌缩成 padding（缺陷 7.19）。新实现把两个量分开传播：
-
-| 趟 | 方向 | 传什么 | 定下什么 |
-| --- | --- | --- | --- |
-| 趟 1 `_measure` | 进入 | `constraint` 向下 | `FIXED` / `FILL` 的尺寸 |
-| 趟 1 `_measure` | 退出 | `size` 向上 | `CONTENT` 的尺寸 |
-| 趟 2 `_place` | 进入 | 只读 `AlignX` / `AlignY` | 绝对坐标 |
-
-**子元素的约束是作为参数拿到的，不再回头问父容器** —— 那条造成循环的回边根本不存在。
-
-**新增**：`layout(pdf=None, force=False)` 公开入口；`_source_w/_source_h` 内容固有尺寸钩子
-（批次 5 只改这两个方法的文本实现即可接入真实行数测量）；
-`LayoutError_CONTENT_FILL`（CONTENT 父 + 直接 FILL 子，报错含父/子元素名与两条修法）。
-
-**删除**：`wrap_content()` / `wrap_content_width()`（语义由 `layout()` 完全取代）、
-`_calculate_wrap_width()`，以及 `_wrap_cache_valid` / `_height_set_by_wrap` /
-`_cached_wrap_height` / `_is_wrapping` / `_geom_cache_valid` 等整套惰性缓存字段。
-失效只剩一个布尔标记 `_layout_valid`。
-
-**行为变化**（按你的决策）：
-
-> **`FIXED` 不再被父约束裁剪。** 旧实现是 `min(_width, avail_w)`；按「代码里定死的尺寸
-> 不动、不另行计算」的原则，现在不裁剪 —— 装不下是**溢出**问题，不是改尺寸的理由。
-> FLOW 的溢出裁剪也从尺寸函数移到了趟 2（它属于"溢出策略"，不属于尺寸计算）。
-
-**过程中修掉的 4 个自身 bug**（都由逐字节比对暴露）：
-
-1. `_place` 里 padding 被减了两次，可用高被吃掉 20mm，后续元素全被裁成 0；
-2. 传给子元素的"原点"语义搞错，子元素把自己的 padding 加在了父的坐标上；
-3. `_place` 内部调 `get_content_area()` 触发 `_ensure_layout()` → 无限递归；
-4. `create_band` / `split_column_advanced` 在**构造之后**才给格子设 `_width`，
-   而尺寸方式在构造时按 `width=0` 推成了 `FILL`，把定死的宽度覆盖掉。
-
-**顺手清掉一处遮蔽**：`ResumeTemplate.py` 里还留着一份批次 2 就已移入引擎的
-`split_column_advanced` 旧副本，它的定义**遮蔽**了 import 的引擎版本，
-且直接写 `_width` / `_x` 而不声明尺寸方式 —— 已删除该副本（102 行），改为从引擎 import。
-
-**新增迁移注意**（已写入技术文档）：
-
-> `obj._height = N` 这种"先构造、后设尺寸"的旧写法会**失效** ——
-> 构造时若 `height=0`，尺寸方式被推成 `FILL`，之后直接写 `_height` 不会改回 `FIXED`。
-> 请改用 `obj.height = N`（新增的公开属性会同步尺寸方式）。
-> 已把 `ResumeTemplate.py` 里 4 处这类写法改正。
-
-**新增工具** `verify_pdfs.py`：把上一段那种手工比对固化成可复用工具。
-标准工具链里没有 pypdf / PyMuPDF，而生成的 PDF 含 CreationDate / ID 等易变字段，
-直接比字节永远失败。该工具剥离这些字段后比对，`py verify_pdfs.py --baseline <目录>` 即可。
-
-**测试**
-
-- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**。
-  这是很强的结果 —— 引擎的整棵测试树走全新遍历，输出与旧实现完全相同；
-- 跑两次结果一致（确定性）；引擎入口整体耗时 **1.32 秒**；
-- 引擎测试入口新增 13 项断言：FIXED 不被裁剪、FILL 撑满、CONTENT 包围内容、
-  **包围高与父高无关（父高 100/300/800 下均为 55）**、CONTENT 夹紧与溢出标记、
-  尺寸循环报错、结构循环报错、失效传导（加子/改子元素后重算拿到新值）、FLOW 溢出裁剪。
-
-#### **批次 4.3：几何属性 property 化**
-
-
-`_x` / `_y` / `_width` / `_height` / `padding` / `align_x` / `align_y` 全部改为
-`@property` + setter，setter 内触发 `invalidate_geom_cache()` —— 从机制上消灭
-"忘了失效"这一类 bug（7.3 / 7.4 的根因）。
-
-**`width` / `height` 的 setter 会同步尺寸方式**：`> 0` → `FIXED`，`== 0` → `FILL`。
-这让"先构造、后声明尺寸"的旧写法（`obj.height = N`）能正确生效 ——
-构造时若为 0，尺寸方式已是 `FILL`，之后写私有字段不会改回 `FIXED`，`FILL` 会覆盖它。
-
-**新增四个显式接口**（都返回 `self`，`None` 表示不修改该轴）：
-
-```python
-set_size(width=None, height=None)
-set_position(x=None, y=None)
-set_align(align_x=None, align_y=None)
-set_padding(padding=None)          # float 会转成 Padding.all
-```
-
-**构造期不走 property**：`__init__` 直接写 `_padding` / `_align_x` / `_align_y` 等私有字段，
-否则每构造一个对象都要向上无效化整条祖先链。`create_band` 里同理，逐项写私有字段后
-统一调一次失效。
-
-**测试**
-
-- 三个入口退出码 0；**规范化比对：三个产物全部逐字节一致** —— 本次是等价重构；
-- 新增 7 项断言：`padding` 改动对 `CONTENT` 尺寸生效（40 → 54）、
-  `align` 改动对位置生效（LEFT→RIGHT、TOP→BOTTOM）、四个显式接口触发失效并返回 self、
-  **显式 `CONTENT` 不被 `height` 赋值覆盖**、
-  **「直接写私有字段会绕过尺寸方式」的不变量已固化**。
-
-> 最后那两项是排查中确认的语义边界，值得单独指出：
-> `height` 赋值**不会**覆盖调用方显式声明的 `CONTENT`（那是他明确表达的意图）；
-> 而直接写 `_height` 则会绕过尺寸方式解析 —— 这正是需要公开接口的理由。
-
-#### **批次 4b：内容固有宽度与收缩包裹（修 7.21）**
-
-`wrap_width` 原先三条路径全部返回 0：收窄要求子元素宽度由自己决定，
-而引擎里 `_width == 0` 的语义是「撑满父宽」，父宽正是待求值 —— 自相矛盾。
-
-**新增独立的「内容固有宽度」路径**，不复用上述语义：
-
-| 新增 | 作用 |
+| # | 缺陷 |
 | --- | --- |
-| `_source_w(pdf)` | 内容固有宽度。`LayoutObject` = 子元素贡献最大值 + padding；`TextObject` 覆盖为字符串宽度 |
-| `_contribution_w()` | 本元素对**父** `CONTENT` 宽度的贡献 |
-| `TextObject._estimate_text_width()` | 按字符类别估算：CJK/全角 = 1.0×字号，其余 = 0.5×字号 |
+| 1 | 中层自检有 5 个查询名漏写 `_right_column` 前缀，一直打印"未找到"却仍退出码 0 |
+| 2 | 证件照模板与姓名模板**撞名**（`profile_photo_0_content` vs `profile_0_content`），前者注册表条目被覆盖 |
+| 3 | `dividing_line` 名字不含 index，多个节标题互相覆盖注册表 |
+| 4 | 个人总结与节详情**共用** `section_details_{i}` 前缀，迫使调用方手工错开编号 |
+| 5 | `profile.photo` 的 `image_path=""` 使 `photo` 被判定为空，证件照整段被跳过 |
+| 6 | 技能/证书/荣誉三段在顶层手抄约 200 行 |
+| 7 | 微信行填的是 **QQ 号**（`f"微信：{profile.social_media_qq}"`） |
+| 8 | 联系方式编号从 0 起算，与姓名模板撞名 |
 
-关键点：测量时 `SizeX.CONTENT` 的父元素取**子元素的固有宽贡献**，
-而不是子元素的"已算宽度" —— 后者那时刻还是 0（FILL 子元素要等父定完）。
+**五、结构级验收**
 
-**顺带修正了批次 4.2 的一处错误设计。**
+改动前代码从未入库，无法用 git 取回，因此改用**独立重建**做比对：把旧 API 的语义
+单独重实现一份，跑同一份数据，再与新版逐节点对照。
 
-4.2 曾判定「`CONTENT` 父 + 直接 `FILL` 子」是尺寸循环并报错。4b 实测确认**这个判定是错的**：
+结果（135 节点）：
 
-> `FILL` 子元素需要的是**约束**，不是「父的最终尺寸」，而约束是作为参数往下传的 ——
-> 这个环在设计上就已经断开了。旧实现之所以撞墙，是因为它回头问
-> `parent.get_effective_height()`，而那时父的尺寸尚未确定 ——
-> 那是**实现方式**造成的环，不是语义上的环。
+- 共有节点 120 个，其中 **24 个有实质差异，全部落在上面 4 项有意变更内**；
+- 右栏从节标题到总结之间**每个元素的 y 坐标完全未变** —— 说明"自动结算出的详情高度"
+  与原固定值逐项等值，是等价替换而非尺寸变化；
+- 左栏整齐下移 9mm 一项，唯一来源是个人信息行默认高度：从硬编码 `20mm`
+  改为按"字号一半 / 图标高 + 留白"推算（22pt 姓名行 → 11mm）。
 
-改为**退化规则**：父元素在某条轴上由内容决定尺寸时，该轴上的 `FILL` 子元素
-**退化为按内容定尺寸**（与安卓 `wrap_content` 父强制 `match_parent` 子退化一致）。
-若不退化，「`CONTENT` 父只有 `FILL` 子」会收敛到 0，完全不可用。
-
-`LayoutError_CONTENT_FILL` 因此不再被触发，类型保留；真正会报错的只剩**结构循环**。
-
-**新增 5 项断言**
-
-- 收窄到内容固有宽（0 / 30 —— 旧实现三条路径全返回 0）；
-- 文本固有宽度估算（半角 0.5×、全角 1.0× 字号）；
-- 双向包围文本（54.00 × 13.20 = 文本固有 48 × 7.2 + padding 6）；
-- 包围盒受祖辈约束夹紧 + 溢出标记；
-- `FILL` 子退化规则。
-
-**测试**：三个入口退出码 0；**规范化比对：三个产物全部逐字节一致**；
-引擎入口耗时仍为 1.32 秒。
-
-> 逐字节一致在这里有一个特别的意义：新功能（收窄）**只在 `SizeX.CONTENT` 时生效**，
-> 既有结构没有任何一处使用它，因此基线必须完全不动。
-
-#### **批次 4.4：删除 `wrap_*` 兼容面（批次 4 收尾）**
-
-**彻底移除 `wrap_width` / `wrap_height`** —— 构造参数、兼容 property、
-`_calculate_wrap_height` 委托垫片全部删除。它们只是
-`SizeX.CONTENT` / `SizeY.CONTENT` 的旧写法，长期并存会让"谁是真相"含糊。
-
-迁移写法：
-
-```
-wrap_width=True   ->  size_x=SizeX.CONTENT
-wrap_height=True  ->  size_y=SizeY.CONTENT
-```
-
-**顺带清掉三处旧机制残留**：
-
-- 模块文档字符串里"wrap_content 支持 / 几何缓存"等过时描述，改写为四轴与两趟遍历的说明；
-- `_get_display_name` / `__repr__` 里的 `wrap_*` 读取改为读 `_size_x` / `_size_y`
-  （标记从 `[H↕]` / `[W↔]` 语义不变，`__repr__` 的标记改为 `content_h` / `content_w`）；
-- `ImageObject` 内部临时 `new FPDF()` 的残留（**缺陷 7.6**）——
-  4.2 已改为 `_source_h(pdf)` + `_image_aspect_ratio(pdf)`：优先用外部传入的 `pdf`，
-  其次用 Pillow 读图片头部，都不行才保守估算。
-
-**顺带修掉缺陷 7.10 的引擎侧**：`Style.padding` 的可变默认参数
-（`Padding.all(0)` 会让所有 `Style` 实例共享同一个 `Padding`）
-改为 `padding=None` → 构造时新建。对外行为不变，但实例之间不再互相污染。
-
-**测试**
-
-- 三个入口退出码 0 —— 值得注意的是**中层/顶层仍在工作**，
-  因为它们本来就没有使用 `wrap_*`（我先前担心 `ResumeTemplate.py` 大量依赖它，实测是 0 处）；
-- **规范化比对：三个产物全部逐字节一致**；
-- 新增 5 项断言：声明值→尺寸方式推断（4 例）、显式 `size_*` 生效、
-  **`wrap_*` 兼容面已彻底移除**（属性不存在 + 四个类的构造签名都不含该形参）、
-  `size_*` setter 生效、**`Style.padding` 可变默认已修**（两个实例的 padding 必须是不同对象）。
-
-> **批次 4 至此全部完成。** 底层现在具备：四轴尺寸/对齐、两趟遍历、
-> 自动失效、收缩包裹、包围内容、显式循环报错。
-> 剩下的批次 5（真实行数测量）只需替换 `_source_w` / `_source_h` 的文本实现 ——
-> 钩子已就位，接口不变。
-
-#### **批次 5：真实文本测量 + 分段样式**
-
-**目标**：让文本尺寸来自真实测量，并让一段文字内部可以有多种样式。
-两者合并做，因为**分段样式的核心就是测量**（逐段量宽、逐段断行）。
-
-**新增数据结构**
-
-- `TextRun`：一段连续文字 + 它自己的样式（字体/字号/粗斜体/颜色）。
-  **不可变** —— 所有"修改"返回新对象，因此 `runs` 列表可安全共享。
-- `TextMetrics`：测量结果（每行的片段、x 偏移、宽度、行高）。
-
-**新增测量引擎 `measure_text(pdf, runs, available_width)`**
-
-摊平成可断行单元 → 贪心装行：
-
-| 切分规则 | 说明 |
-| --- | --- |
-| CJK **逐字** | 中文没有空格，逐字断行是标准做法 |
-| 非 CJK **按空白切词** | 拉丁文按词断行，不在词中间断开 |
-| 空白单独成段 | 便于行尾丢弃；`\n` 变硬换行 |
-
-宽度在**各自的字体**下用 `pdf.get_string_width()` 测量 —— 这正是分段样式的关键。
-
-> **关键设计**：渲染时**复用同一份 `lines`**，因此"测量出的行数"与"画出来的行数"
-> **一致性由构造保证**，不依赖 fpdf 内部断行行为。这是缺陷 7.7 的根治。
-
-**新增 Markdown 内联语法**
-
-`**粗体**` · `*斜体*` · `` `等宽` `` · `<b>` `<i>` · `<c:RRGGBB>色</c>` · 转义 `\*` `\` `\<`。
-`runs=` 与 `text=` 同时给出时 **`runs` 优先**；`markdown=False` 可关闭解析。
-
-**不支持与未闭合的标记原样保留为文本** —— 不静默丢弃，写错时看得见。
-
-**新增 `font_context` 字体切换助手**（测量与渲染共用，只有一处实现），
-含**变体缺失的优雅降级**：调用方未必注册过 `"B"`/`"I"`/`"BI"` 每个变体，
-fpdf 未注册时会抛 `FPDFException`，直接冒泡会让整份文档渲染失败。
-因此退回"同字体、无样式"并**明确打印提示**。
-
-**`TextObject` 改为持有 `runs`**
-
-- `get_text()` 是 runs 的拼合视图（**向后兼容**，旧代码只读纯文本的地方行为不变）；
-- `set_text()` 重建为单段（并解析 markdown）；`append_text()` 追加到最后一段；
-- 新增 `get_runs()` / `set_runs()`（返回副本，避免外部直改内部状态）；
-- `render()` 改为逐 run 绘制，**基线对齐**（同一行内各片段底边对齐）；
-  相邻同源片段会合并，避免逐字调用 `pdf.cell`。
-
-**P1 时序：`render(pdf)` 自动补测重排**
-
-文本的真实字宽只有 fpdf 能给，而 `get_effective_*()` 是无参的、
-且会惰性触发布局 —— 那条路径拿不到 `pdf`。因此 `render(pdf)` 入口会检查
-"当前布局是否用真实 pdf 测过"，没有则**强制重排一次**。
-调用方接口不变（仍写 `root.render(pdf)`），三段式（先尺寸、再位置、最后绘制）仍成立。
-
-实测这条机制有效：一个 `SizeX.CONTENT` 文本块在无 pdf 布局时估算宽 **48.00**，
-`render` 入口补测后变为 **16.93**（旧估算偏大近 3 倍）。
-
-**行为变化：行高从 `0.6×字号` 改为 `1.2×字号`（有意）**
-
-旧代码把"行高"当成 `字号 × 0.6` 这个粗常数，后果是
-**多行文本行距过密（会重叠）**，且**单行文本垂直偏上**
-（居中用的是紧行框，而字形实际约占 1.2×字号）。批次 5 让行高成为真正的行距。
-
-**布局几何完全未变**（逐个元素的有效尺寸与绝对坐标与批次 4 相同），
-差异**只来自"文字在块内画在哪"**：单行移动 1.7~2.8mm，多行按真实行高排布后移位更大。
-这是**有意的改进**，不是回归 —— 况且旧逻辑本就依赖手动设置文本高度
-（`description_height`），那正是本批要消灭的东西。
-
-**测试**：三个入口退出码 0；新增 12 项断言 ——
-CJK 断行（宽 120/60/30 → 2/3/5 行）、总高 = 行数 × 行高、硬换行、
-拉丁按词断行、分段样式同行测量、**同字号分段与单段断行位置完全一致**、
-markdown 解析（转义/未闭合/颜色/HTML/纯文本）、`runs` 优先与 `markdown` 开关、
-`get_text`/`set_text`/`append_text`/`set_runs` 语义、
-**真实测量接入尺寸计算**、**P1 时序（估算 → 实测重排）**、字体变体缺失降级。
-
-引擎入口耗时 1.81 秒（批次 4 为 1.32 秒 —— 真实测量比字符估算贵，属预期）。
-
-> 批次 5 是**有意的行为变更**，逐字节基线到此更新为新基线
-> （`%TEMP%\batch5_baseline`）。批次 6（分页）暂缓。
-
-#### **收尾核查：签出功能分支前的三条判定标准**
-
-按 `SKILLS.md` 的「底层功能完整」逐项核查（**只读**，用引擎公开接口搭一个完整文档）。
-
-**判定标准 1：引擎能独立完成一次多元素排版** ✅
-
-用纯公开接口搭出：容器 → `create_band` 按比例分栏 → 按 `Style` 建文本块 →
-`runs` 分段样式 → `SizeX/Y.CONTENT` 矩形包围内容 → `create_spacer` 流式堆叠。
-**全程未手工改写 `_height` / `_x` / `_width`。**
-
-自洽性核对：`C_Body` 内容高 = 40（带）+ 20.4（包围盒）+ 6（留白）+ 10（padding）= **82.40** ✅
-
-**判定标准 2：缓存失效自动触发** ✅
-
-改子元素 `height` / `add_child` / 改 `padding` / 改 `size_y`+`height` / `remove_child`
-五种操作后，包围高都自动重算到期望值。
-
-**判定标准 3：引擎自检不依赖中层** ✅
-
-测试入口的 import 只有 `fpdf` / `inspect` / `io` —— **对中层/顶层零依赖**；
-**192 条 assert**，覆盖四轴尺寸、两趟遍历、包围内容、分栏、留白、文本块、
-缓存失效、循环报错、文本测量、分段样式、Markdown、P1 时序。
-
-**核查中发现并修复一个引擎缺口**
-
-> **`create_band` 缺少 `align_y` 参数**，它建的带容器**无法参与纵向流式排列**
-> （只能绝对定位在 `avail_y`）。这不是用法问题而是真缺口 ——
-> 几乎总要显式改成 `FLOW`，否则带与后续兄弟**重叠**。
-
-已修复：`create_band` / `create_columns` / `create_columns_balanced` 新增
-`align_y: AlignY = AlignY.NONE`（默认值保持既有行为，故既有产物逐字节不变）。
-
-`split_column_advanced` **不**加此参数 —— 它是包装层，默认把左右对象设为
-`align_x/y = NONE` 并返回 `parent` 供链式调用；直接改它的 `align_y` 会破坏
-"左右栏各占自己那一栏"的语义。
-
-**结论：底层已具备签出功能分支的条件。** 剩余待办全部记在 `SKILLS.md` 的
-「只在功能分支处理的事项」。批次 6（分页）暂缓。
+生成物基线（`%TEMP%\resume_pre_refactor`）与 `verify_pdfs.py` 仍可用于后续回归。
 
 #### **批次 7：文本落点与盒内对齐（两处缺陷，详见 TECHNICAL.md 3.4d）**
 
@@ -713,87 +183,5 @@ fpdf 又把文字**垂直居中**在格子里，于是基线落到格子中央�
 功能分支文档的「中层调参手册」。
 
 ---
-
-## 分支策略
-
-项目按"底层稳定、上层多分支"组织：
-
-- **`master`** —— 只承载**最底层**：排版引擎与引擎自身的文档。
-  这一层要被所有功能分支复用，所以必须尽量稳定、尽量不含领域词汇。
-- **功能分支** —— 从 `master` 签出，承载中层快捷调用与顶层功能。
-  同一份引擎可以在不同分支上实现不同功能（简历、报告、文档流……）。
-
-### 分层归属
-
-| 层 | 文件 | 归属 |
-| --- | --- | --- |
-| 底层 · 构件 | `LayoutEngine.py` | `master` |
-| 底层 · 文档 | `TECHNICAL.md`、`SKILLS.md`、`README.md` | `master` |
-| 中层 · 快捷调用 | `create_band` / `create_columns` / `split_column_advanced` / `create_spacer` | `master`（批次 1、2 已下沉） |
-| 顶层 · 版式词汇 | `ResumeTemplate.py`（`Style`、`STYLES`、`generate_*`、`fill_*`） | 功能分支 |
-| 顶层 · 领域模型 | `ResumeCore.py`（`Profiles`、`Section`、`Resume`） | 功能分支 |
-
-> **为什么 `Style` 也属于顶层**：`Style` 与"样式→对象"的翻译被计划下沉进引擎
-> （见 `TECHNICAL.md` 8.4，属**批次 3**），但**当前它住在 `ResumeTemplate.py` 里**，
-> 所以现在它随功能分支走。下沉完成之后它才转为底层内容。
-
-### 本次整理：`master` 的暂存内容
-
-`8af9962`（新增构件 spacer）已提交。在其之上，**基础设施**与**批次 2** 产生了以下待提交内容：
-
-| 状态 | 文件 | 说明 |
-| --- | --- | --- |
-| `M` | `.gitignore` | 追加 `*.pdf`、`output/`、`Resources/*.ttf` |
-| `M` | `README.md` | 新增「资源获取」章节 + 上述日志 |
-| `M` | `PythonPDFLayoutSystem.pyproj` | 入口与编译项改指 `LayoutEngine.py` |
-| `M` | `LayoutEngine.py` | 新增 `create_band` + `split_column_advanced` 移入 + 修 7.3/7.4 + 断言 |
-| `M` | `TECHNICAL.md` | 3.4 节重写、8.1 标完成、7.3/7.4 标修复、批次表更新、新增批次 2 踩坑记录 |
-
-暂存区之外、**留给功能分支**的内容（自 `f718518` 起一律未跟踪，符合分层归属）：
-
-| 状态 | 文件 | 说明 |
-| --- | --- | --- |
-| `??` | `ResumeTemplate.py` | 顶层：简历版式词汇 |
-| `??` | `ResumeCore.py` | 顶层：简历领域模型与生成流程（已改用 `create_spacer`） |
-
-两者互相依赖（`ResumeCore` 依赖 `ResumeTemplate`），必须同分支落地，
-且 `ResumeCore.py` 当前已修到可运行（退出码 0）。
-
-> ✅ **已验证底层与顶层暂时不同步不构成问题**：批次 1、2 让
-> `ResumeCore.py` / `ResumeTemplate.py` 用上了新增的 `create_spacer`、`create_band`，
-> 而这两个文件未入库。依赖方向是顶层依赖底层，所以 `master` 上的 `LayoutEngine.py`
-> 只是多了两个暂时无人使用的构件。在包含这两个文件的工作树中，三个入口均实测退出码 0。
-
-生成物已由 `.gitignore` 排除：`test_layout_engine_cached.pdf`、`resume_template_v2_test.pdf`、
-`output/` —— 它们随代码变化且可由测试入口复现。
-
-### 待决事项
-
-1. **功能分支尚未建立**：`master` 目前只有引擎与文档。等批次 3 把中层设施
-   （`create_text_block`、`Style`）也下沉完毕后，即可从 `master` 签出
-   功能分支，把 `ResumeTemplate.py` / `ResumeCore.py` 作为首个提交放进去。
-2. **`main.py` 的归属**：内容仅为占位（`print("Hello,world!")`），已在 `f718518` 中入库。
-   程序入口已按决定指向 `LayoutEngine.py`（`.pyproj` 的 `StartupFile`），
-   `main.py` 可留作占位，或在功能分支里替换为真正的入口。
-3. **`TECHNICAL.md` 与 `master` 内容存在时间差**：文档第 4、5 章描述的是
-   `ResumeTemplate.py` / `ResumeCore.py`，而这两个文件不在 `master` 上。
-   目前将其整体归为底层文档（它们描述的是引擎的既有消费方，对引擎的约束仍然有效）；
-   若日后 `master` 需要独立自洽，可把这两章拆到功能分支的文档里。
-   注意第 3.4 节的 `create_spacer` 条目**属于底层**，不受此影响。
-4. **`PythonPDFLayoutSystem.pyproj` / `.slnx` 仍引用已删除的旧入口**：
-
-   ```xml
-   <StartupFile>PythonPDFLayoutSystem.py</StartupFile>
-   <Compile Include="PythonPDFLayoutSystem.py" />
-   ```
-
-   这两处需改为指向 `LayoutEngine.py`（并补上其它源文件），否则在 Visual Studio
-   中打开该项目会看到失联的启动文件。
-5. **建议把生成物写进 `.gitignore`**：追加 `*.pdf` 与 `output/`，
-   以免日后误提交。
-6. **`Resources/` 是否入库仍未定**：内含 6 个霞鹜文楷 TTF，单个 18–21 MB、合计约 117 MB。
-   完全不入库则新克隆的仓库缺字体、中文静默降级为空白；全量入库则仓库显著变重。
-   可选：全部入库 / 只入 Regular+Bold / Git LFS / 只写下载说明。
-   目前没有任何 `.gitignore` 规则覆盖它，**将来一定会被误提交**。
 
 ---

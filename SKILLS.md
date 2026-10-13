@@ -14,6 +14,17 @@
 
 项目有 Git 仓库。可以运行指令以在不同分支和快照中签出。
 
+## 分层归属（当前实际）
+
+| 层 | 文件 | 分支 | 状态 |
+| --- | --- | --- | --- |
+| 底层 | `LayoutEngine.py` + 文档 | `master` | 稳定，192 条自检 assert |
+| **中层** | `ResumeTemplate.py` | `feature_resume_sub_templates` | 2026-10-13 重写为方法风格 + 句柄 |
+| 顶层 | `ResumeCore.py` | 同上 | 同步改写调用点 |
+
+> 「中层 = 对底层构件的调用与便捷封装」；「顶层 = 面向使用者与开发人员」。
+> 现有行数：`ResumeTemplate.py` 约 1415 行、`ResumeCore.py` 约 845 行。
+
 ## 默认约定
 
 - 如果我没有声明需要改动什么文件，那就先不要动
@@ -64,54 +75,67 @@
 ## 只在功能分支处理的事项
 
 底层（`master` 上的 `LayoutEngine.py` 及其文档）已经稳定。中层与顶层文件
-（`ResumeTemplate.py` **1523 行**、`ResumeCore.py` **1221 行**）
-**不在 `master` 上**，因此有一类改动无法在 `master` 完成。
+（`ResumeTemplate.py`、`ResumeCore.py`）**不在 `master` 上**，因此有一类改动无法在
+`master` 完成。
 
 > **重要更正**：这两个文件当前是**未跟踪**状态，但**它们不阻塞签出**。
 > `master` 只有 `LayoutEngine.py` 一个源文件，它自洽且自检通过。
 > 正确顺序是：**先在 `master` 提交 → 签出功能分支 → 把这两个文件加进分支**。
+> ⚠️ 当前这两个文件**仍未入库**（`git status` 显示 `??`），是本分支最大的风险点。
 
-### A. 文档与元数据层（无行为风险，建议最先做）
+### A. 文档与元数据层（无行为风险）
 
 | 优先级 | 事项 | 说明 |
 | --- | --- | --- |
 | A1 | **`.pyproj` 补编译项** | 目前只 `Include` 了 `LayoutEngine.py`；加入 `ResumeTemplate.py` / `ResumeCore.py` |
-| A2 | **`Resources/` 图标入库** | `ResumeTemplate.py` / `ResumeCore.py` 引用的 **11 个**图片文件尚未入库（`.ttf` 已被 `.gitignore` 排除，小素材应正常入库） |
+| A2 | **`Resources/` 图标入库** | 两个文件引用的 **11 个**图片文件尚未入库（`.ttf` 已被 `.gitignore` 排除，小素材应正常入库） |
 
-> 已核实：两个文件都是**完好的 UTF-8**（无 BOM、0 个替换字符、2376 / 2177 个正常中文字符）。
+> 已核实：两个文件都是**完好的 UTF-8**（无 BOM、0 个替换字符）。
 > 之前担心的"编码损坏"是 PowerShell 以 GBK 读取 UTF-8 的显示问题，**不是文件问题**。
 
-### B. 顶层 · 模板层（`ResumeTemplate.py`）—— 收益最大
+### B. 中层 · 模板层（`ResumeTemplate.py`）—— ✅ 2026-10-13 全部完成
 
-现状核实（行号为当前值）：
+| 优先级 | 事项 | 结论 |
+| --- | --- | --- |
+| **B1** | 删除本地 `class Style`，改从引擎导入 | ✅ 完成。`ResumeTemplate.Style is LayoutEngine.Style` 由测试断言守住 |
+| B2 | 7 处 `TextObject(...)` + 3 处 `ImageObject(...)` 改用 `from_style(...)` | ✅ 完成，全部走 `TextObject.from_style` / `ImageObject.from_style` |
+| **B3** | 2 处 `height=50` 显式传参 | ✅ **超出预期完成**：不再写死高度，改由 `SizeY.CONTENT` 自动结算（见 C3） |
 
-| 现状 | 数量 |
+**追加完成（B 之外的实质改造）**：
+
+| 项 | 说明 |
 | --- | --- |
-| 本地 `class Style` | 1 处（**第 49 行**） |
-| `TextObject(...)` 手抄参数 | 7 处 |
-| `ImageObject(...)` 手抄参数 | 3 处 |
-| 硬编码 `height=50` | 2 处（**第 979 / 1069 行**） |
-| `from_style` 调用 | **0 处** |
-| `create_text_block` 调用 | **0 处** |
+| 方法风格 API | `generate_*` / `fill_*` 共 11 个符号**全部移除**，替换为挂在 `LayoutObject` 上的 10 个 `add_*` 方法 |
+| 结果句柄 | 7 个 dataclass 句柄（`BasicHandle` / `ProfileHandle` / … ），部件走属性访问，不再靠字符串查询 |
+| 列表入口 | `add_details_list(items)` —— 同一蓝图复用 N 次 |
+| 组合模板 | `add_section(section)` = 节标题 + N × 详情 |
+| 文本行构件 | `add_text_row(...)` —— 技能/证书/荣誉三段从约 200 行收敛为一次循环 |
+| 三栏改用 `create_band` | 手算 `col_widths` + `cumulative_x` 的写法删除 |
+| 证件照与姓名撞名 | 照片节点前缀改 `photo_`，消除 `profile_photo_0_content` vs `profile_0_content` 覆盖 |
+| 分隔线命名 | `section_title_{i}_divider` 含 index，消除同名解析不一致 |
+| 个人总结命名空间 | 独立为 `summary_{i}_*`，不再与节详情共用前缀 |
+| 个人信息行左缩进 | 从"行内容器内边距"改为"整条横带右移 + 同步收窄宽度"，消除原先 3mm 的右侧溢出 |
 
-| 优先级 | 事项 | 说明 |
+### C. 顶层 · 领域层（`ResumeCore.py`）—— ✅ 2026-10-13 全部完成
+
+| 优先级 | 事项 | 结论 |
 | --- | --- | --- |
-| **B1** | **删除本地 `class Style`**（第 49 行起），改 `from LayoutEngine import Style` | **最高优先级**。方案 A：单一来源，不留别名。现在本地 `Style` 遮蔽引擎版本，引擎侧 `Style` 的改动（如 4.4 修的可变默认 `padding`）**在模板层拿不到**，两边会悄悄漂移 |
-| B2 | 7 处 `TextObject(...)` + 3 处 `ImageObject(...)` 改用 `from_style(...)` | 每处从手抄 7 个参数缩到 1 行 |
-| **B3** | 2 处 `height=50` 改经 `create_text_block` 显式传参 | ⚠️ **迁移时必须显式传 50**，不能依赖新默认值 `0` —— 后者的语义是"取父可用高"（见 TECHNICAL.md 3.5），否则产物会变 |
+| C1 | 导入块把 `Style` 改从 `LayoutEngine` 取 | ✅ 完成（与 B1 配套） |
+| C2 | 技能/证书/荣誉三段用 `create_text_block` 收敛 | ✅ 完成，改用中层 `add_text_row`；三块走一个 `blocks()` 循环 |
+| C3 | `Details.description_height` 的移除 | ✅ 完成。字段保留但默认改为 `None` = 自动结算；实测自动值与旧固定值**逐项等值** |
+| C4 | `Generate()` 与 `main()` 的 print 差异统一 | ⏸ 未做（低价值，暂缓） |
+| C5 | 两个可变默认参数 | ✅ 完成。`SkillsAwards` 三个列表与 `Resume.Lead` 均改为 `None` + 副本 |
 
-### C. 顶层 · 领域层（`ResumeCore.py`）
+**追加完成**：
 
-现状核实：`from ResumeTemplate import` **1 处**；`Style` 引用 **2 处**；
-`create_spacer` 已在用 **15 处**；技能/证书/荣誉三段各 1 处。
-
-| 优先级 | 事项 | 说明 |
-| --- | --- | --- |
-| C1 | 导入块把 `Style` 改从 `LayoutEngine` 取 | 不再经 `ResumeTemplate` 转手（与 B1 配套） |
-| C2 | **技能/证书/荣誉三段**（约 200 行）用 `create_text_block` 收敛 | 三段几乎逐行相同；顺带处理其中父指针错挂、`align_y` 不一致等既有问题 |
-| C3 | `Details.description_height` 的移除 | 批次 5 的真实测量已让这个手动调参旋钮**不再必需**；改由 `SizeY.CONTENT` 自动定高 |
-| C4 | `Generate()` 与 `main()` 的 print 差异统一 | `Generate` 用 `print(f"   >>>✅ ...")`，`main` 用 `print(f"  生成成功: ...")` |
-| C5 | 两个可变默认参数 | `skills/qualifications/awards: List[str] = []`、`Lead: dict = {}`；改 `field(default_factory=list)` / `None` 模式 |
+| 项 | 说明 |
+| --- | --- |
+| `Generate` 增加布局结算 | 渲染前显式 `root.layout(pdf=pdf, force=True)`，让 `CONTENT` 高度用真实文本测量 |
+| 联系方式列表化 | 原 14 行 if-append 改为 `_contact_rows()` |
+| 微信取值错误 | 原实现填的是 **QQ 号**（`f"微信：{profile.social_media_qq}"`），已改为 `social_media_wechat` |
+| 联系方式编号错位 | 原从 0 起算，与姓名模板撞名；现从姓名之后接排 |
+| 技能三段形状统一 | 归入 `_fill_skills_awards()` |
+| 新增 `summary_title` | 原先写死标题文本，现可配置 |
 
 ### D. 引擎侧跟进（可在功能分支做，也可回 `master`）
 
@@ -119,9 +143,10 @@
 | --- | --- | --- |
 | D1 | **`_calculate_wrap_height` 已彻底删除** | ✅ 无需处理 —— 功能分支不会调到它 |
 | D2 | 上层若需"先构造、后声明尺寸" | 用 `obj.height = N`（公开 property 会同步尺寸方式）；**直接写 `_height` 会绕过尺寸方式解析** |
-| D3 | `timer` 装饰器改受开关控制 | 一次简历生成打印数千行（TECHNICAL.md 7.13）；改 `logging` 更好 |
-| D4 | 全局单例可重入 | `layer_manager` / `objectRegister` 是模块级全局（7.14），同进程生成多份文档会互相污染 |
+| D3 | `timer` 装饰器改受开关控制 | 一次简历生成打印数千行（TECHNICAL.md 7.13）；改 `logging` 更好。**仍未排期** |
+| D4 | 全局单例可重入 | `layer_manager` / `objectRegister` 是模块级全局（7.14），同进程生成多份文档会互相污染。**仍未排期** |
 | D5 | 边框 / `is_fill`（缺陷 7.9） | `RectangleObject.render()` 永远实心填充，忽略 `is_fill`。**仍未排期** |
+| D6 | `line_height` 死参数 | 构造参数 `line_height` 只写入 `self._line_height`，**全库从不读取**；实际行高由 `line_height_ratio=1.2` 决定。`create_text_block` 的 docstring 曾误写 `font_size * 0.6`，已于 2026-10-13 就地更正 |
 
 ### E. 已决定不做 / 暂缓
 
@@ -140,7 +165,25 @@
 2. 改动后比对；
 3. 差异**逐条对应到预期改动**，确认没有多余的连带变化。
 
-> ⚠️ 批次 5 起，文本的**行高从 `0.6×字号` 改为 `1.2×字号`**（有意修正：
-> 旧值会让多行文本行距过密、单行垂直偏上）。功能分支若沿用旧产物做基线，
-> 需把这一项差异预期在内。
+#### F.1 一个坑：旧代码无法用 git 取回
 
+`ResumeTemplate.py` / `ResumeCore.py` **从未入库**，因此 `git worktree` / `git stash`
+都取不到改动前的版本，无法用"跑旧代码再比结构"的方式做回归。
+
+2026-10-13 采用的办法是**独立重建**：把旧 API 的语义单独重实现一份（手算宽度、
+手改 `_height`、`description height=50`、`line_height=font_size*0.6`、`dividing_line`
+不含 index……），跑同一份数据，再与新版**逐节点**对照。
+
+结论模板：
+
+- 共有节点 N 个，其中 M 个有实质差异，**逐条归入有意变更清单**；
+- 与有意变更无关的节点必须**完全未动**（右栏每个元素的 y 坐标逐一核对过）。
+
+> ⚠️ 重建的旧代码必然有常量取舍，会留下亚毫米残差，判据取 **0.5mm 容差**。
+
+#### F.2 行高：曾经的误判
+
+> ⚠️ 旧版**文档**写"行高 = `0.6 × 字号`"，但**实现从未如此** ——
+> `line_height` 是死参数（见 D6），实际一直是 `1.2 × 字号`。
+> 因此 2026-10-13 删掉这两处 `line_height=font_size * 0.6` 是**零产出差异**的清理，
+> 不需要任何基线预期。

@@ -130,31 +130,41 @@ Colors、LayoutObject、Utils、PaddingsAligns、LayoutEngineV2、LayoutEngine�
 ### 2.1 分层（对应 `SKILLS.md` 的定义）
 
 ```
-┌─ 顶层：功能 ────────────────────────────────────────────────┐
+┌─ 顶层：面向使用者与开发人员 ────────────────────────────────┐
 │  ResumeCore.py     Profiles / SkillsAwards / Details /      │
 │                    Section / Resume                         │
-│                    → 领域数据模型 + 数据到 PDF 的编排        │
-│  ResumeTemplate.py STYLES / generate_*_template / fill_*    │
+│                    → 领域数据模型 + 数据到 PDF 的流程编排    │
+└─────────────────────────────────────────────────────────────┘
+                            ↓ 依赖
+┌─ 中层：调用与便捷封装（feature_resume_sub_templates）────────┐
+│  ResumeTemplate.py STYLES / 结果句柄 / add_* 子模板方法      │
 │                    → 简历版式词汇：姓名、节标题、节详情      │
+│                    → 挂在 LayoutObject 上，调用形如          │
+│                      node.add_details(...) -> DetailsHandle  │
 └─────────────────────────────────────────────────────────────┘
                             ↓ 依赖
-┌─ 中层：快捷调用 ────────────────────────────────────────────┐
-│  split_column_advanced()   传入已构造对象的左右分栏          │
-│  create_columns()          按数量/宽度/比例创建 N 栏         │
-│  create_columns_balanced() 等宽分栏                          │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ 依赖
-┌─ 底层：基本构件 ────────────────────────────────────────────┐
-│  AlignX / AlignY / Color / Padding                          │
-│  LayoutObject（几何、父子、wrap、缓存）                      │
+┌─ 底层：基本构件（master）────────────────────────────────────┐
+│  AlignX / AlignY / SizeX / SizeY / Color / Padding          │
+│  LayoutObject（几何、父子、两趟布局、缓存）                  │
+│  Style / TextRun / measure_text                             │
 │  TextObject / ImageObject / RectangleObject（渲染）          │
+│  快捷构件：create_band / create_columns / create_spacer /    │
+│            create_text_block / split_column_advanced        │
 │  LayerManager / objectRegister（全局registry）              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**分层违规（批次 2 已消除）**：`split_column_advanced`（中层能力）原本住在 `ResumeTemplate.py`
-（顶层文件）里，`ResumeCore.py` 因此不得不 `from ResumeTemplate import ...` 才能分栏。
-批次 2 已把它连同新的 `create_band` 一起移入引擎（见 3.4），依赖方向恢复正常。
+**三层与 Git 分支的对应**：底层只在 `master` 演进；中层与顶层在本分支演进
+（`ResumeTemplate.py` / `ResumeCore.py` 目前仍未跟踪，见 1.1）。
+
+**分层违规（批次 2 已消除）**：`split_column_advanced`（横向布局能力）原本住在
+`ResumeTemplate.py` 里，`ResumeCore.py` 因此不得不 `from ResumeTemplate import ...`
+才能分栏。批次 2 已把它连同新的 `create_band` 一起移入引擎（见 3.4），依赖方向恢复正常。
+
+**中层的调用形态（2026-10-13 起重写）**：`ResumeTemplate.py` 把 `add_*` 子模板方法
+挂到 `LayoutObject` 上，得到 `节点.add_details(...)` 的方法风格 API，并返回结果句柄
+（见第 4 章）。方法不定义在引擎里，是因为模板必须认识"节标题 / 详情 / Style"这类
+**简历词汇**，而引擎刻意对领域词汇零知识。
 
 ### 2.2 依赖图
 
@@ -1123,248 +1133,244 @@ def find_object_by_name(name: str = "") -> Optional[Any]
 
 ---
 
-## 4. ResumeTemplate.py API
+## 4. ResumeTemplate.py API（中层）
 
-### 4.1 `class Style`
+> ⚠️ **本章已于 2026-10-13 整体重写**。旧的 `generate_*` / `fill_*` 共 11 个符号
+> **已全部移除**，替换为挂在 `LayoutObject` 上的方法 + 结果句柄。旧描述见
+> README 的「10：35 中层重构」一节。
+
+### 4.1 分层与调用形态
+
+`ResumeTemplate.py` 是**中层**：把引擎构件封装成"简历版式词汇"。
+它与引擎的分工是：
+
+| 层 | 文件 | 是否认识"简历词汇" |
+| --- | --- | --- |
+| 底层 | `LayoutEngine.py` | **否**（只有构件、几何、样式） |
+| 中层 | `ResumeTemplate.py` | 是（`STYLES`、节标题、详情……） |
+| 顶层 | `ResumeCore.py` | 是（`Profiles`、`Section`、`Resume`） |
+
+因此子模板方法**不能定义在 `LayoutEngine.py` 里**：那会让引擎认识领域词汇。
+做法是在导入本模块时把 10 个函数挂到 `LayoutObject` 上（第 8 节
+`_install_methods`），并断言"目标成员不存在，拒绝覆盖"。
+
+调用形态：
 
 ```python
-Style(
-    font_name: str = "helvetica",
-    font_size: float = 12,
-    bold: bool = False,
-    italic: bool = False,
-    color: Color = Black,
-    fill_color: Color = White,
-    image_path: str = "",
-    padding: Padding = Padding.all(0),
-    fit_mode = "cover",
-)
+root.add_basic(...)          # 而不是 generate_basic_subtemplate(root=...)
+column.add_details(...)      # 而不是 generate_section_details_template(root=...)
 ```
 
-纯数据类，"长什么样"的属性集合，不含位置信息。
+### 4.2 `Style` 与 `STYLES`
 
-| 方法 | 返回 | 说明 |
-| --- | --- | --- |
-| `get_font_style()` | `str` | `"B"` / `"I"` / `"BI"` / `""`，fpdf 兼容 |
-| `__repr__()` | `str` | 调试字符串 |
+`Style` **只有一份**，来自 `LayoutEngine`（批次 3 已下沉）。本层只提供 `STYLES` 字典。
 
-> ⚠️ `padding: Padding = Padding.all(0)` 是**可变默认参数**，全部 `Style` 实例共享同一个 `Padding` 对象。
-> 当前无代码改写它，所以未爆雷，但是个隐患。见 7.10。
+> 旧版本在本层重复定义了一份 `class Style` 并遮蔽引擎版本，两边会悄悄漂移；
+> 现已删除。`ResumeTemplate.Style is LayoutEngine.Style` 由顶层测试入口断言守住。
 
-### 4.2 `STYLES` 字典
-
-模块级样式表，键 → 用途：
+`STYLES` 键一览（19 个）：
 
 | 键 | 用途 | 关键属性 |
 | --- | --- | --- |
 | `left_column` | 左栏底色 | `fill_color=RimuruBlue` |
 | `profile_photo` | 证件照 | `fit_mode="cover"` |
-| `name_image` | 姓名旁图标 | `image_path=""`（待填） |
-| `name_text` | 姓名文字 | LXGW 22pt 粗体 |
-| `profile_text` | 联系方式文字 | LXGW 12pt 粗体 |
+| `name_image` / `section_title_image` | 图标 | `image_path=""`，待调用方填充 |
+| `name_text` | 姓名 | LXGW 22pt 粗体 |
+| `profile_text` | 联系方式行 | LXGW 12pt 粗体 |
 | `contact_text` | 联系方式（备用） | LXGW 10pt |
-| `skillsawards_title` | 技能/证书/荣誉标题 | LXGW 14pt |
-| `skillsawards_text` | 技能/证书/荣誉正文 | LXGW 10pt |
-| `section_title_image` | 节标题图标 | `image_path=""`（待填） |
-| `section_title_text` | 节标题文字 | LXGW 22pt 粗体，深蓝 |
-| `detail_key_1` | 详情关键词（组1） | LXGW 13pt 粗体 |
-| `detail_time_1` | 详情时间（组1） | LXGW 7pt，`padding=Padding.top(5)` |
-| `detail_tags_1` | 详情标签（组1） | LXGW 8pt |
-| `detail_key_2` | 详情关键词（组2，备选） | LXGW 12pt 粗体 |
-| `detail_time_2` | 详情时间（组2） | LXGW 8pt |
-| `detail_tags_2` | 详情标签（组2） | LXGW 8pt |
-| `detail_description` | 详情描述正文 | LXGW 10pt |
+| `skillsawards_title` / `skillsawards_text` | 技能/证书/荣誉 | LXGW 14pt / 10pt |
+| `section_title_text` | 节标题 | LXGW 22pt 粗体，深蓝 |
+| `detail_key_1` / `detail_time_1` / `detail_tags_1` | 详情三栏（默认） | 13pt 粗 / 7pt（`Padding.top(5)`）/ 8pt |
+| `detail_key_2` / `detail_time_2` / `detail_tags_2` | 详情三栏（紧凑备选） | 12pt / 8pt / 8pt，**当前无调用方** |
+| `detail_description` | 详情描述 | LXGW 10pt |
+| `summary_text` | 个人总结正文 | LXGW 10pt |
 
-> `name_image`、`section_title_image` 的 `image_path` 为空，需由调用方 `set_image()` 填充。
-> 组2（`_2` 系列）已定义但**当前无代码使用**。
+### 4.3 版式默认值
 
-### 4.3 模板生成函数
+集中为模块常量，不再散落在各函数体内：
 
-所有 `generate_*` 函数遵循统一约定：
-- **返回值**：新建的 `content` 对象（`ResumeTemplate.py` 中一律为 `LayoutObject`）。
-- **副作用**：立即 `root.add_child(content)` 并级联创建全部子节点，**注册到全局 `objectRegister`**。
-- **命名约定**：`f"{root.name}_{模板标识}_{index}_..."`，因此必须用**挂载点的 name** 去 `find_by_name`。
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `DEFAULT_RATIO` | `[1.0, 2.5]` | 基础模板左右比例 |
+| `DEFAULT_TITLE_HEIGHT` | `15.0` | 节标题整体高 |
+| `DEFAULT_DIVIDER_HEIGHT` | `0.5` | 节标题分隔线粗细 |
+| `DEFAULT_BRIEF_HEIGHT` | `10.0` | 详情三栏高 |
+| `DEFAULT_BRIEF_RATIO` | `[2.0, 1.0, 2.0]` | 详情三栏比例 |
+| `DEFAULT_ICON_WIDTH` | `4.0` | 个人信息左格宽 |
+| `DEFAULT_TITLE_ICON_WIDTH` | `10.0` | 节标题左格宽 |
+| `DEFAULT_PHOTO_WIDTH` | `30.0` | 证件照宽 |
+| `PHOTO_ASPECT` | `1.6` | 证件照高 = 宽 × 此值 |
+| `DEFAULT_ROW_INSET` | `3.0` | 个人信息行左缩进（旧 split 容器的 `Padding.left(3)`） |
+| `DEFAULT_ROW_PAD_Y` | `3.0` | 行内图标上下最低留白 |
 
-#### `generate_basic_subtemplate(...)`
-
-```python
-generate_basic_subtemplate(
-    root: LayoutObject,
-    ratio: list = None,              # 默认 [1.0, 2.5]
-    left_padding: Padding = None,    # 默认 Padding.all(0)
-    right_padding: Padding = None,   # 默认 Padding.left(5)
-    layer: int = 0,
-) -> LayoutObject                    # 返回 {root.name}_split_container
-```
-
-产出结构：
-
-```
-root
-└── {root}_split_container : LayoutObject
-    ├── {root}_left_column  : RectangleObject   (fill = STYLES["left_column"].fill_color)
-    └── {root}_right_column : LayoutObject      (color = Green)
-```
-
-约束：**同一份简历中只应调用一次**。返回的 `content` 需自行 `find_by_name` 取回。
-
-#### `generate_profile_template(...)`
+两个高度推算函数：
 
 ```python
-generate_profile_template(
-    root, index,
-    icon_style: Style = None,        # 默认 STYLES["name_image"]
-    text_style: Style = None,        # 默认 STYLES["profile_text"]
-    icon_width: float = 4,
-    gap: float = 0,
-    layer: int = 0,
-    content_height = 20,
-) -> LayoutObject                    # 返回 {root}_profile_{index}_content
+profile_content_height(style=None, icon_width=0.0) -> float
+    # max(字号 × 0.5, 图标宽 + 3)。旧实现把该行写死为 20mm
+skills_row_height(style=None) -> float
+    # 字号 × 0.5（与历史行为一致）
 ```
 
-产出结构：
+### 4.4 结果句柄
 
-```
-{root}_profile_{index}_content : LayoutObject   (height=content_height, align_x=CENTER, align_y=FLOW)
-└── {root}_profile_{index}_split : LayoutObject (padding=Padding.left(3))
-    ├── {root}_profile_{index}_icon_range : LayoutObject (width=icon_width)
-    │   └── {root}_profile_{index}_icon   : ImageObject  (fit_mode="cover", align=VCENTER, layer+1)
-    └── {root}_profile_{index}_text_range : LayoutObject (x=icon_width+gap)
-        └── {root}_profile_{index}_text   : TextObject   (align_x=LEFT, align_y=VCENTER, layer+1)
-```
+每个生成方法返回一个 dataclass 句柄，字段就是该模板实例的公开部件。
+**名字只用于调试与兼容查找，正常取用一律走属性。**
 
-宽高计算：`content_w` 从 `content.get_content_area()` 取；若 `<= 0` 则回退到 `root` 的内容宽，
-再回退到硬编码 `150`。`right_width = content_w - icon_width - gap`，为负则归零并令 `gap = 0`。
+| 句柄 | 字段 |
+| --- | --- |
+| `BasicHandle` | `node`（分栏容器）/ `left` / `right` |
+| `ProfileHandle` | `node` / `split` / `icon_range` / `icon` / `text_range` / `text` |
+| `PhotoHandle` | `node` / `photo` |
+| `TitleHandle` | `node` / `split` / `icon_range` / `icon` / `text_range` / `text` / `divider` |
+| `DetailsHandle` | `node` / `brief` / `col_key` / `col_time` / `col_tags` / `key` / `during_time` / `tags` / `details` / `description` |
+| `SummaryHandle` | `node` / `details` / `description` |
+| `SectionHandle` | `node` / `title`（`TitleHandle`）/ `details`（`List[DetailsHandle]`） |
 
-#### `generate_profile_photo_template(...)`
+全部句柄都有 `content` 属性（= `node`）与 `fill(...)` 方法：
+
+| 句柄 | `fill(...)` 参数 |
+| --- | --- |
+| `ProfileHandle` | `text` / `image_path` |
+| `PhotoHandle` | `image_path` |
+| `TitleHandle` | `title` / `image_path` |
+| `DetailsHandle` | `key` / `during_time` / `tags` / `description` / `description_height` |
+| `SummaryHandle` | `description` / `description_height` |
+
+`DetailsHandle` 与 `SummaryHandle` 另有 **`apply(data)`**：从 dict 或 dataclass
+按字段名取值（取不到用默认值），便于把结构化数据直接喂进来。
+
+`fill` / `apply` 都返回 `self`，可链式：
 
 ```python
-generate_profile_photo_template(
-    root, index,
-    icon_style: Style = None,        # 默认 STYLES["profile_photo"]
-    photo_width: float = 30,
-    layer: int = 0,
-) -> LayoutObject                    # 返回 {root}_profile_photo_{index}_content
+col.add_details(index=0, brief_ratio=[2,1,2]).apply(detail).description.set_text("...")
 ```
 
-```
-{root}_profile_photo_{index}_content : LayoutObject (height = photo_width * 1.6, align_x=CENTER, align_y=FLOW)
-└── {root}_profile_photo_{index}_photo : ImageObject (width=photo_width, align=CENTER/VCENTER, layer+1)
-```
+### 4.5 子模板方法
 
-> ⚠️ `photo` 构造时 `parent=root`（第 655 行），但随后被 `content.add_child(photo)` 重新挂到 `content` 下。
-> 实际父子关系正确，但构造参数有误导性。
+#### `add_basic(ratio=None, left_padding=None, right_padding=None, layer=0) -> BasicHandle`
 
-#### `generate_section_title_template(...)`
-
-```python
-generate_section_title_template(
-    root, index,
-    icon_style: Style = None,        # 默认 STYLES["section_title_image"]
-    text_style: Style = None,        # 默认 STYLES["section_title_text"]
-    icon_width: float = 10,
-    gap: float = 0,
-    layer: int = 0,
-) -> LayoutObject                    # 返回 {root}_section_title_{index}_content
-```
+基础模板（左右分栏），同一份简历只应调用一次。
 
 ```
-{root}_section_title_{index}_content : LayoutObject (height=15, align_x=CENTER, align_y=FLOW)
-├── {root}_section_title_{index}_split : LayoutObject (height=15-0.5, align=NONE)
-│   ├── ..._icon_range : LayoutObject (padding=Padding.bottom(3))
-│   │   └── ..._icon : ImageObject (fit_mode="contain", align=CENTER/BOTTOM, layer+1)
-│   └── ..._text_range : LayoutObject (x=icon_width+gap)
-│       └── ..._text : TextObject (align_x=LEFT, align_y=BOTTOM, layer+1)
-└── {root}_dividing_line : RectangleObject (height=0.5, align_y=BOTTOM)
+self
+└─ {self.name}_split_container
+     ├─ {self.name}_left_column   : RectangleObject
+     └─ {self.name}_right_column  : LayoutObject
 ```
 
-> ⚠️ `dividing_line` 的 name 用 `{root}_dividing_line`，**不含 index**（第 836 行）。
-> 多个节标题会互相覆盖 `objectRegister` 里的同名条目，`find_by_name` 只能找到最后一个。
+宽度按 `ratio` 归一化后**定死**，再作为"已构造格子"交给引擎的 `create_band` 排放
+（`split_column_advanced` 返回 `parent`，此处需要带容器本身）。挂载点必须有正的内容宽。
 
-#### `generate_section_details_template(...)`
+#### `add_profile(index=0, icon_style=None, text_style=None, icon_width=4, gap=0, content_height=None, row_inset=3.0, layer=0) -> ProfileHandle`
 
-```python
-generate_section_details_template(
-    root, index,
-    key_style: Style = None,         # 默认 STYLES["detail_key_1"]
-    time_style: Style = None,        # 默认 STYLES["detail_time_1"]
-    tags_style: Style = None,        # 默认 STYLES["detail_tags_1"]
-    desc_style: Style = None,        # 默认 STYLES["detail_description"]
-    brief_ratio: list = None,        # 默认 [2.0, 1.0, 2.0]
-    brief_height: float = 10,
-    layer: int = 0,
-) -> LayoutObject                    # 返回 {root}_section_details_{index}_content
-```
+一行两格（图标 + 文本）。
 
 ```
-{root}_section_details_{index}_content : LayoutObject (align=CENTER/FLOW)
-├── ..._brief : LayoutObject (height=brief_height, align=CENTER/FLOW)
-│   ├── ..._brief_col_0 : LayoutObject  → ..._key          : TextObject (LEFT/VCENTER)
-│   ├── ..._brief_col_1 : LayoutObject  → ..._during_time  : TextObject (CENTER/VCENTER, padding=time_style.padding)
-│   └── ..._brief_col_2 : LayoutObject  → ..._tags         : TextObject (RIGHT/VCENTER, padding=Padding.right(1.5))
-└── ..._details : LayoutObject (align=CENTER/FLOW)
-    └── ..._description : TextObject (multi_line=True, height=50, line_height=font_size*0.6, align=LEFT/FLOW)
+{prefix}_content（高 content_height，FLOW）
+└─ {prefix}_split（横带，x = row_inset）
+     ├─ {prefix}_icon_range : 宽 = icon_width
+     └─ {prefix}_text_range : 占满剩余
 ```
 
-三栏按 `brief_ratio` 等分 `brief_w`，无间距（`gap_total = 0`），`col_2` 额外加 `Padding.right(1.5)`。
-`brief_w <= 0` 时同样回退到 `root` 内容宽、再回退到硬编码 `150`。
+横带宽度 = `content 可用宽 − row_inset`，与左移量同步收窄，避免右侧溢出。
+`content_height=None` 时取 `profile_content_height(text_style, icon_width)`。
 
-> ⚠️ `_description` 的 `height` 硬编码为 `50`，**必须**由 `fill_section_details_data` 改写，
-> 否则该条详情固定占用 50mm。见 7.8。
-
-#### `generate_summary_template(...)`
-
-```python
-generate_summary_template(
-    root, index,
-    desc_style: Style = None,        # 默认 STYLES["detail_description"]
-    layer: int = 0,
-) -> LayoutObject                    # 返回 {root}_section_details_{index}_content
-```
-
-结构与 `generate_section_details_template` 的 `content → details → description` 部分**完全一致**，
-只是没有 `brief` 三栏。注意它与 details 模板**共用同一套命名前缀** `{root}_section_details_{index}`，
-所以两者的 `index` 必须在同一命名空间内错开。见 7.2。
-
-### 4.4 数据填充函数
-
-约定：全部通过全局 `root.find_by_name(...)` 定位，找不到就**静默跳过**（`if obj:` 保护），不报错。
-
-#### `fill_profile_data(root, index, name: str, image_path: str = "")`
-填充 `{root}_profile_{index}_icon`（仅当 `image_path` 非空）与 `{root}_profile_{index}_text`。
-
-#### `fill_section_title_data(root, index, title: str, image_path: str = "")`
-填充 `{root}_section_title_{index}_icon` 与 `{root}_section_title_{index}_text`。
-
-#### `fill_section_details_data(...)`
-
-```python
-fill_section_details_data(
-    root, index,
-    key: str, during_time: str, tags: str, description: str,
-    brief_height = 10,
-    description_height: float = 50,
-) -> None
-```
-
-填充四处，并**直接改写两个 `_height`**：
+#### `add_profile_photo(index=0, icon_style=None, photo_width=30, layer=0) -> PhotoHandle`
 
 ```
-{root}_section_details_{index}_content._height = description_height + brief_height
-{root}_section_details_{index}_description._height = description_height
+{self.name}_photo_{index}_content（高 = photo_width × 1.6，FLOW）
+└─ ..._photo : ImageObject（居中）
 ```
 
-这是当前唯一的"高度调参"手段。因为 `_height > 0` 时 wrap 不生效（3.2 节优先级约定），
-所以必须在填充阶段显式给出高度，否则文本块会按硬编码的 50mm 占位。
+> 节点前缀刻意用 `photo_` 而非 `profile_photo_`：后者会与 `add_profile` 的
+> `{self.name}_profile_{index}_content` **撞名**（`profile_photo_0_content` vs
+> `profile_0_content`），导致注册表条目互相覆盖。
 
-#### `fill_summary_data(...)`
+#### `add_section_title(index=0, icon_style=None, text_style=None, icon_width=10, gap=0, height=15, layer=0) -> TitleHandle`
 
-```python
-fill_summary_data(root, index, description: str, description_height: float = 50) -> None
 ```
-同上，但只改 `content._height` 与 `description._height`（不涉及 `brief_height`）。
+{prefix}_content（高 height，FLOW）
+├─ {prefix}_split（高 height − 0.5）
+│    ├─ {prefix}_icon_range（Padding.bottom(3)，图标 BOTTOM）
+│    └─ {prefix}_text_range（文本 BOTTOM）
+└─ {prefix}_divider : RectangleObject（高 0.5，BOTTOM）
+```
 
----
+分隔线名字**含 index**（旧版不含，多个节标题会互相覆盖注册表）。
+
+#### `add_details(index=0, name_key=None, *, 样式…, brief_ratio=None, brief_height=10, description_height=None, key="", during_time="", tags="", description="", layer=0) -> DetailsHandle`
+
+```
+{key}_content（SizeY.CONTENT）
+├─ {key}_brief（高 brief_height，FLOW）
+│    └─ {key}_brief_band : 三栏，比例 brief_ratio
+│         ├─ col_0 → key            (LEFT/VCENTER)
+│         ├─ col_1 → during_time    (CENTER/VCENTER，padding = time_style.padding)
+│         └─ col_2 → tags           (RIGHT/VCENTER，Padding.right(1.5))
+└─ {key}_details（SizeY.CONTENT）
+     └─ {key}_description : TextObject(multi_line，LEFT/FLOW，Padding.all(2))
+```
+
+其中 `{key}` = `{self.name}_section_details_{index if name_key is None else name_key}`。
+
+- `name_key` 用于让**跨节**的详情互不同名（`add_section` 传 `"{节号}_{节内序号}"`）；
+  同一挂载点上按相同 `index` 建多个实例会同名并互相覆盖注册表。
+- `description_height=None` → 描述高度由 `SizeY.CONTENT` 自动结算；
+  给正值 → 固定高度（兼容旧的手动调参）。
+- `brief_ratio` 必须恰好 3 个元素，否则抛 `ValueError`。
+
+#### `add_summary(index=0, desc_style=None, description="", description_height=None, layer=0) -> SummaryHandle`
+
+结构与 `add_details` 的 `content → details → description` 部分相同，无三栏。
+命名空间独立：`{self.name}_summary_{index}`（旧版与节详情共用
+`_section_details_` 前缀，迫使调用方手工错开编号）。
+
+#### `add_text_row(name, text="", style=None, height=None, text_padding=None, row_padding=None, align_x=LEFT, align_y=VCENTER, multi_line=False, text_width=0, row_height_ratio=0.5, layer=0) -> TextObject`
+
+"一行文本块" = 定高容器（FLOW）+ 其中的文本。技能 / 证书 / 荣誉三段共用此形状。
+
+```
+{name}_content（高 height，FLOW，row_padding）
+└─ {name} : TextObject（width=text_width，height=0 即撑满行高，text_padding）
+```
+
+`height=None` 时取 `style.font_size × row_height_ratio`（默认 0.5）。
+**此处刻意用 `TextObject.from_style` 直接构造**：`create_text_block` 的参数表
+不含 `width` / `size_x`，而"一行文本"需要能控制宽度轴。
+
+#### `add_spacer(name, height, layer=0) -> LayoutObject`
+
+引擎 `create_spacer` 的方法风格包装（`parent=self`）。
+
+### 4.6 组合模板
+
+#### `add_section(section, index=0, title_style=None, icon_style=None, detail_styles=None, brief_ratio=None, brief_height=10, title_detail_gap=0.0, between_details_gap=0.0, layer=0) -> SectionHandle`
+
+一个完整章节 = `add_section_title` + N × `add_details`（编号 `"{index}_{i}"`）。
+
+- `section` 可以是 dict 或对象，需提供 `title` / `icon` / `details`；
+- `detail_styles` 是透传给 `add_details` 的样式字典（键名
+  `key_style` / `time_style` / `tags_style` / `desc_style`），模块提供便捷字典
+  `BRIEF_DETAIL_STYLES`；
+- `details` 为空时返回 `SectionHandle(None, None, [])`，不生成任何节点。
+
+#### `add_details_list(items, start_index=0, between_gap=0.0, **detail_kwargs) -> List[DetailsHandle]`
+
+列表入口：同一份蓝图实例化 N 条详情。返回列表与 `items` 一一对应。
+`**detail_kwargs` 透传给 `add_details`。
+
+### 4.7 尺寸与高度的约定
+
+| 场景 | 做法 |
+| --- | --- |
+| 内容决定高度（推荐） | 默认行为：`SizeY.CONTENT` |
+| 固定高度 | 显式传 `description_height` / `content_height` / `height` |
+| 写入尺寸 | **必须用公开属性** `obj.height = N`；直接写 `_height` 会绕过尺寸方式解析 |
+
+> ⚠️ **踩坑（实测）**：包装容器若留在默认的 `FILL`，而它又处在 `CONTENT` 父之下，
+> 会走引擎的"退化规则"去读**尚未测量**的子元素高度，整条内容会塌缩为 0 高。
+> `add_details` / `add_summary` 因此显式把 `content` 与 `details` 设为 `SizeY.CONTENT`。
 
 ## 5. ResumeCore.py API
 
@@ -1411,7 +1417,11 @@ SkillsAwards(
 > ✅ 三个 `get_char_*` 原先用循环拼接，`if i < len(...)` 恒为真导致**每段结尾多一个 `\n`**；
 > 批次 0 已改为 `'\n'.join(...)`。历史记录见 7.15。
 >
-> ⚠️ `skills: List[str] = []` 等三个**可变默认参数**，与 `Style.padding` 同类隐患（见 7.10）。
+| `blocks()` | `List[tuple]` | `[(块名, 标题, 条目列表), ...]`，只含非空块（供编排循环用） |
+
+> ✅ **可变默认参数已消除（2026-10-13）**：改为 `Optional[List[str]] = None` 再在
+> 函数体内 `list(...)` 复制。`Details.description_height` 与 `Resume.Lead` 同步处理，
+> 见 7.10。
 
 #### `@dataclass Details`
 
@@ -1421,7 +1431,7 @@ SkillsAwards(
 | `during_time` | `str` | `""` | 起讫时间 |
 | `tags` | `str` | `""` | 专业/技术栈 |
 | `description` | `str` | `""` | 详情描述 |
-| `description_height` | `float` | `12.0` | **手动调参的排版高度（mm）** |
+| `description_height` | `Optional[float]` | `None` | 描述排版高度（mm）。`None` = 由引擎按真实行数**自动结算**；给正值则固定高度 |
 
 方法：`to_dict()`、`is_empty()`（`key` 与 `description` 全空才算空）。
 
@@ -1465,7 +1475,8 @@ Resume(
     sections: Optional[List[Section]] = None,
     summary_icon = "",
     summary: str = "",
-    summary_height: float = 30.0,
+    summary_title: str = "个人总结",
+    summary_height: Optional[float] = None,
     Lead: dict = {},          # ← 可变默认参数（见 7.10）
 )
 ```
@@ -1491,43 +1502,52 @@ Resume(
 | `1` | 仅 `root.render_debug(pdf, is_fill=True, ...)` |
 | 其他 | 先 `render_debug` 再 `render` |
 
-`Generate` 的完整流程：校验 `profile.is_empty()` → 建 PDF/加页 → 注册 LXGW 字体（失败静默吞掉）
-→ 设置元数据 → 建 `Root`（210×297，padding 10）→ `generate_basic_subtemplate`
-→ 取左右栏 → `_fill_left_column()` → `_fill_right_column()` → 渲染 → 输出到 `output_dir`。
+`Generate` 的完整流程：校验 `profile.is_empty()` → 建 PDF/加页 → 注册 LXGW 字体
+（失败静默吞掉）→ 设置元数据 → 建 `Root`（210×297，padding 10）→ `root.add_basic(...)`
+→ 从 `BasicHandle` 直接取左右栏 → `_fill_left_column()` → `_fill_right_column()`
+→ **`root.layout(pdf=pdf, force=True)`** → 渲染 → 输出到 `output_dir`。
 
-`_fill_left_column()` 顺序：上方留白 → 证件照 → 照片/姓名间留白 → 头像+姓名 → 姓名/联系人间留白
-→ 联系方式（每条 + 间隔留白）→ 技能/证书/荣誉（各自标题 + 正文 + 间隔留白）→ 底部留白。
+> ⚠️ **`layout(pdf=...)` 这一步不能省**：`SizeY.CONTENT` 的高度要靠真实文本测量才能结算，
+> 而精确测量需要 `pdf` 实例。旧的固定高度写法不需要它，所以旧流程没有这一步。
 
-`_fill_right_column()` 顺序：上方留白 → 遍历 `sections`（节标题 + 标题/详情间留白 + 各详情 +
-详情间留白）→ 节间留白 → 个人总结（标题 + 留白 + 正文）→ 底部留白。
+`_fill_left_column()` 顺序：上方留白 → 证件照 → 照片/姓名间留白 → 姓名行 →
+姓名/联系人间留白 → 联系方式（`_contact_rows()` 的每一条 + 间隔留白，N 条只加 N-1 个）
+→ 技能/证书/荣誉（`_fill_skills_awards()`）→ 底部留白。
 
-> ⚠️ `_fill_right_column` 里 `section_details_index` 被**递增两次**（第 1008 行与第 1029 行），
-> 导致节内第 2 条详情之后的编号跳号（0,1,3,4,...）。模板本身仍能生成，
-> 但 `Details` 与模板实例的索引不再一一对应。见 7.12。
+`_fill_right_column()` 顺序：上方留白 → 遍历 `sections`（每节一次 `root.add_section(...)`）
+→ 节间留白 → 个人总结（节标题 + 留白 + `add_summary`）→ 底部留白。
+
+> ✅ **7.12 已消除**：编号不再由顶层手工维护，改由 `add_section` 内部按
+> `"{节号}_{节内序号}"` 分配，不存在"详情编号跳号"或"跨节同名"的问题。
 
 ---
 
 ## 6. 命名与查找约定
 
-模板的一切都靠**名字字符串**连接，这是本项目最容易踩坑的地方。
+> ⚠️ **2026-10-13 起，名字不再是取用部件的正常途径。**
+> 中层返回**结果句柄**，部件一律走属性访问（`handle.description`）；
+> 名字只用于调试、注册表兼容与外部查询。
+> 下面的表仍有效，但调用方不该再依赖它定位对象。
 
 规则：`{挂载点.name}_{模板标识}_{index}_{部件}`
 
-| 部件名 | 所属模板 | 类型 |
+| 部件名 | 所属方法 | 类型 |
 | --- | --- | --- |
-| `profile_{i}_content` | `generate_profile_template` | `LayoutObject` |
+| `profile_{i}_content` | `add_profile` | `LayoutObject` |
 | `profile_{i}_split` | 同上 | `LayoutObject` |
 | `profile_{i}_icon_range` / `profile_{i}_icon` | 同上 | `LayoutObject` / `ImageObject` |
 | `profile_{i}_text_range` / `profile_{i}_text` | 同上 | `LayoutObject` / `TextObject` |
-| `profile_photo_{i}_content` / `profile_photo_{i}_photo` | `generate_profile_photo_template` | `LayoutObject` / `ImageObject` |
-| `section_title_{i}_content` | `generate_section_title_template` | `LayoutObject` |
+| `photo_{i}_content` / `photo_{i}_photo` | `add_profile_photo` | `LayoutObject` / `ImageObject` |
+| `section_title_{i}_content` | `add_section_title` | `LayoutObject` |
 | `section_title_{i}_split` / `_icon_range` / `_icon` / `_text_range` / `_text` | 同上 | |
-| `dividing_line` | 同上（**无 index**） | `RectangleObject` |
-| `section_details_{i}_content` | details / summary 模板 | `LayoutObject` |
-| `section_details_{i}_brief` / `_brief_col_0..2` | `generate_section_details_template` | `LayoutObject` |
+| `section_title_{i}_divider` | 同上（**含 index**，7.16 已修） | `RectangleObject` |
+| `section_details_{i}_content` | `add_details` | `LayoutObject` |
+| `section_details_{i}_brief` / `_brief_band` / `_brief_col_0..2` | 同上 | `LayoutObject` |
 | `section_details_{i}_key` / `_during_time` / `_tags` | 同上 | `TextObject` |
-| `section_details_{i}_details` / `_description` | 两者共用 | `LayoutObject` / `TextObject` |
-| `skills_title_content` / `skills_title` / `skills_text_content` / `skills_text` | `ResumeCore._fill_left_column` | |
+| `section_details_{i}_details` / `_description` | 同上 | `LayoutObject` / `TextObject` |
+| `section_details_{C}_{i}_*` | `add_section`（`C`=节号，`i`=节内序号） | |
+| `summary_{i}_content` / `_details` / `_description` | `add_summary`（**独立命名空间**，7.2 已修） | |
+| `{块名}_title_content` / `{块名}_title` / `{块名}_text_content` / `{块名}_text` | `add_text_row`（`{块名}` ∈ skills / qualifications / awards） | |
 | `qualifications_*` / `awards_*` | 同上 | |
 | `Lead_*` | 留白对象 | `LayoutObject` |
 
@@ -1557,15 +1577,15 @@ Resume(
   并在 `ResumeCore.py` 的测试入口加入**导入契约断言**（校验 12 个必需符号），
   模板文件名再次变更时会在测试入口立即报错，而不是运行到一半才崩。
 
-### 7.2 details 与 summary 模板共用命名空间（逻辑级）
+### 7.2 details 与 summary 模板共用命名空间（逻辑级）— ✅ 功能分支已修（2026-10-13）
 
-- **位置**：`ResumeTemplate.py:905`（`prefix = f"{root.name}_section_details_{index}"`）
-  与 `ResumeTemplate.py:1121`（**同一个 prefix 表达式**）
-- **现象**：`generate_summary_template` 产出的节点名与 `generate_section_details_template` 完全相同。
-- **风险**：若两者用了相同的 `index`，`objectRegister` 相互覆盖，
-  `fill_summary_data` 可能改到 details 模板的对象上。
-- **当前缓解**：`ResumeCore._fill_right_column` 让 `section_details_index` 在 summary 之前已经递增过，
+- **原位置**：`ResumeTemplate.py` 的 `generate_section_details_template` 与
+  `generate_summary_template` 使用**同一个** `prefix = f"{root.name}_section_details_{index}"`。
+- **原风险**：两者用相同 `index` 时 `objectRegister` 互相覆盖，填充可能改到另一个模板的对象上。
+- **原缓解**：`ResumeCore._fill_right_column` 让 `section_details_index` 在 summary 之前已递增过，
   所以恰好不撞号——这是**巧合**，不是设计。
+- **修复**：`add_summary` 改用独立命名空间 `{self.name}_summary_{index}`，
+  不再与节详情共用前缀；顶层测试入口断言 `Root_right_column_summary_0_description` 存在。
 
 ### 7.3 绕过 `add_child` 直接挂载（一致性级）— ✅ 批次 2 已修
 
@@ -1614,15 +1634,16 @@ Resume(
   **渲染时复用同一份 `lines`**，因此测量行数与绘制行数的一致性**由构造保证**，
   不再依赖估算公式。测试入口 12.1 / 12.2 固化（行数随可用宽单调、总高 = 行数 × 行高）。
 
-### 7.8 `description.height` 硬编码 50（调用方必须记得改） — ✅ 引擎侧已消除（批次 3 起）
+### 7.8 `description.height` 硬编码 50 —— ✅ 两层均已消除（功能分支 2026-10-13）
 
-- **位置**：`ResumeTemplate.py:1071`、`ResumeTemplate.py:1161`
-- **现象**：`height=50` 写死在构造里，靠 `fill_*` 改写 `_height` 才正确。
-- **后果**：忘记调用 `fill_section_details_data` / `fill_summary_data`，该块就固定占 50mm。
-- **状态**：**成因已在引擎侧消除（批次 3）** —— `create_text_block` 的 `height`
-  是显式参数，不再有硬编码常量。但模板层的两处 `height=50` 调用点
-  **属功能分支**，迁移时会显式传入 `50`（不能依赖新默认值 `0`）。见 `SKILLS.md`
-  的「只在功能分支处理的事项」。
+- **原位置**：`ResumeTemplate.py` 的详情/总结模板，构造时 `height=50`，
+  再由 `fill_*` 回写 `content._height` 与 `description._height`。
+- **原后果**：忘记调用填充函数，该块就固定占 50mm。
+- **修复（引擎侧，批次 3）**：`create_text_block` 的 `height` 是显式参数，不再有硬编码常量。
+- **修复（功能分支）**：`add_details` / `add_summary` **不再写死高度，也不再回写 `_height`**，
+  改为 `SizeY.CONTENT` 由引擎按真实行数自动结算。
+  实测自动结算值与旧固定值逐项等值（12 / 6 / 12 / 12）；
+  需要固定高度时显式传 `description_height=N`。
 
 ### 7.9 `RectangleObject.render` 忽略 `is_fill`
 
@@ -1631,13 +1652,14 @@ Resume(
   与 `TextObject` / `ImageObject` 的 `is_fill` 语义不一致。
   调试渲染时所有矩形都是实心的，会盖住下层内容。
 
-### 7.10 可变默认参数 — ⚠️ 引擎侧已修，上层待功能分支
+### 7.10 可变默认参数 — ✅ 两层均已修（功能分支 2026-10-13）
 
 | 位置 | 参数 | 状态 |
 | --- | --- | --- |
 | `LayoutEngine.py`（`Style.__init__`） | `padding: Padding = Padding.all(0)` | ✅ **批次 4.4 已修**：改为 `padding=None` → 构造时 `Padding.all(0)`，每次新建 |
-| `ResumeCore.py:152-155` | `skills: List[str] = []`、`qualifications`、`awards` | 待功能分支 |
-| `ResumeCore.py:315` | `Lead: dict = {}` | 待功能分支 |
+| `ResumeCore.py`（`SkillsAwards`） | `skills` / `qualifications` / `awards: List[str] = []` | ✅ **功能分支已修**：改为 `Optional[List[str]] = None`，函数体内 `list(...)` 复制 |
+| `ResumeCore.py`（`Resume.__init__`） | `Lead: dict = {}` | ✅ **功能分支已修**：改为 `Optional[dict] = None`，函数体内 `dict(...)` 复制 |
+| `ResumeCore.py`（`Details`） | `description_height: float = 12.0`（不可变，但语义已变） | ✅ 改为 `Optional[float] = None`，语义见 7.8 |
 
 - **后果**：默认对象在多次实例化间共享。此前无代码原地修改它们，所以尚未爆雷，
   但任何 `style.padding.left = 5` 或 `self.Lead["x"] = ...` 都会污染其他实例。
@@ -1678,11 +1700,16 @@ Resume(
 测试入口的断言目前接受上述两种形态，但**拒绝 `None`**，因此能同时守住
 `render` 与 `render_debug` 两条路径。
 
-### 7.12 `section_details_index` 双重递增
+### 7.12 `section_details_index` 双重递增 — ✅ 功能分支已消除（2026-10-13）
 
-- **位置**：`ResumeCore.py:1008` 与 `1029`（同一循环体内）
-- **后果**：节内详情编号跳号。模板生成与填充用同一个 `index`，所以**功能正确**，
-  但 `objectRegister` 里出现大量未使用的编号，`Details[i]` 与模板 index 不再对应。
+- **原位置**：`ResumeCore.py` 的 `_fill_right_column`，同一循环体内两处 `+= 1`
+  （一处为"详情间间距"预留编号）。
+- **原后果**：节内详情编号跳号（0,1,3,4,…）。模板生成与填充用同一个 `index`，
+  所以**功能正确**，但 `objectRegister` 里出现大量未使用的编号，
+  `Details[i]` 与模板 index 不再对应。
+- **修复**：编排改为 `root.add_section(section)` 一次落地，
+  编号由 `add_section` 内部按 `"{节号}_{节内序号}"` 统一分配，不再有跳号，
+  也顺带消除了"跨节详情同名"的隐患。
 
 ### 7.13 渲染日志无法关闭
 
@@ -1703,12 +1730,13 @@ Resume(
 - **修复**：三个方法改为 `'\n'.join(...)`，语义等价且无末尾换行。
   测试入口已加入断言：`["Python","C++"] → "Python\nC++"`、单元素 `["a"] → "a"`、空列表 `→ ""`。
 
-### 7.16 调试/查询辅助的若干不一致
+### 7.16 调试/查询辅助的若干不一致 — ✅ 功能分支部分已修（2026-10-13）
 
-- `LayerManager._cache_valid` 被写从不被读。
-- `generate_section_title_template` 的 `dividing_line` 命名缺 `index`。
-- `generate_profile_photo_template` 里 `photo` 构造时传 `parent=root`，随后又 `content.add_child(photo)`。
-- `ResumeTemplate.py:1515` / `ResumeCore.py` 的 `key_names` 列表里有一批永远不会命中的名字（见第 6 章推论 2）。
+- ⚠️ `LayerManager._cache_valid` 被写从不被读。（**未修，属引擎**）
+- ✅ `add_section_title` 的 `divider` 命名**已含 index**，多个节标题不再互相覆盖注册表。
+- ✅ `add_profile_photo` 的 `photo` 直接挂到 `content` 下，构造参数不再误导。
+- ✅ 中层自检里那批"永远不会命中的名字"已定位并修正：5 个查询名漏写了
+  `_right_column` 前缀，此前一直打印"未找到"却仍退出码 0（静默假通过）。
 
 #### 7.16.1 `dividing_line` 同名对象的两套解析结果不同（批次 0 已实测确认）
 
@@ -2434,22 +2462,53 @@ Style.fit_mode    -> ImageObject.fit_mode
 # **overrides 优先级高于 style；style=None 用全默认值
 # RectangleObject.from_style 刻意不做
 
-# 默认值
-line_height 默认 = font_size * 0.6
-fill_section_details_template: brief_height=10, brief_ratio=[2.0,1.0,2.0], description height=50
-generate_basic_subtemplate:    ratio=[1.0, 2.5], right_padding=Padding.left(5)
+# 文本行高（批次 5 实测更正）
+行高实际由 line_height_ratio 决定，构造参数 line_height **是死参数**
+（只写入 self._line_height，全库从不读取）
+line_height_ratio 默认 = 1.2   → 每行高 = 该行最大字号 × 1.2
+# 历史文档曾写 "line_height 默认 = font_size * 0.6"，与实现不符
+
+# 底层默认值
 split_column_advanced:         ratio=[1.0, 2.5], gap=0
 create_columns:                num_columns=2, gap=5
 create_band:                   gap=0, height=0（取父内容区高）, container_name="{parent.name}_band"
 create_spacer:                 parent=None, layer=0
 create_text_block:             height=0（取父可用高，**不是**按内容撑高）, align_x=LEFT, align_y=FLOW
-Resume:                        summary_height=30.0
+                               # 参数表不含 width / size_x —— 需要控制宽度轴时直接用 from_style
 
-# 构造函数返回值对照（批次 2 变更）
+# 中层默认值（ResumeTemplate.py，2026-10-13 重写）
+DEFAULT_RATIO              = [1.0, 2.5]
+DEFAULT_TITLE_HEIGHT       = 15.0      DEFAULT_DIVIDER_HEIGHT = 0.5
+DEFAULT_BRIEF_HEIGHT       = 10.0      DEFAULT_BRIEF_RATIO    = [2.0, 1.0, 2.0]
+DEFAULT_ICON_WIDTH         = 4.0       DEFAULT_TITLE_ICON_WIDTH = 10.0
+DEFAULT_PHOTO_WIDTH        = 30.0      PHOTO_ASPECT           = 1.6
+DEFAULT_ROW_INSET          = 3.0       DEFAULT_ROW_PAD_Y      = 3.0
+profile_content_height(style, icon_width) = max(字号×0.5, 图标宽+3)
+skills_row_height(style)                  = 字号×0.5
+add_basic:                 right_padding=Padding.left(5), left_padding=Padding.all(0)
+add_details:               brief_height=10, brief_ratio=[2.0,1.0,2.0],
+                           description_height=None（None = SizeY.CONTENT 自动结算）
+add_summary:               description_height=None
+add_profile:               content_height=None（None = profile_content_height(...)）
+add_text_row:              height=None（None = 字号 × row_height_ratio=0.5）
+BRIEF_DETAIL_STYLES:       detail_key_1 / detail_time_1 / detail_tags_1 / detail_description
+Resume:                    summary_height=None（None = 自动结算）, summary_title="个人总结"
+
+# 返回值对照
 create_band                -> 新建的带容器
 create_columns             -> 新建的带容器   # 此前返回 parent
 create_columns_balanced    -> 新建的带容器   # 此前返回 parent
 split_column_advanced      -> parent         # 未变，保持链式调用兼容
 create_text_block          -> 新建的 TextObject（已挂载）
 from_style                 -> 新建对象（**未挂载**）
+add_basic                  -> BasicHandle(node/left/right)
+add_profile                -> ProfileHandle(node/split/icon_range/icon/text_range/text)
+add_profile_photo          -> PhotoHandle(node/photo)
+add_section_title          -> TitleHandle(node/split/icon_range/icon/text_range/text/divider)
+add_details                -> DetailsHandle(node/brief/三个 col/key/during_time/tags/details/description)
+add_summary                -> SummaryHandle(node/details/description)
+add_section                -> SectionHandle(node/title/details[])
+add_details_list           -> List[DetailsHandle]（与传入数据一一对应）
+add_text_row               -> TextObject（容器按 {name}_content 查找）
+add_spacer                 -> LayoutObject
 ```

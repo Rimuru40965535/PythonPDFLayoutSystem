@@ -91,6 +91,10 @@ DEFAULT_PHOTO_WIDTH: float = 30.0               # 证件照宽
 PHOTO_ASPECT: float = 1.6                       # 证件照高 = 宽 × 此值
 DEFAULT_ROW_INSET: float = 3.0                  # 分栏行左缩进（旧 split 容器的左内边距）
 DEFAULT_ROW_PAD_Y: float = 3.0                  # 行内图标上下的最低留白
+DEFAULT_HIGHLIGHT_HEIGHT: float = 9.0           # 重点突出信息行默认高
+DEFAULT_BULLET_SIZE: float = 3.2                # 分条目的正方形引导符边长
+DEFAULT_BULLET_INDENT: float = 1.0              # 分条目整行的左缩进
+DEFAULT_BULLET_GAP: float = 2.0                 # 引导符与文本之间的距离
 
 
 def profile_content_height(style: Optional[Style] = None,
@@ -364,6 +368,28 @@ STYLES = {
         font_size=10,
         color=Black,
     ),
+
+    # ---- 重点突出信息 ----
+    # 一条显著突出的信息行（如「5 年后端开发经验」）：比正文大一档、加粗、深色底
+    "highlight_text": Style(
+        font_name="LXGW",
+        font_size=13,
+        bold=True,
+        color=White,
+        fill_color=Color(0, 80, 160, 0),
+    ),
+
+    # ---- 分条目：正文与引导符 ----
+    "bullet_text": Style(
+        font_name="LXGW",
+        font_size=10,
+        color=Black,
+    ),
+    "bullet_mark": Style(
+        font_name="LXGW",
+        font_size=10,
+        color=Color(0, 80, 160, 0),
+    ),
 }
 
 
@@ -607,6 +633,48 @@ class SummaryHandle:
             description=get("description", ""),
             description_height=get("description_height", None),
         )
+
+
+@dataclass
+class HighlightHandle:
+    """
+    重点突出信息行句柄。
+
+    一条显著突出的单行信息（如「5 年后端开发经验」）：整行带底色、字号更大、加粗。
+    """
+    node: LayoutObject
+    text: TextObject
+
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    def fill(self, text: str = "") -> 'HighlightHandle':
+        self.text.set_text(text)
+        return self
+
+
+@dataclass
+class BulletHandle:
+    """
+    分条目句柄。
+
+    `mark` 是正方形引导符位（可能是 ImageObject、TextObject 或空色块），
+    `text` 是该条目的正文。行高由正文按可用宽折行后的实际高度决定。
+    """
+    node: LayoutObject            # 整行容器
+    mark_cell: LayoutObject       # 引导符所占的正方形格
+    text_cell: LayoutObject       # 正文格
+    text: TextObject              # 正文
+    mark: Optional[LayoutObject]  # 引导符对象（图片 / 文字 / None）
+
+    @property
+    def content(self) -> LayoutObject:
+        return self.node
+
+    def fill(self, text: str = "") -> 'BulletHandle':
+        self.text.set_text(text)
+        return self
 
 
 @dataclass
@@ -1519,6 +1587,236 @@ def add_text_row(self: LayoutObject,
 
 
 # ============================================================================
+# 5b. 重点突出信息行
+# ============================================================================
+
+def add_highlight(self: LayoutObject,
+                  text: str = "",
+                  style: Optional[Style] = None,
+                  height: float = DEFAULT_HIGHLIGHT_HEIGHT,
+                  padding: Optional[Padding] = None,
+                  align_x: AlignX = AlignX.LEFT,
+                  layer: int = 0) -> HighlightHandle:
+    """
+    重点突出信息行子模板 —— 一条显著突出的单行信息。
+
+    用于让 HR 一眼看到的少数几条（如「5 年后端开发经验」「GPA 3.9/4.0」）。
+    默认样式比正文大一档、加粗、带深色底（见 `STYLES["highlight_text"]`）。
+
+    结构：
+        self
+        └─ {self.name}_highlight_{n}_content（定高、FLOW、带底色）
+             └─ ..._text : TextObject（盒内垂直居中）
+
+    Args:
+        text: 文字内容，构造时直接填入
+        style: 文字样式。默认 `STYLES["highlight_text"]`
+        height: 行高 (mm)
+        padding: 行内边距
+        align_x: 文字水平对齐
+        layer: 图层索引
+
+    Returns:
+        HighlightHandle
+    """
+    style = STYLES["highlight_text"] if style is None else style
+    padding = Padding.all(0) if padding is None else padding
+
+    # 取一个不重名的序号（同一挂载点下可放多条）
+    n = sum(1 for c in self.children if "_highlight_" in c.name)
+    prefix = f"{self.name}_highlight_{n}"
+
+    content = LayoutObject(
+        name=f"{prefix}_content",
+        x=0, y=0, width=0, height=height,
+        color=style.fill_color,        # 底色（is_fill 调试态可见）
+        padding=padding,
+        align_x=AlignX.CENTER,
+        align_y=AlignY.FLOW,
+        layer=layer,
+    )
+    self.add_child(content)
+
+    text_obj = TextObject.from_style(
+        f"{prefix}_text", style,
+        text=text,
+        width=0, height=0,
+        color=style.fill_color,
+        padding=Padding.all(0),
+        align_x=align_x,
+        align_y=AlignY.VCENTER,        # 行内垂直居中
+        multi_line=False,
+        layer=layer + 1,
+    )
+    content.add_child(text_obj)
+    return HighlightHandle(node=content, text=text_obj)
+
+
+# ============================================================================
+# 5c. 通用分条目
+# ============================================================================
+
+def add_bullets(self: LayoutObject,
+                item: str = "",
+                bullet_size: float = DEFAULT_BULLET_SIZE,
+                bullet_kind: str = "block",
+                bullet_value: Optional[str] = None,
+                bullet_style: Optional[Style] = None,
+                indent: float = DEFAULT_BULLET_INDENT,
+                gap: float = DEFAULT_BULLET_GAP,
+                style: Optional[Style] = None,
+                padding: Optional[Padding] = None,
+                align_x: AlignX = AlignX.LEFT,
+                layer: int = 0) -> BulletHandle:
+    """
+    通用分条目子模板 —— 一行「正方形引导符 + 正文」。
+
+    **一次挂一条**（多条请由调用方循环；需要间距时在循环里 `add_spacer`）。
+
+    结构：
+        self
+        └─ ..._bullet_{n}_content（高 = 正文折行后的实际高）
+             ├─ ..._mark_cell（边长 bullet_size 的正方形，竖直对准正文首行）
+             │    └─ ..._mark（ImageObject / TextObject / 无）
+             └─ ..._text_cell → ..._text : TextObject(multi_line)
+
+    尺寸规则（全部实测验证）：
+        · 整行宽度 = 父内容区宽（用行容器的 padding 表达左缩进）
+        · 正文列宽 = 父内容区宽 − indent − bullet_size − gap
+        · 行高 = 正文在该列宽下折行后的**实际高度**（随宽度自动变化）
+        · 引导符竖直位置 = (首行实高 − bullet_size) / 2
+          —— 使正方形中心落在正文首行中心上（实测偏差 0.00mm）；
+          正文只有一行时即为整行居中
+
+    Args:
+        item: 该条目正文（支持 \n 硬换行与内联 Markdown）
+        bullet_size: 正方形引导符的边长 (mm)
+        bullet_kind: `"block"` 空色块 / `"text"` 文字符号 / `"image"` 图片
+        bullet_value: `"text"` 时为符号字符（如 `"·"`、`"▪"`）；`"image"` 时为图片路径
+        bullet_style: 引导符文字/图片的样式
+        indent: 整行左缩进 (mm)
+        gap: 引导符与正文之间的距离 (mm)
+        style: 正文字样式。默认 `STYLES["bullet_text"]`
+        padding: 正文格内边距
+        align_x: 正文水平对齐
+
+    Returns:
+        BulletHandle
+
+    Raises:
+        ValueError: bullet_kind 非法，或挂载点没有可用宽度
+    """
+    if bullet_kind not in ("block", "text", "image"):
+        raise ValueError(
+            f"add_bullets: bullet_kind 只能是 'block' / 'text' / 'image'，"
+            f"收到 {bullet_kind!r}")
+    style = STYLES["bullet_text"] if style is None else style
+    bullet_style = STYLES["bullet_mark"] if bullet_style is None else bullet_style
+    padding = Padding.all(0) if padding is None else padding
+
+    # ---- 1) 先算可用宽与正文列宽 ----
+    _, _, parent_w, _ = self.get_content_area()
+    if parent_w <= 0:
+        raise ValueError(f"add_bullets: 挂载点 '{self.name}' 没有可用宽度")
+    inner_w = max(parent_w - indent, 0.0)
+    text_w = max(inner_w - bullet_size - gap, 0.0)
+
+    # ---- 2) 量出正文折行后的实际高度与行数 ----
+    text_h = wrapped_height(item, style, text_w)
+    lines = wrapped_lines(item, style, text_w)
+    # 单行实高（用于把引导符对准首行）
+    line_h = (style.font_size * 1.2 * PT_TO_MM) + padding.top + padding.bottom
+    row_h = max(text_h + padding.top + padding.bottom,
+                line_h if lines else 0.0,
+                bullet_size)
+
+    n = sum(1 for c in self.children if "_bullet_" in c.name)
+    prefix = f"{self.name}_bullet_{n}"
+
+    # ---- 3) 行容器：缩进做成 padding，子元素可用宽自然收窄 ----
+    row = LayoutObject(
+        name=f"{prefix}_content",
+        x=0, y=0, width=0, height=row_h,
+        color=White,
+        padding=Padding(left=indent),
+        align_x=AlignX.CENTER,
+        align_y=AlignY.FLOW,
+        layer=layer,
+    )
+    self.add_child(row)
+
+    # ---- 4) 引导符格：正方形，竖直对准正文首行 ----
+    mark_y = (line_h - bullet_size) / 2
+    mark_cell = LayoutObject(
+        name=f"{prefix}_mark_cell",
+        x=0, y=mark_y, width=bullet_size, height=bullet_size,
+        color=White,
+        padding=Padding.all(0),
+        align_x=AlignX.NONE,
+        align_y=AlignY.NONE,
+        layer=layer,
+    )
+    row.add_child(mark_cell)
+
+    mark: Optional[LayoutObject] = None
+    if bullet_kind == "text":
+        mark = TextObject.from_style(
+            f"{prefix}_mark", bullet_style,
+            text=bullet_value or "·",
+            width=0, height=0,
+            color=White,
+            padding=Padding.all(0),
+            align_x=AlignX.CENTER,
+            align_y=AlignY.VCENTER,
+            multi_line=False,
+            layer=layer + 1,
+        )
+        mark_cell.add_child(mark)
+    elif bullet_kind == "image":
+        mark = ImageObject.from_style(
+            f"{prefix}_mark", bullet_style,
+            image_path=bullet_value or "",
+            width=bullet_size, height=bullet_size,
+            keep_aspect_ratio=True,
+            color=White,
+            padding=Padding.all(0),
+            align_x=AlignX.CENTER,
+            align_y=AlignY.VCENTER,
+            layer=layer + 1,
+        )
+        mark_cell.add_child(mark)
+    # block：什么都不放，靠 mark_cell 自身的底色（调试态可见）
+
+    # ---- 5) 正文格 ----
+    text_cell = LayoutObject(
+        name=f"{prefix}_text_cell",
+        x=bullet_size + gap, y=0, width=text_w, height=row_h,
+        color=White,
+        padding=padding,
+        align_x=AlignX.NONE,
+        align_y=AlignY.NONE,
+        layer=layer,
+    )
+    row.add_child(text_cell)
+
+    text_obj = TextObject.from_style(
+        f"{prefix}_text", style,
+        text=item,
+        width=0, height=0,
+        color=White,
+        padding=Padding.all(0),
+        align_x=align_x,
+        align_y=AlignY.FLOW,
+        multi_line=True,
+        layer=layer + 1,
+    )
+    text_cell.add_child(text_obj)
+
+    return BulletHandle(node=row, mark_cell=mark_cell, text_cell=text_cell,
+                        text=text_obj, mark=mark)
+
+
+# ============================================================================
 # 6. 组合模板：由子模板构成，体现"整个模板就是子模板的组合"
 # ============================================================================
 
@@ -1656,6 +1954,8 @@ _TEMPLATE_METHODS = {
     "add_detail": add_detail,
     "add_detail_head": add_detail_head,
     "add_detail_body": add_detail_body,
+    "add_highlight": add_highlight,
+    "add_bullets": add_bullets,
     "add_section": add_section,
     "add_text_row": add_text_row,
     "add_spacer": add_spacer,
@@ -1896,6 +2196,72 @@ if __name__ == "__main__":
         _dup = {n for n in _names if _names.count(n) > 1}
         assert not _dup, f"{_parent.name} 下存在同名兄弟：{sorted(_dup)}"
     print("  ✅ 无同名兄弟", flush=True)
+
+    # ---- 9. 新增模板：重点突出行 / 通用分条目 ----
+    print("\n【9. 重点突出行 与 通用分条目】", flush=True)
+
+    _hl = right_column.add_highlight(text="5 年后端开发经验")
+    _bl = right_column.add_bullets(
+        item=("负责后端服务重构与性能优化，把订单接口的平均响应时间从 320ms "
+              "降到 95ms，并支撑了大促期间三倍的峰值流量。"),
+        bullet_kind="text", bullet_value="·", layer=1,
+    )
+    _bl_short = right_column.add_bullets(item="单行短条目。",
+                                         bullet_kind="text", bullet_value="·", layer=1)
+    root.layout(pdf=pdf, force=True)
+
+    # 9.1 重点突出行：整行定高、文字盒内垂直居中、带上色样式
+    _hl_info = _hl.node.get_layout_info()
+    assert _hl_info["size_mode"]["y"] == "fixed", "重点行应为定高"
+    assert abs(_hl.node.get_effective_height() - DEFAULT_HIGHLIGHT_HEIGHT) < 1e-6, \
+        f"重点行高应为 {DEFAULT_HIGHLIGHT_HEIGHT}，实际 {_hl.node.get_effective_height()}"
+    assert _hl.text.align_y is AlignY.VCENTER, "重点行文字应盒内垂直居中"
+    assert _hl.text.font_size == STYLES["highlight_text"].font_size
+    print(f"  ✅ 重点突出行通过（高 {_hl.node.get_effective_height():.2f}mm，"
+          f"字号 {_hl.text.font_size:.0f}pt，文字居中）", flush=True)
+
+    # 9.2 分条目：行高随折行自适应，且不溢出父宽
+    _rows = [(_bl, 2), (_bl_short, 1)]
+    for _h, _min_lines in _rows:
+        _row = _h.node
+        _t = _h.text
+        _lines = wrapped_lines(_t.get_text(), STYLES["bullet_text"],
+                               _t.get_effective_width())
+        assert _lines >= _min_lines, f"折行数应 >= {_min_lines}，实际 {_lines}"
+        _expected = _lines * STYLES["bullet_text"].font_size * 1.2 * PT_TO_MM
+        assert abs(_row.get_effective_height() - _expected) < 0.01, (
+            f"行高应等于折行实高 {_expected:.2f}，实际 {_row.get_effective_height():.2f}")
+        _right = _t.get_absolute_x() + _t.get_effective_width()
+        _row_right = _row.get_absolute_x() + _row.get_effective_width()
+        assert _right <= _row_right + 0.01, "正文不得溢出整行"
+    print(f"  ✅ 分条目高度自适应通过（长条目 {_bl.node.get_effective_height():.2f}mm / "
+          f"2 行 → 短条目 {_bl_short.node.get_effective_height():.2f}mm / 1 行）", flush=True)
+
+    # 9.3 引导符：正方形，且中心落在正文首行中心上（这是本模板的核心契约）
+    for _h in (_bl, _bl_short):
+        _mc = _h.mark_cell
+        assert abs(_mc.get_effective_width() - _mc.get_effective_height()) < 1e-6, \
+            "引导符必须是正方形"
+        _line_h = STYLES["bullet_text"].font_size * 1.2 * PT_TO_MM
+        _first_center = _h.text.get_absolute_y() + _line_h / 2
+        _mark_center = _mc.get_absolute_y() + _mc.get_effective_height() / 2
+        assert abs(_mark_center - _first_center) < 0.01, (
+            f"引导符中心应落在正文首行中心：偏差 {_mark_center - _first_center:+.3f}mm")
+    print("  ✅ 引导符对首行中心对齐通过（偏差 < 0.01mm；单行时即整行居中）", flush=True)
+
+    # 9.4 引导符三种形态都可构造
+    _b_img = right_column.add_bullets(
+        item="带图片引导符的条目。", bullet_kind="image",
+        bullet_value=".\\Resources\\icon_Project_History.png", layer=1)
+    assert _b_img.mark is not None and isinstance(_b_img.mark, ImageObject)
+    _b_block = right_column.add_bullets(item="空色块引导符。", bullet_kind="block", layer=1)
+    assert _b_block.mark is None
+    try:
+        right_column.add_bullets(item="x", bullet_kind="bogus")
+        raise AssertionError("非法 bullet_kind 应当报错")
+    except ValueError:
+        pass
+    print("  ✅ 引导符三形态通过（text / image / block，非法值报错）", flush=True)
 
     print("\n✅ 回归契约断言全部通过", flush=True)
     print("\n" + "=" * 60, flush=True)

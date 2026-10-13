@@ -1152,15 +1152,58 @@ def find_object_by_name(name: str = "") -> Optional[Any]
 | 顶层 | `ResumeCore.py` | 是（`Profiles`、`Section`、`Resume`） |
 
 因此子模板方法**不能定义在 `LayoutEngine.py` 里**：那会让引擎认识领域词汇。
-做法是在导入本模块时把 10 个函数挂到 `LayoutObject` 上（第 8 节
-`_install_methods`），并断言"目标成员不存在，拒绝覆盖"。
+做法是在导入本模块时把函数挂到 `LayoutObject` 上（第 8 节 `_install_methods`），
+并断言"目标成员不存在，拒绝覆盖"。
 
-调用形态：
+调用形态（每个模板都是"在传入节点之下挂载一个子模板"）：
 
 ```python
-root.add_basic(...)          # 而不是 generate_basic_subtemplate(root=...)
-column.add_details(...)      # 而不是 generate_section_details_template(root=...)
+root.add_split(...)              # 而不是 generate_basic_subtemplate(root=...)
+column.add_detail(...)           # 而不是 generate_section_details_template(root=...)
 ```
+
+**当前 13 个已挂载方法**：
+
+| 分类 | 方法 |
+| --- | --- |
+| 分栏 | `add_split` / `add_basic` |
+| 左栏 | `add_info` / `add_photo` / `add_highlight` |
+| 右栏 | `add_section_heading` / `add_section` / `add_detail` |
+| 详情部件 | `add_detail_head` / `add_detail_body` |
+| 通用 | `add_bullets` / `add_text_row` / `add_spacer` |
+
+> **旧名已全部退役、不留兼容层**：`add_profile`、`add_profile_photo`、
+> `add_section_title`、`add_details`、`add_details_summary`、`add_summary`、
+> `add_details_list` 调用会直接得到 `AttributeError`。
+> 顶层测试入口有断言守住这一点。
+
+#### 4.1b 共享测量实例（模板内部**不要**新建 FPDF）
+
+"高度由内容决定"要先知道"文本按可用宽折几行"，这需要 pdf 实例。实测（30 次测量）：
+
+| 方式 | 耗时 | 备注 |
+| --- | --- | --- |
+| 复用同一实例 | **23.56 ms** | 本层采用 |
+| 每次新建实例 | **30 559 ms** | 注册字体 345 ms/次，净增内存 **2.5 GB** |
+
+更致命的是**未注册字体的实例测不了中文** —— `measure_text` 内部直接调
+`pdf.get_string_width`，fpdf 对 CJK 抛 `FPDFUnicodeEncodingException`，
+而引擎 `font_context` 的"优雅降级"只处理*变体缺失*、不处理*编码不支持*，
+异常会一路冒泡（`_source_h` 内没有 try）。
+
+因此本层提供：
+
+```python
+measure_pdf() -> FPDF        # 惰性创建的共享测量实例（只建一次，从不 output）
+reset_measure_pdf() -> None   # 丢弃它（测试 / 同进程多份文档用）
+wrapped_height(text, style, available_width, line_height_ratio=1.2, pdf=None) -> float
+wrapped_lines(text, style, available_width, line_height_ratio=1.2, pdf=None) -> int
+```
+
+`wrapped_*` 的 `pdf=None` 表示用共享实例；显式传入则用调用方的实例（便于确定性复现）。
+
+> ⚠️ 这是一处模块级可变状态（与引擎的 `layer_manager` / `objectRegister` 同类，
+> 见 7.14 / SKILLS.md D4）。用 `reset_measure_pdf()` 显式管理它，别当它不存在。
 
 ### 4.2 `Style` 与 `STYLES`
 
@@ -1371,9 +1414,60 @@ self
 
 > ⚠️ **踩坑（实测）**：包装容器若留在默认的 `FILL`，而它又处在 `CONTENT` 父之下，
 > 会走引擎的"退化规则"去读**尚未测量**的子元素高度，整条内容会塌缩为 0 高。
-> `add_details` / `add_summary` 因此显式把 `content` 与 `details` 设为 `SizeY.CONTENT`。
+> `add_detail` / `add_detail_body` 因此显式把 `content` 与 `details` 设为 `SizeY.CONTENT`。
 
-### 4.8 资源清单（`Resources/` 不入库）
+#### 4.7b 分条目模板的尺寸规则（`add_bullets`）
+
+这是唯一**行高由内容折行决定**的模板，尺寸规则与其余模板不同：
+
+| 量 | 规则 |
+| --- | --- |
+| 整行宽 | 父内容区宽（左缩进用**行容器的 padding** 表达） |
+| 正文列宽 | `父内容区宽 − indent − bullet_size − gap` |
+| 行高 | **正文在该列宽下折行后的实际高度**（`wrapped_height`），随宽度自动变化 |
+| 引导符 | 边长 `bullet_size` 的正方形，竖直位置 `(首行实高 − bullet_size) / 2` |
+
+引导符的竖直位置使**正方形中心落在正文首行中心**上（实测偏差 0.00mm）；
+正文只有一行时，它就等价于"整行居中"。
+
+> ⚠️ **不要用 `create_band` 搭这个模板**：`create_band` 会把所有格子高度
+> 统一成"带高"并声明 `SizeY.FIXED`（引擎行为，见 3.4），而这里引导符格与
+> 正文格的高度本就不同。因此 `add_bullets` 直接手工摆放两个格子。
+
+> ⚠️ **也不要用 `SizeY.CONTENT` 去"自动撑高"这个行容器**：`CONTENT` 轴会把父的
+> constraint **原样下传**（不扣 padding），子元素会拿到父外框宽而不是内容区宽，
+> 于是正文列宽多算 `indent` 而溢出。行高改为**显式算好再用 `FIXED`**。
+
+实测（父宽 100mm、indent 1、gap 2、边长 3.2、10pt）：
+
+| 正文长度 | 列宽 | 折行 | 行高 |
+| --- | --- | --- | --- |
+| 长条目 | 93.8 | 2 行 | 8.47 |
+| 短条目 | 93.8 | 1 行 | 4.23 |
+| 长条目（父宽 60） | 53.8 | 3 行 | 12.70 |
+
+### 4.8 改名对照（2026-10-13 重塑）
+
+重塑**没有改变任何版面**（S0 基线 vs S6 现状：96 个节点结构/几何/属性全部一致），
+但方法名变了。旧名**不留兼容层**。
+
+| 旧名 | 新名 | 说明 |
+| --- | --- | --- |
+| `add_basic` | `add_split`（+ `add_basic` 保留为双栏预设） | N 栏、各栏颜色、各栏缩进 |
+| `add_profile` | `add_info(variant="name"\|"contact")` | 一套模板两个预设，不分家 |
+| `add_profile_photo` | `add_photo` | |
+| `add_section_title` | `add_section_heading` | |
+| `add_details` | `add_detail`（容器） | 另拆出 `add_detail_head` / `add_detail_body` |
+| `add_summary` | `add_detail_body(prefix=...)` | **退役** |
+| `add_details_list` | 调用方自己的循环 + `add_detail` | **退役** |
+| — | `add_highlight` | **新增**：重点突出信息行 |
+| — | `add_bullets` | **新增**：通用分条目 |
+
+节点名随之变化（`profile_{i}_*` → `info_{i}_*`、`section_details_{i}_brief*` 仍在
+但由 `add_detail_head` 产出、个人总结由 `summary_*` 改为
+`section_details_summary_0_*`）。**结构路径未变**，这也是重塑期验收的判据。
+
+### 4.9 资源清单（`Resources/` 不入库）
 
 **决定（2026-10-13）**：`Resources/` 下的全部素材**一律不追踪**。
 `.gitignore` 规则为 `Resources/*` + `!Resources/.gitkeep`；目录本身由
@@ -2518,39 +2612,60 @@ create_spacer:                 parent=None, layer=0
 create_text_block:             height=0（取父可用高，**不是**按内容撑高）, align_x=LEFT, align_y=FLOW
                                # 参数表不含 width / size_x —— 需要控制宽度轴时直接用 from_style
 
-# 中层默认值（ResumeTemplate.py，2026-10-13 重写）
+# 中层默认值（ResumeTemplate.py，2026-10-13 重塑后）
 DEFAULT_RATIO              = [1.0, 2.5]
 DEFAULT_TITLE_HEIGHT       = 15.0      DEFAULT_DIVIDER_HEIGHT = 0.5
 DEFAULT_BRIEF_HEIGHT       = 10.0      DEFAULT_BRIEF_RATIO    = [2.0, 1.0, 2.0]
 DEFAULT_ICON_WIDTH         = 4.0       DEFAULT_TITLE_ICON_WIDTH = 10.0
 DEFAULT_PHOTO_WIDTH        = 30.0      PHOTO_ASPECT           = 1.6
 DEFAULT_ROW_INSET          = 3.0       DEFAULT_ROW_PAD_Y      = 3.0
+DEFAULT_HIGHLIGHT_HEIGHT   = 9.0
+DEFAULT_BULLET_SIZE        = 3.2       DEFAULT_BULLET_INDENT  = 1.0
+DEFAULT_BULLET_GAP         = 2.0
 profile_content_height(style, icon_width) = max(字号×0.5, 图标宽+3)
 skills_row_height(style)                  = 字号×0.5
-add_basic:                 right_padding=Padding.left(5), left_padding=Padding.all(0)
-add_details:               brief_height=10, brief_ratio=[2.0,1.0,2.0],
-                           description_height=None（None = SizeY.CONTENT 自动结算）
-add_summary:               description_height=None
-add_profile:               content_height=None（None = profile_content_height(...)）
-add_text_row:              height=None（None = 字号 × row_height_ratio=0.5）
-BRIEF_DETAIL_STYLES:       detail_key_1 / detail_time_1 / detail_tags_1 / detail_description
-Resume:                    summary_height=None（None = 自动结算）, summary_title="个人总结"
+wrapped_height(text, style, width, lhr=1.2, pdf=None) -> mm   # 折行后的实际高
+wrapped_lines(text, style, width, lhr=1.2, pdf=None)  -> int  # 折行数
+measure_pdf() / reset_measure_pdf()                           # 共享测量实例
+
+add_split:        ratio=[1.0, 2.5]（与 widths 互斥）；colors/paddings/insets 按栏
+add_basic:        right_padding=Padding.left(5), left_padding=Padding.all(0)
+add_info:         variant="contact"（另一预设 "name"）；显式参数优先于预设
+add_photo:        photo_width=30（行高 = 宽 × 1.6）
+add_section_heading: icon_width=10, height=15（内部 = 标题带 14.5 + 分隔线 0.5）
+add_detail:       brief_height=10, brief_ratio=[2.0,1.0,2.0],
+                  description_height=None（None = SizeY.CONTENT 自动结算）
+add_detail_head:  ratio=[2.0,1.0,2.0]（必须 3 个元素）, height=10
+add_detail_body:  height=None（None = 自动结算）
+add_highlight:    height=9, 样式 STYLES["highlight_text"]（13pt 粗体白字深蓝底）
+add_bullets:      bullet_size=3.2, indent=1, gap=2, bullet_kind="block"
+                  bullet_kind ∈ {block, text, image}
+add_text_row:     height=None（None = 字号 × row_height_ratio=0.5）
+BRIEF_DETAIL_STYLES: detail_key_1 / detail_time_1 / detail_tags_1 / detail_description
+Resume:           summary_height=None（None = 自动结算）, summary_title="个人总结"
+
+# 已退役（不再挂在 LayoutObject 上）
+add_profile  add_profile_photo  add_section_title  add_details
+add_summary  add_details_list
 
 # 返回值对照
 create_band                -> 新建的带容器
-create_columns             -> 新建的带容器   # 此前返回 parent
-create_columns_balanced    -> 新建的带容器   # 此前返回 parent
+create_columns             -> 新建的带容器
+create_columns_balanced    -> 新建的带容器
 split_column_advanced      -> parent         # 未变，保持链式调用兼容
 create_text_block          -> 新建的 TextObject（已挂载）
 from_style                 -> 新建对象（**未挂载**）
-add_basic                  -> BasicHandle(node/left/right)
-add_profile                -> ProfileHandle(node/split/icon_range/icon/text_range/text)
-add_profile_photo          -> PhotoHandle(node/photo)
-add_section_title          -> TitleHandle(node/split/icon_range/icon/text_range/text/divider)
-add_details                -> DetailsHandle(node/brief/三个 col/key/during_time/tags/details/description)
-add_summary                -> SummaryHandle(node/details/description)
+add_split                  -> SplitHandle(node/cells[]，left/right 为便捷属性)
+add_basic                  -> SplitHandle（同为 SplitHandle，left/right 可用）
+add_info                   -> ProfileHandle(node/split/icon_range/icon/text_range/text)
+add_photo                  -> PhotoHandle(node/photo)
+add_section_heading        -> TitleHandle(node/split/icon_range/icon/text_range/text/divider)
+add_detail                 -> DetailsHandle(node/head/body，并转发 key/tags/description 等)
+add_detail_head            -> DetailHeadHandle(node/band/三个 col/key/during_time/tags)
+add_detail_body            -> DetailBodyHandle(node/description)
+add_highlight              -> HighlightHandle(node/text)
+add_bullets                -> BulletHandle(node/mark_cell/text_cell/text/mark)
 add_section                -> SectionHandle(node/title/details[])
-add_details_list           -> List[DetailsHandle]（与传入数据一一对应）
 add_text_row               -> TextObject（容器按 {name}_content 查找）
 add_spacer                 -> LayoutObject
 ```

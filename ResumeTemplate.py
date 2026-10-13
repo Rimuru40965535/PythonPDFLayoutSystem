@@ -106,7 +106,7 @@ DEFAULT_PARA_ICON_PAD_TOP: float = 0.5          # 图标段落：左栏上内边
 # ⚠️ 这是**可配置的占位值**：`Resources/` 里的图标都是语义化的（教育/项目/…），
 #    目前没有通用的"重点标记"符号，所以这里先借一个方形图标顶上。
 #    换图标只需改这一处（或每次调用显式给 icon=…）。
-DEFAULT_PARA_ICON: str = ".\\Resources\\icon_Project_History.png"
+DEFAULT_PARA_ICON: str = ".\\Resources\\black_circle.png"
 
 
 def profile_content_height(style: Optional[Style] = None,
@@ -2630,6 +2630,10 @@ if __name__ == "__main__":
     # ---- 6. 右栏：节标题 + 节详情 ----
     print("\n【6. 生成右栏内容】", flush=True)
 
+    # 图标分段的公共参数：左栏宽 = 图标宽、整行不额外缩进（右栏本身有内边距）
+    _PARA_KW_ARGS = {"icon_width": 4.0, "icon_align": AlignY.VCENTER,
+                     "indent": 0.0, "gap": 2.0}
+
     edu_title = right_column.add_section_heading(
         index=0,
         icon_style=STYLES["section_title_image"],
@@ -2660,13 +2664,18 @@ if __name__ == "__main__":
             index=i,
             brief_ratio=[2.0, 1.0, 2.0],
             brief_height=DEFAULT_BRIEF_HEIGHT,
+            # 描述体用**图标段落**（黑圆点 + 文本）而非整段文本
+            desc_mode="para",
+            para_gap=1.0,
+            para_kwargs=_PARA_KW_ARGS,
             layer=1,
             **item,
             **BRIEF_DETAIL_STYLES,
         )
         for i, item in enumerate(edu_items)
     ]
-    print(f"  ✅ 教育经历 {len(edu_details)} 条（调用方循环）", flush=True)
+    print(f"  ✅ 教育经历 {len(edu_details)} 条"
+          f"（调用方循环 + 图标分段）", flush=True)
 
     proj_title = right_column.add_section_heading(
         index=1,
@@ -2695,13 +2704,55 @@ if __name__ == "__main__":
         right_column.add_detail(
             index=len(edu_details) + i,
             brief_ratio=[2.0, 1.0, 2.0],
+            desc_mode="para",
+            para_gap=1.0,
+            para_kwargs=_PARA_KW_ARGS,
             layer=1,
             **item,
             **BRIEF_DETAIL_STYLES,
         )
         for i, item in enumerate(proj_items)
     ]
-    print(f"  ✅ 项目经历 {len(proj_details)} 条", flush=True)
+    print(f"  ✅ 项目经历 {len(proj_details)} 条（图标分段）", flush=True)
+
+    # ---- 6b. 直接调用 add_para：图标段落模板的公共入口 ----
+    # 上面两节是"由 add_detail 的 desc_mode='para' 间接使用"；
+    # 这里演示**直接调用** —— 这个模板可以挂在任何节点下
+    # （左栏、右栏、任意容器都行），用于在密集信息里标出重点。
+    print("\n【6b. 直接调用 add_para（图标段落）】", flush=True)
+
+    demo_title = right_column.add_section_heading(
+        index=2,
+        icon_style=STYLES["section_title_image"],
+        text_style=STYLES["section_title_text"],
+        title="技能亮点",
+        image_path=".\\Resources\\icon_Project_History.png",
+        layer=1,
+    )
+    print(f"  ✅ 节标题: {demo_title.text.get_text()}", flush=True)
+
+    para_demos = [
+        # 普通一条：默认黑圆点 + 盒内垂直居中
+        right_column.add_para(
+            text="熟练使用 <c:0066CC>**Python**</c> 与 <c:0066CC>**FPDF**</c>，"
+                 "独立完成排版引擎的实现。",
+            layer=1,
+        ),
+        right_column.add_para(
+            text="把订单接口的响应时间从 <c:CC0000>**320ms**</c> 压到 "
+                 "<c:CC0000>**95ms**</c>，并支撑大促三倍峰值。",
+            layer=1,
+        ),
+        # 强调最要紧的一条：图标放大 + 贴顶对齐
+        right_column.add_para(
+            text="<c:CC0000>**主导**</c>了千万级流量系统的重构。",
+            icon_width=5.0,
+            icon_align=AlignY.TOP,
+            layer=1,
+        ),
+    ]
+    print(f"  ✅ add_para {len(para_demos)} 条"
+          f"（含放大图标 + 贴顶对齐的强调条目）", flush=True)
 
     # ---- 7. 渲染与高度结算 ----
     print("\n【7. 渲染 PDF】", flush=True)
@@ -2824,17 +2875,32 @@ if __name__ == "__main__":
     assert right_column.find_by_name(f"{right_column.name}_section_title_1_divider") is not None
     print("  ✅ 分隔线命名含 index（旧缺陷已消除）", flush=True)
 
-    # 8.5 描述高度由内容结算
+    # 8.5 描述体已改为**图标段落**（desc_mode="para"）：正文落在 add_para 上
+    _p_nodes = [n for n in edu_details[0].body.node.children
+                if "_para_" in n.name]
+    assert _p_nodes, "para 模式下描述体下应有 _para_ 段落节点"
     _desc_h = edu_details[1].description.get_effective_height()
     assert _desc_h > 0, f"描述有效高应为正，实际 {_desc_h}"
-    assert edu_details[1].description.size_y is SizeY.CONTENT, \
-        "描述应处于 CONTENT 尺寸方式"
-    print(f"  ✅ 描述高度自动结算：{_desc_h:.2f}mm（不再硬编码 50）", flush=True)
+    # 段落文本是 FILL（满高，靠 align_y 居中），而不再是 CONTENT 的整段文本
+    assert edu_details[0].description.align_y is AlignY.VCENTER, \
+        "para 模式下段落正文应在行内垂直居中"
+    assert edu_details[0].description.line_height_ratio == 1.2, \
+        "段落正文行高应走引擎默认 1.2"
+    print(f"  ✅ 描述体 = 图标段落（{len(_p_nodes)} 个段落节点，"
+          f"正文高 {_desc_h:.2f}mm）", flush=True)
 
-    # 8.6 行高走引擎默认：未显式写死 line_height
-    assert edu_details[0].description._line_height is None, \
-        "description 不应显式传入 line_height"
-    print("  ✅ 行高走引擎默认（line_height_ratio=1.2）", flush=True)
+    # 8.6 段落之间的留白只在**段落之间**（n 段 → n-1 个）
+    _body_kids = edu_details[0].body.node.children
+    _gaps = [c for c in _body_kids if "_para_gap_" in c.name]
+    # 段落 = 整行容器（名含 _para_ 或 _description 且不是留白）
+    _n_para = len([c for c in _body_kids
+                   if "_para_gap_" not in c.name
+                   and ("_para_" in c.name or c.name.endswith("_description"))])
+    assert _n_para >= 2, f"本用例应有多个段落，实际 {_n_para}"
+    assert len(_gaps) == _n_para - 1, \
+        f"{_n_para} 段之间应有 {_n_para - 1} 个留白，实际 {len(_gaps)}"
+    print(f"  ✅ 段落留白正确（{_n_para} 段 → {len(_gaps)} 个留白，末段之后不加）",
+          flush=True)
 
     # 8.7 详情容器由内容撑高
     assert all(d.node.size_y is SizeY.CONTENT for d in edu_details), \

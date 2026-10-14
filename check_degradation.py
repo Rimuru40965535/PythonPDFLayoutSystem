@@ -17,6 +17,7 @@
 """
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -61,25 +62,62 @@ class ResourceMover:
     ⚠️ 暂存目录必须与 `Resources/` 同盘：`os.replace` 跨盘会抛
     `OSError: [WinError 17] 系统无法将文件移到不同的磁盘驱动器`。
     放在项目内还有个好处：`os.replace` 是原子改名，不复制 18MB 的字体。
+
+    ⚠️ **文件被其他进程独占时改名会失败**（`PermissionError: WinError 32`）——
+    实测由 Visual Studio（`devenv`）或编辑器持有句柄时会发生。
+    这时**不能**直接放弃：改为"复制一份到暂存目录、再把原件截断/删除"，
+    并在结束时**从暂存副本写回**（而不是改名回来）。
+
+    安全底线：**只做复制与覆盖，绝不先删原件再复制**。
+    否则一旦中途出问题就会丢掉素材 —— 这个错误真的犯过一次
+    （手工测试时删掉了 6 个 PNG，见 README 开发日志 2026-10-14）。
     """
 
     def __init__(self, suffixes, tag):
         self.suffixes = suffixes
         self.tag = tag
         self.stash = os.path.join(ROOT, f"_degrade_{tag}_stash")
-        self.moved = []
+        self.moved = []          # 靠 os.replace 挪走的（用 replace 挪回）
+        self.copied = []         # 靠复制+删除挪走的（从副本写回）
+        self.skipped = []        # 锁死且无法挪走的（保持原位，报告出来）
+
+    def _take(self, name):
+        """把一个文件从 Resources 挪进暂存；返回处理方式"""
+        src = os.path.join(RES, name)
+        dst = os.path.join(self.stash, name)
+        try:
+            os.replace(src, dst)             # 首选：原子改名
+            self.moved.append(name)
+            return "replace"
+        except PermissionError:
+            pass                             # 被锁 -> 走复制回退
+        # 回退：先复制到暂存（此时是新增文件，不碰原件），再尝试删除原件
+        shutil.copy2(src, dst)
+        try:
+            os.remove(src)
+            self.copied.append(name)
+            return "copy+remove"
+        except PermissionError:
+            # 连删除都不行 —— 原件留着（等于"没挪走"），如实报告
+            self.copied.append(name)
+            self.skipped.append(name)
+            return "locked"
 
     def __enter__(self):
         os.makedirs(self.stash, exist_ok=True)
         try:
             for f in sorted(os.listdir(RES)):
                 if f.lower().endswith(self.suffixes):
-                    os.replace(os.path.join(RES, f), os.path.join(self.stash, f))
-                    self.moved.append(f)
+                    self._take(f)
         except BaseException:
             # 中途失败也要把已挪走的放回去，绝不留下残缺的 Resources
             self.__exit__(None, None, None)
             raise
+        if self.skipped:
+            print(f"  ⚠️  {len(self.skipped)} 个文件被其他进程锁定，未能挪走："
+                  f"{self.skipped}")
+            print(f"      （环境可能不干净，本次结果请打折看待；"
+                  f"关掉编辑器 / Visual Studio 后重试）")
         return self
 
     def __exit__(self, *exc):
@@ -87,7 +125,11 @@ class ResourceMover:
             src = os.path.join(self.stash, f)
             if os.path.exists(src):
                 os.replace(src, os.path.join(RES, f))
-        self.moved = []
+        for f in self.copied:
+            src = os.path.join(self.stash, f)
+            if os.path.exists(src) and not os.path.exists(os.path.join(RES, f)):
+                shutil.copy2(src, os.path.join(RES, f))
+        self.moved, self.copied, self.skipped = [], [], []
         if os.path.isdir(self.stash) and not os.listdir(self.stash):
             os.rmdir(self.stash)
         return False

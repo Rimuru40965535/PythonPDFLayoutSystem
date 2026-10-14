@@ -1456,7 +1456,7 @@ def add_section_heading(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.CENTER,
-        align_y=AlignY.BOTTOM,
+        align_y=AlignY.VCENTER,
         layer=layer + 1,
     )
     text = TextObject.from_style(
@@ -1466,7 +1466,7 @@ def add_section_heading(self: LayoutObject,
         color=White,
         padding=Padding.all(0),
         align_x=AlignX.LEFT,
-        align_y=AlignY.BOTTOM,
+        align_y=AlignY.VCENTER,
         multi_line=False,
         layer=layer + 1,
     )

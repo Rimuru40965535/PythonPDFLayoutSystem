@@ -381,6 +381,9 @@ output_demo/
 my_resumes.py
 my_resume*.py
 resumes_private/
+# 临时备份目录（可能含真实信息）—— 用完请自行删除
+_bak_*/
+
 
 # Resources/ 下的**全部素材**一律不入库（字体、图标、头像、证件照）。
 #

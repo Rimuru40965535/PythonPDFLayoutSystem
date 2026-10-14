@@ -641,7 +641,7 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 
 | 类 | 字段 |
 | --- | --- |
-| `Profiles` | `photo` `name` `telephone` `email` `locate` `social_media_qq` `social_media_wechat` `contact_address` `title` `website` `summary` |
+| `Profiles` | `photo` `name` `telephone` `email` `locate` `social_media_qq` `social_media_wechat` `contact_address` `title` `website` **`evaluation`** |
 | `Details` | `key` `during_time` `tags` `description`（支持 `\n` 分段与内联 Markdown） |
 | `Section` | `title`（**取用键**） `icon` `details` |
 | `SkillsAwards` | `skills` `qualifications` `awards` + 三个可选标题 |
@@ -649,7 +649,18 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 
 **空串即不渲染**：`telephone=""` 则联系电话整行消失，不用注释代码。
 
-**内联 Markdown**（写在 `description` / `summary` 里）：
+> ⚠️ **两个"总结"不要混**：
+> - **`Profiles.evaluation`** → 渲染在**左栏最后**，视觉模板与技能/证书/荣誉**完全相同**
+>   （标题文案由 `Theme.evaluation_title` 决定，默认「个人评价」）
+> - **`Resume.summary`** → 渲染在**右栏**，是「个人总结」节
+>
+> 两者互不影响，可以只用其中一个。**留空即整块不渲染**（也不会留下多余空隙）。
+>
+> `Profiles` 里曾有一个 `summary` 字段 —— 它**从来没被渲染过**，已于 2026-10-14 删除。
+> 若你的旧文件里有 `Profiles(summary=...)`，请改成 `evaluation=...`
+> （`Resume(summary=...)` 不变，那是右栏的）。
+
+**内联 Markdown**（写在 `description` / `summary` / `evaluation` 里）：
 `**粗体**`、`*斜体*`、`<c:RRGGBB>彩色</c>`、`<b>`/`<i>`。
 嵌套请用 `<b>粗<i>斜</i></b>`（`**粗*斜***` 有歧义，见 E3）。
 
@@ -723,7 +734,7 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 | 项 | 说明 | 前置 |
 | --- | --- | --- |
 | `AlignX.JUSTIFY`（两端对齐） | 设计已定：**跳过最后一行与单行**；CJK 按字间补、拉丁按词间补 | 引擎侧改动，需回 `master` |
-| 图标分辨率建议 | 4mm 显示只需 **96px**（≈600 DPI）；当前 `black_circle.png` 是 2048×2048，实测让产物从 11.3KB 涨到 65.8KB | 等用户提供低分辨率素材 |
+| 图标分辨率 | ✅ **素材已提供**：`black_circle_small.png`（4298 字节）/ `blue_circle_small.png`（4603 字节）。原 2048×2048 版实测让产物从 11.3KB 涨到 65.8KB | 只需把 `Theme.contact_icons` 或中层 `DEFAULT_PARA_ICON` 指向 `_small` 版 |
 | `add_detail_body` 内边距语义 | 内边距**计入 CONTENT 高度**，单行文本时"文字略微偏下"。已可通过 `inner_padding=Padding.all(0)` 绕开，但语义值得再想 | |
 
 ### I.4 配色与样式的覆盖面

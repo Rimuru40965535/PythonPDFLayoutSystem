@@ -102,7 +102,10 @@ class Profiles:
     contact_address: str = ""
     title: str = ""                     # 求职头衔
     website: str = ""                   # 个人网站 / GitHub
-    summary: str = ""                   # 个人简介正文（内容，不是标题）
+    # 个人评价 —— 渲染在**左栏最后**，视觉模板与技能/证书/荣誉相同。
+    # 标题由 Theme.evaluation_title 决定（默认「个人评价」）。
+    # 与 Resume.summary 是两回事：那个渲染在右栏，是个人总结。
+    evaluation: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,7 +119,7 @@ class Profiles:
             "contact_address": self.contact_address,
             "title": self.title,
             "website": self.website,
-            "summary": self.summary,
+            "evaluation": self.evaluation,
         }
 
     def is_empty(self) -> bool:
@@ -429,6 +432,8 @@ class Theme:
 
     # ---- 版面标签文案（逐简历可被数据类覆盖）----
     summary_title: str = "个人总结"
+    # 左栏个人评价块的标题文案（与技能/证书/荣誉同一视觉模板）
+    evaluation_title: str = "个人评价"
     skills_title: str = "掌握技能"
     qualifications_title: str = "获得证书"
     awards_title: str = "获得荣誉"
@@ -540,6 +545,9 @@ class Theme:
         if self.page_padding * 2 >= min(self.page_width, self.page_height):
             problems.append(
                 f"page_padding={self.page_padding} 过大：两倍已超过页面短边")
+        if not self.evaluation_title.strip():
+            problems.append(
+                "evaluation_title 为空 —— 个人评价块会渲染成没有标题的一行")
         if self.desc_mode not in ("inline", "para"):
             problems.append(
                 f"desc_mode={self.desc_mode!r} 只能是 'inline' 或 'para'")
@@ -673,45 +681,80 @@ def _fill_left_column(column: LayoutObject, resume: Resume,
         _spacer(column, "Lead_Left_Contacts_Skills", spacing.contacts_skills)
 
     _fill_skills_awards(column, resume, theme, spacing)
+    # 个人评价放在左栏**最后**（技能块之后、底部留白之前）
+    _fill_evaluation(column, resume, theme, spacing)
     _spacer(column, "Lead_Left_Below_All", spacing.left_bottom)
 
 
-def _fill_skills_awards(column: LayoutObject, resume: Resume,
-                        theme: Theme, spacing: Spacing) -> None:
+def _add_left_block(column: LayoutObject, theme: Theme,
+                    block_name: str, block_title: str,
+                    description: str) -> None:
     """
-    技能 / 证书 / 荣誉：每块 = 标题行 + 正文行。
+    左栏里的一个"文本块" = **一行加粗标题 + 一行自适应正文**。
+
+    这是「技能 / 证书 / 荣誉」与「个人评价」**共用的视觉模板**
+    —— 所以它们看起来是同一套排版，改样式时也只需改一处。
 
     ⚠️ 正文用 `add_detail_body(height=None)` 让它**按内容自动结算**，
     不再用历史上那个 `高度 = 条目数 × 6` 的硬编码估算 ——
     那个估算在条目文字较长（折行）时会算少，导致文字溢出或与下一块重叠。
+
+    ⚠️ 标题行与正文的左缩进**必须同值**：标题用 `row_padding`，
+    正文用文本块 `inner_padding`（见 `Theme.skills_body_padding`）。
     """
+    column.add_text_row(
+        name=f"{column.name}_{block_name}_title",
+        text=block_title,
+        style=theme.skills_title_style,
+        height=skills_row_height(theme.skills_title_style),
+        row_padding=Padding.left(theme.skills_left_indent),
+        text_padding=Padding.all(0),
+        align_x=AlignX.LEFT, align_y=AlignY.VCENTER, layer=1,
+    )
+    column.add_detail_body(
+        prefix=f"{column.name}_{block_name}",
+        description=description,
+        style=theme.skills_text_style,
+        height=None,                       # ← 由内容结算
+        # 左缩进做进文本块内边距，与标题行对齐；
+        # 上下内边距沿用 body_inner_padding（None = 中层默认 2mm）
+        inner_padding=theme.skills_body_padding(),
+        layer=1,
+    )
+
+
+def _fill_skills_awards(column: LayoutObject, resume: Resume,
+                        theme: Theme, spacing: Spacing) -> None:
+    """技能 / 证书 / 荣誉：每块用 `_add_left_block` 落地，块间留白"""
     if resume.skills_awards.is_empty():
         return
 
     blocks = resume.skills_awards.blocks(theme)
     for i, (block_name, block_title, items) in enumerate(blocks):
-        # 标题行：左缩进与正文行**同一值**，否则标题比正文更靠右、参差不齐
-        column.add_text_row(
-            name=f"{column.name}_{block_name}_title",
-            text=block_title,
-            style=theme.skills_title_style,
-            height=skills_row_height(theme.skills_title_style),
-            row_padding=Padding.left(theme.skills_left_indent),
-            text_padding=Padding.all(0),
-            align_x=AlignX.LEFT, align_y=AlignY.VCENTER, layer=1,
-        )
-        column.add_detail_body(
-            prefix=f"{column.name}_{block_name}",
-            description="\n".join(items),
-            style=theme.skills_text_style,
-            height=None,                       # ← 由内容结算
-            # 左缩进做进文本块内边距，与标题行对齐；
-            # 上下内边距沿用 body_inner_padding（None = 中层默认 2mm）
-            inner_padding=theme.skills_body_padding(),
-            layer=1,
-        )
+        _add_left_block(column, theme, block_name, block_title, "\n".join(items))
         if i < len(blocks) - 1:
             _spacer(column, f"Lead_Left_SkillsBlock_{i+1}", spacing.between_skills)
+
+
+def _fill_evaluation(column: LayoutObject, resume: Resume,
+                     theme: Theme, spacing: Spacing) -> None:
+    """
+    个人评价：**与技能/证书/荣誉完全相同的视觉模板**（复用 `_add_left_block`）。
+
+    数据来自 `Profiles.evaluation`。为空则整块不渲染。
+
+    放在左栏**最后**（技能块之后、底部留白之前）。
+    右栏的个人总结（`Resume.summary`）是另一回事，两者可以同时存在，
+    也可以只用其中一个 —— 互不影响。
+    """
+    text = resume.profile.evaluation
+    if not text:
+        return
+    # 与前一"块"之间留白：复用 between_skills，
+    # 因为评价在视觉上就是"技能的下一块"，同间距最自然（且无需中层新增字段）
+    if not resume.skills_awards.is_empty():
+        _spacer(column, "Lead_Left_SkillsBlock_eval", spacing.between_skills)
+    _add_left_block(column, theme, "evaluation", theme.evaluation_title, text)
 
 
 def _fill_right_column(column: LayoutObject, resume: Resume,
@@ -1042,6 +1085,7 @@ class RenderConfig:
                 "column_ratio": list(self.theme.column_ratio),
                 "right_column_padding_left": self.theme.right_column_padding_left,
                 "summary_title": self.theme.summary_title,
+                "evaluation_title": self.theme.evaluation_title,
                 "skills_title": self.theme.skills_title,
                 "qualifications_title": self.theme.qualifications_title,
                 "awards_title": self.theme.awards_title,
@@ -1085,7 +1129,9 @@ def default_content() -> ContentConfig:
         contact_address="中央都市魔王大道 1 号",
         title="后端开发工程师",
         website="github.com/limuru",
-        summary="",
+        # 个人评价 —— 渲染在左栏最后，视觉模板与技能/证书/荣誉相同
+        evaluation="五年全栈开发经验，习惯把复杂问题拆成可验证的小步。\n"
+                   "重视可维护性与工程质量。",
     )
 
     edu = Section(title="教育背景",
@@ -1094,7 +1140,7 @@ def default_content() -> ContentConfig:
         key="日本农业苞谷大学",
         during_time="2020.09 - 2024.06",
         tags="金坷垃制造与苞米发酵工程 | 本科",
-        description="主修课程：数据结构与算法、操作系统、计算机网络、数据库原理、软件工程。\n"
+        description="主修课程：<c:CC0000>数据结构与算法</c>、操作系统、计算机网络、数据库原理、软件工程。\n"
                     "毕业论文：基于深度学习的图像分类算法研究。\n"
                     "连续三年获得专业奖学金，GPA 3.8/4.0。"))
     edu.add_detail(Details(
@@ -1146,7 +1192,7 @@ def _sample(seed: str = "甲") -> Resume:
         contact_address="某路 1 号",
         title="后端开发",
         website="github.com/x",
-        summary="",
+        evaluation="五年全栈开发经验。",
     )
     edu = Section(title="教育背景",
                   icon=r".\Resources\icon_Education_History.png")
@@ -1510,6 +1556,67 @@ def _selftest() -> int:
     check("不同版本文件名不冲突",
           _r1.get_file_name() != _r2.get_file_name(),
           f"{_r1.get_file_name()} vs {_r2.get_file_name()}")
+
+    # ---- V12 个人评价：与技能块同视觉模板，放在左栏最后 ----
+    # 需求："用与技能与荣誉同样的视觉模板与代码写法写个人评价"。
+    # 所以这里卡两件事：**位置对**（左栏最后、底部留白之前）与
+    # **模板等价**（标题行高、正文自适应与技能块逐项相同）。
+    print("\n【V12】个人评价（左栏，复用技能块的视觉模板）")
+    _ev12 = Resume(
+        profile=Profiles(name="测试", telephone="1",
+                         evaluation="第一行评价。\n第二行评价。"),
+        skills_awards=SkillsAwards(skills=["技能一"], awards=["荣誉一"]),
+        sections=[Section(title="S", details=[Details(key="k")])])
+    _root12 = quiet(build_layout, _ev12, Theme(), Spacing())
+    _lc12 = _root12.find_by_name("Root_left_column")
+    _names12 = [c.name for c in _lc12.children]
+    check("个人评价渲染在左栏", any("evaluation_title" in n for n in _names12))
+    _i_eval = next((i for i, n in enumerate(_names12)
+                    if "evaluation_title" in n), None)
+    _i_bot = _names12.index("Lead_Left_Below_All")
+    check("评价在底部留白之前", _i_eval is not None and _i_eval < _i_bot,
+          f"评价在索引 {_i_eval}，底部留白在 {_i_bot}")
+    check("底部留白是左栏最后一个元素", _i_bot == len(_names12) - 1)
+
+    def _block_h12(prefix):
+        got = {}
+        for c in _lc12.children:
+            if c.name.startswith(prefix):
+                got[c.name.rsplit("_", 1)[-1]] = round(c.get_effective_height(), 4)
+        return got
+
+    _sk12 = _block_h12("Root_left_column_skills")
+    _ev_blk = _block_h12("Root_left_column_evaluation")
+    check("标题行高与技能块一致",
+          _sk12.get("content") == _ev_blk.get("content"),
+          f"{_sk12.get('content')} vs {_ev_blk.get('content')}")
+    check("正文高度与技能块一致（同为内容结算）",
+          _sk12.get("details") == _ev_blk.get("details"),
+          f"{_sk12.get('details')} vs {_ev_blk.get('details')}")
+
+    _empty12 = Resume(profile=Profiles(name="测试", telephone="1"),
+                      sections=[Section(title="S", details=[Details(key="k")])])
+    _root12b = quiet(build_layout, _empty12, Theme(), Spacing())
+    _lc12b = _root12b.find_by_name("Root_left_column")
+    check("空评价整块不渲染",
+          not any("evaluation" in c.name for c in _lc12b.children))
+    check("空评价不留多余空隙（不得多出 spacer）",
+          not any("eval" in c.name for c in _lc12b.children))
+
+    _both12 = Resume(profile=Profiles(name="测试", telephone="1",
+                                      evaluation="左栏评价。"),
+                     sections=[Section(title="S", details=[Details(key="k")])],
+                     summary="右栏总结。")
+    _root12c = quiet(build_layout, _both12, Theme(), Spacing())
+    check("左栏评价与右栏总结可共存",
+          any("evaluation" in c.name
+              for c in _root12c.find_by_name("Root_left_column").children)
+          and any("summary" in c.name
+                  for c in _root12c.find_by_name("Root_right_column").children))
+    check("Theme.evaluation_title 默认为「个人评价」",
+          Theme().evaluation_title == "个人评价")
+    check("Profiles 已去掉从不渲染的 summary 字段",
+          not hasattr(Profiles(), "summary"))
 
     # ---- V5 不溢出 ----
     # ⚠️ 两层检查都要做：

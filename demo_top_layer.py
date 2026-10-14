@@ -32,7 +32,8 @@ def build_resume() -> Resume:
         social_media_qq="1145141919",
         title="后端开发工程师",
         website="github.com/limuru",
-        summary="",
+        # 个人评价 —— 渲染在左栏最后，视觉模板与技能/证书/荣誉相同
+        evaluation="五年全栈开发经验，习惯把复杂问题拆成可验证的小步。",
     )
 
     edu = Section(title="教育背景",

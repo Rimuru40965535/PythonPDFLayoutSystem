@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>fc92c775-b8e5-433d-9726-e9f1b53f2f3e</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>ResumeTemplate.py</StartupFile>
+    <StartupFile>demo_multi_version.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -22,8 +22,10 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- 底层：排版引擎（master 内容）。 -->
+    <Compile Include="demo_multi_version.py" />
     <Compile Include="LayoutEngine.py" />
     <!-- 中层：简历模板层（本分支内容）。启动文件指向它 —— 它自带回归契约断言。 -->
+    <Compile Include="ResumeCore.py" />
     <Compile Include="ResumeTemplate.py" />
     <!-- 顶层 ResumeCore.py 刻意不在此处：它属另一个分支，见 SKILLS.md 的分支策略。 -->
   </ItemGroup>

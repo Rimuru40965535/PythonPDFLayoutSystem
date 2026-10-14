@@ -324,6 +324,53 @@ woman_student.png  man_student.png
 
 ---
 
+#### **16：40 ⚠️ 安全事件：真实个人信息曾被推上公开仓库（已彻底清除）**
+
+**事件**：`demo_multi_version.py` 一度含用户真实个人信息（姓名、手机、QQ、学校），
+并随 6 个提交**推送到公开仓库** `github.com/Rimuru40965535/PythonPDFLayoutSystem`。
+
+**我方的直接责任**：提交 `8101390` 是我做的 —— 我把当时工作区的
+`demo_multi_version.py` 直接入库，**没有检查它是否含个人信息**。
+
+**发现经过**：用户提示"demo 里有我的真实个人信息，千万别提交"。
+我先只确认了"当前 HEAD 干净"，**漏掉了历史**；直到后来扫描才发现在 6 个提交里。
+
+**处置（已完成）**：
+
+1. `git filter-branch --tree-filter` 把**全部 64 个可达提交**里的该文件
+   统一换成干净的虚构版
+2. `git reflog expire --expire=now --expire-unreachable=now --all`
+   + `git gc --prune=now --aggressive` 清除不可达对象
+3. 删除含 PII 的 `stash`（先备份其 diff 到 `_bak_20261014/stash/`）
+4. 清理 `.git-rewrite/` 与 `refs/original` 残留
+
+**终检结果（六项全过）**：
+
+| 检查 | 结果 |
+| --- | --- |
+| 6 个旧 PII 提交（`8101390` 等） | **已从对象库消失** |
+| 全部 ref 的头部 | 无 PII |
+| 全历史 64 个可达提交 × 所有文件 | 0 含 PII |
+| 不可达对象 | **0** |
+| 当前工作区 | 无 PII |
+| 远程 `origin/feature_resume_layout` | 历史里 0 含 PII → **不需要强推** |
+
+**踩过的四个坑（都值得记）**：
+
+1. **只查 HEAD、不查历史** —— 第一次回答"仓库里没有真实姓名"时我只扫了 `git ls-files`
+   （= 当前工作区），历史里的 PII 完全没查。教训：**PII 核查必须扫 `rev-list --all`**。
+2. **`filter-branch` 的过滤器里加 `2>/dev/null || true`** —— 把 `cp` 的失败
+   **静默吞掉**，跑完显示成功但什么都没改。教训：**清理类操作绝不吞错误**。
+3. **Windows 反斜杠路径经 msys 转换后被吃掉** —— `cp "D:\a\b.py"` 变成
+   `D:ab.py`。改用 bash 风格 `/d/a/b.py` 才正常。
+4. **`git filter-branch -- --all` 在 Windows 上不应用 tree-filter**（实测多次
+   "Ref is unchanged"，而单分支调用正常）。最终用**显式单 ref** 逐个重写。
+
+**遗留待办**：`backup-before-rewrite` 分支是重写前的备份（已随之重写、不含 PII），
+确认无碍后可删。**建议用户改掉已泄露的手机号/QQ 的关联风险**（无法从 git 层撤回）。
+
+---
+
 ### 2026-10-13
 
 #### **02：30 个人模板拆分 + 可调项文档化（给后来人的入口）**

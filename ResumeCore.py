@@ -100,7 +100,11 @@ class Profiles:
     social_media_qq: str = ""
     social_media_wechat: str = ""
     contact_address: str = ""
-    title: str = ""                     # 求职头衔
+    # 求职头衔 —— 渲染在**左栏**「求职意向」块（标题由 Theme.intent_title 决定）。
+    # ⚠️ 只是**兜底**：正常用法是给 `ResumeVersion.job` 填岗位名，
+    #    它会自动流进 `Resume.intend_job`，并随投递版本变化。
+    #    本字段只在 intend_job 为空时才被取用（2026-10-18 前它从未被渲染过）。
+    title: str = ""
     website: str = ""                   # 个人网站 / GitHub
     # 个人评价 —— 渲染在**左栏最后**，视觉模板与技能/证书/荣誉相同。
     # 标题由 Theme.evaluation_title 决定（默认「个人评价」）。
@@ -434,6 +438,8 @@ class Theme:
     summary_title: str = "个人总结"
     # 左栏个人评价块的标题文案（与技能/证书/荣誉同一视觉模板）
     evaluation_title: str = "个人评价"
+    # 左栏求职意向块的标题文案（同样是技能那一套视觉模板）
+    intent_title: str = "求职意向"
     skills_title: str = "掌握技能"
     qualifications_title: str = "获得证书"
     awards_title: str = "获得荣誉"
@@ -548,6 +554,9 @@ class Theme:
         if not self.evaluation_title.strip():
             problems.append(
                 "evaluation_title 为空 —— 个人评价块会渲染成没有标题的一行")
+        if not self.intent_title.strip():
+            problems.append(
+                "intent_title 为空 —— 求职意向块会渲染成没有标题的一行")
         if self.desc_mode not in ("inline", "para"):
             problems.append(
                 f"desc_mode={self.desc_mode!r} 只能是 'inline' 或 'para'")
@@ -637,7 +646,7 @@ def _spacer(root: LayoutObject, name: str, height: float, layer: int = 1) -> Non
 
 def _fill_left_column(column: LayoutObject, resume: Resume,
                       theme: Theme, spacing: Spacing) -> None:
-    """左栏：证件照 / 姓名 / 联系方式 / 技能证书荣誉"""
+    """左栏：证件照 / 姓名 / **求职意向** / 联系方式 / 技能证书荣誉 / 个人评价"""
     profile = resume.profile
 
     _spacer(column, "Lead_Left_Above_All", spacing.left_top)
@@ -654,6 +663,13 @@ def _fill_left_column(column: LayoutObject, resume: Resume,
                         text_style=theme.name_text_style,
                         layer=1)
         _spacer(column, "Lead_Left_Name_Contacts", spacing.name_contacts)
+
+    # 求职意向紧跟在姓名之后 —— HR 扫简历时第一眼就能看到投的是哪个岗，
+    # 这让"把简历转给哪个组"从需要判断变成不需要判断。
+    # 空则整块不渲染（与其它左栏块一致）。
+    if resume.intend_job or profile.title:
+        _fill_intent(column, resume, theme, spacing)
+        _spacer(column, "Lead_Left_Intent_Contacts", spacing.name_contacts)
 
     contacts = profile.contact_rows(theme)
     for i, (icon_path, value) in enumerate(contacts):
@@ -692,7 +708,7 @@ def _add_left_block(column: LayoutObject, theme: Theme,
     """
     左栏里的一个"文本块" = **一行加粗标题 + 一行自适应正文**。
 
-    这是「技能 / 证书 / 荣誉」与「个人评价」**共用的视觉模板**
+    这是「技能 / 证书 / 荣誉」与「个人评价」「求职意向」**共用的视觉模板**
     —— 所以它们看起来是同一套排版，改样式时也只需改一处。
 
     ⚠️ 正文用 `add_detail_body(height=None)` 让它**按内容自动结算**，
@@ -755,6 +771,29 @@ def _fill_evaluation(column: LayoutObject, resume: Resume,
     if not resume.skills_awards.is_empty():
         _spacer(column, "Lead_Left_SkillsBlock_eval", spacing.between_skills)
     _add_left_block(column, theme, "evaluation", theme.evaluation_title, text)
+
+
+def _fill_intent(column: LayoutObject, resume: Resume,
+                 theme: Theme, spacing: Spacing) -> None:
+    """
+    求职意向：**与技能/证书/荣誉/个人评价完全相同的视觉模板**（复用 `_add_left_block`）。
+
+    数据来源（按优先级）：
+        1. `Resume.intend_job` —— 由 `ResumeVersion.job` 自动填入，随投递版本变化。
+           **这是正常用法**：投什么岗就给版本的 `job` 填什么。
+        2. `Profiles.title` —— 旧字段「求职头衔」，仅作兜底
+           （它此前定义了却从未被任何渲染代码读取，2026-10-18 才接上这根线）。
+
+    位置：姓名之后、联系方式之前 —— HR 扫简历时第一眼就能看到投的是哪个岗。
+
+    ⚠️ 刻意**不渲染** `Resume.intend_company`：
+       公司名已经在输出文件名里；写进简历正文会让这一份"只对一家有效"，
+       一旦简历被转到兄弟部门或进人才库，反而成了减分项。
+    """
+    text = resume.intend_job or resume.profile.title
+    if not text:
+        return
+    _add_left_block(column, theme, "intent", theme.intent_title, text)
 
 
 def _fill_right_column(column: LayoutObject, resume: Resume,
@@ -1086,6 +1125,7 @@ class RenderConfig:
                 "right_column_padding_left": self.theme.right_column_padding_left,
                 "summary_title": self.theme.summary_title,
                 "evaluation_title": self.theme.evaluation_title,
+                "intent_title": self.theme.intent_title,
                 "skills_title": self.theme.skills_title,
                 "qualifications_title": self.theme.qualifications_title,
                 "awards_title": self.theme.awards_title,

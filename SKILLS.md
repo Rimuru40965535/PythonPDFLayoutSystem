@@ -249,6 +249,52 @@ Resources/*
 | 技能三段形状统一 | 归入 `_fill_skills_awards()` |
 | 新增 `summary_title` | 原先写死标题文本，现可配置 |
 
+#### C·续：左栏「求职意向」块（2026-10-18）—— ✅ 完成
+
+**为什么加**：投递要分方向（渲染 / 技术支持 / 教育），而简历正文里没有任何地方说明"这一份投的是哪个岗"。
+HR 拿到简历后要判断"该转给哪个组"——**把岗位名写进简历，这个判断就不需要做了**。
+
+**改动前发现的两个死字段**（本次改动的直接动机）：
+
+| 字段 | 声明处的说法 | 实际用途 |
+| --- | --- | --- |
+| `Profiles.title` | 注释「求职头衔」，H.3 也把它列为内容字段 | **从未被任何渲染代码读取** —— 填了没有效果 |
+| `Resume.intend_company` / `intend_job` | 由 `ResumeVersion.company/job` 自动填入 | **只用于输出文件名**，不进正文 |
+
+**改动清单（全部在顶层 `ResumeCore.py`）**：
+
+| 位置 | 改动 |
+| --- | --- |
+| `Theme` | 新增 `intent_title: str = "求职意向"` |
+| `Theme.validate()` | 新增 `intent_title` 空值检查（与 `evaluation_title` 同款，防止渲染成"没有标题的一行"） |
+| `render()` 的 theme 导出字典 | 补 `"intent_title"` |
+| **新增 `_fill_intent()`** | 复用现成的 `_add_left_block()`，因此与「掌握技能」「个人评价」**视觉模板完全一致** |
+| `_fill_left_column()` | 在**姓名之后、联系方式之前**调用；自带 `Lead_Left_Intent_Contacts` 留白，不与姓名留白连用 |
+| 三处文档串 | `_fill_left_column`（左栏顺序）、`_add_left_block`（共用模板清单）、`Profiles.title`（说明它只是兜底） |
+
+**数据来源（按优先级）**：
+
+1. `Resume.intend_job` ← 由 `ResumeVersion.job` 自动填入，随版本变化 —— **正常用法**
+2. `Profiles.title` —— 兜底，让这个旧字段不再空转
+
+**刻意不渲染 `Resume.intend_company`**：公司名已在输出文件名里；写进正文会让这份简历"只对一家有效"，
+被转到兄弟部门或进人才库时反而成了减分项。
+
+**为什么没碰中层 / 底层**：
+
+- 视觉模板复用 `_add_left_block()`，它内部只用中层已有的 `add_text_row` / `add_detail_body`
+- 留白复用现有的 `Spacing.name_contacts`，**没有给中层加字段**
+- `Theme` 本身就在顶层
+
+**验证**：
+
+- `py_compile` 语法通过
+- AST 静态校验 14 项全过：字段声明、复用 `_add_left_block`、调用顺序（意向→技能→评价）、
+  位置（姓名 < 意向 < 联系方式）、可执行代码确实不读 `intend_company`
+- ⚠️ **渲染级验证未做**：本机找不到装有 `reportlab` 的 Python 环境，需要你在能跑的环境里生成一份 PDF 目视确认
+
+**未做（另议）**：`my_resumes.py` 的素材改造 —— 新增 OpenGL 项目条目、渲染向技能表、松应版本定义。
+
 ### D. 引擎侧跟进（可在功能分支做，也可回 `master`）
 
 | 优先级 | 事项 | 说明 |
@@ -600,7 +646,7 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 | `right_bottom` | 5.0 | 右栏底部 |
 | `between_bullets` | 0.0 | 分条目之间（`add_bullet_list` 用） |
 
-### H.2 版式 `Theme`（34 项）
+### H.2 版式 `Theme`（37 项配置字段，另有 6 个 `ICON_*` 兼容面）
 
 | 字段 | 默认 | 管什么 | 常见改法 |
 | --- | --- | --- | --- |
@@ -623,6 +669,7 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 | `name_icon` | 学生头像 | 姓名行图标 | |
 | `summary_icon` | "" | 个人总结节标题图标 | |
 | `summary_title` | "个人总结" | 总结的标题文案 | |
+| `evaluation_title` / `intent_title` | "个人评价" / "求职意向" | 左栏两个"技能同款块"的标题文案 | 想改叫「自我评价」「应聘岗位」就在这里改 |
 | `skills_title` / `qualifications_title` / `awards_title` | 掌握技能/获得证书/获得荣誉 | 三块标题的**全局默认** | 逐简历改请用 `SkillsAwards(skills_title=...)`（优先级更高）|
 | `contact_icons` | 见下 | 联系方式图标路径字典 | `{"email": r".\Resources\x.png"}` |
 | `section_title_style` 等 **9 个样式字段** | None（取中层） | 各模板的字体/字号/粗体/字色 | `STYLES["name_text"].replace(font_size=20)` |
@@ -648,6 +695,16 @@ copy/replace，就地改属性会污染 `STYLES` 里所有共用者。
 | `Resume` | `intend_company` `intend_job` `profile` `skills_awards` `sections` `summary` |
 
 **空串即不渲染**：`telephone=""` 则联系电话整行消失，不用注释代码。
+
+> **投递意向写哪个字段**（2026-10-18 起才有区别）：
+>
+> | 字段 | 渲染到哪 | 说明 |
+> | --- | --- | --- |
+> | **`Resume.intend_job`** | 左栏「求职意向」块 | **推荐**。由 `ResumeVersion.job` 自动填入，切版本就切岗位，不用额外维护 |
+> | `Profiles.title` | 左栏「求职意向」块 | **兜底**。只在 `intend_job` 为空时才取用（此前它填了没有效果） |
+> | `Resume.intend_company` | ❌ **不渲染**，只进文件名 | 刻意为之：公司名进正文会让这份简历只对一家有效，被转发到兄弟部门时反而减分 |
+>
+> 也就是说：**投什么岗，就写 `ResumeVersion(job="...")`**，那一行会自动出现在姓名下面。
 
 > ⚠️ **两个"总结"不要混**：
 > - **`Profiles.evaluation`** → 渲染在**左栏最后**，视觉模板与技能/证书/荣誉**完全相同**
